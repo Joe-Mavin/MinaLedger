@@ -1631,6 +1631,34 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await phase.test('recovery cannot consume another facility, unsupported material, or already consumed sources', async () => {
       const attempt = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send(validRecoveryEventBody(ids.phaseThree.recoveryLocationId));
       assert.equal(attempt.status, 404);
+      const usedReceipt = ids.phaseThree.correctedPartialReceiptItem;
+      const usedReceiptCorrection = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipt-items/${usedReceipt.id}/corrections`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, quantityGrams: '0.400000', outcome: 'ACCEPTED',
+          correctionReason: 'Fictional follow-up attempted after recovery use.',
+          measurement: { kind: 'MEASURED', sourceValue: '0.4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' },
+        });
+      assert.equal(usedReceiptCorrection.status, 409);
+      assert.equal(usedReceiptCorrection.body.error.code, 'RECEIPT_ALREADY_USED_IN_RECOVERY');
+      await assert.rejects(sequelize.transaction(async (transaction) => {
+        const [prior] = await db(`SELECT consignment_id,consignment_item_id,batch_id,quantity_g FROM consignment_receipt_item WHERE id=:id`, { id: usedReceipt.id }, transaction, QueryTypes.SELECT);
+        const receiptId = randomUUID();
+        const measurementSetId = randomUUID();
+        const measurementId = randomUUID();
+        await db(`INSERT INTO consignment_receipt(id,consignment_id,received_by_user_id,occurred_at_claimed)
+          VALUES (:id,:consignmentId,:actor,:at)`, { id: receiptId, consignmentId: prior.consignment_id, actor: ids.phaseThree.recoveryUserId, at: happenedAt }, transaction);
+        await db(`INSERT INTO material_measurement_set(id,batch_id,consignment_item_id,consignment_stage)
+          VALUES (:id,:batchId,:itemId,'RECEIPT')`, { id: measurementSetId, batchId: prior.batch_id, itemId: prior.consignment_item_id }, transaction);
+        await db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
+          VALUES (:id,:setId,'MEASURED',:quantity,:quantity,'g','test-v1','RECORDER',:party,:actor,:at)`, {
+          id: measurementId, setId: measurementSetId, quantity: prior.quantity_g, party: ids.phaseThree.recoveryPartyUserId, actor: ids.phaseThree.recoveryUserId, at: happenedAt,
+        }, transaction);
+        await db(`INSERT INTO consignment_receipt_item(id,receipt_id,consignment_id,consignment_item_id,batch_id,quantity_g,outcome,measurement_set_id,measurement_id,supersedes_receipt_item_id,correction_reason)
+          VALUES (:id,:receiptId,:consignmentId,:itemId,:batchId,:quantity,'ACCEPTED',:setId,:measurementId,:prior,'Fictional direct database correction after recovery use')`, {
+          id: randomUUID(), receiptId, consignmentId: prior.consignment_id, itemId: prior.consignment_item_id, batchId: prior.batch_id,
+          quantity: prior.quantity_g, setId: measurementSetId, measurementId, prior: usedReceipt.id,
+        }, transaction);
+      }), sqlError('23514'));
       const supersededSource = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
       const staleSourceAttempt = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
         recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,

@@ -616,6 +616,14 @@ export async function correctConsignmentReceiptItem(consignmentId, receiptItemId
     if (!prior || await query(`SELECT 1 FROM consignment_receipt_item WHERE supersedes_receipt_item_id=:id`, { id: receiptItemId }, transaction).then((rows) => rows.length > 0)) {
       throw new AppError(409, 'RECEIPT_OBSERVATION_NOT_CURRENT', 'Only a current receipt observation can be corrected.');
     }
+    const [recoveryUse] = await query(
+      `SELECT COALESCE(sum(source_quantity_g),0)::NUMERIC(20,6) AS quantity_g
+       FROM recovery_event_input_source WHERE consignment_receipt_item_id=:receiptItemId`,
+      { receiptItemId }, transaction,
+    );
+    if (toMicros(recoveryUse.quantity_g)>0n) {
+      throw new AppError(409, 'RECEIPT_ALREADY_USED_IN_RECOVERY', 'A receipt already referenced by recovery genealogy cannot be revised.');
+    }
     await assertReceiptClaimWithinDispatch(prior.consignment_item_id, input.quantityGrams, transaction, prior.id);
     const [destination] = await query(
       `SELECT inventory_location_id FROM recovery_inventory_location WHERE inventory_location_id=:locationId AND recovery_facility_id=:facilityId FOR UPDATE`,

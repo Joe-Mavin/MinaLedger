@@ -40,6 +40,9 @@ BEGIN
       OR EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=previous_item.id) THEN
       RAISE EXCEPTION 'receipt corrections must succeed the current observation for the same item' USING ERRCODE='23514';
     END IF;
+    IF EXISTS (SELECT 1 FROM recovery_event_input_source WHERE consignment_receipt_item_id=previous_item.id) THEN
+      RAISE EXCEPTION 'a receipt referenced by recovery genealogy cannot be corrected' USING ERRCODE='23514';
+    END IF;
   END IF;
 
   SELECT COALESCE(sum(dispatch.posted_quantity_g-COALESCE(reversed.quantity_g,0)),0)::NUMERIC(20,6)
