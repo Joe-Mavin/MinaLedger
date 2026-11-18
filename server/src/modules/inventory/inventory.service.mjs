@@ -84,3 +84,90 @@ export async function postTransfer({ lines, reason, occurredAt }, auth, mutation
   }));
 }
 
+export async function lockInventoryBalanceKeys(keys, transaction) {
+  const ordered = sortKeys(keys);
+  for (const key of ordered) {
+    await sequelize.query(
+      `INSERT INTO inventory_balance_guard(location_id,batch_id) VALUES (:locationId,:batchId) ON CONFLICT DO NOTHING`,
+      { replacements: key, transaction },
+    );
+  }
+  for (const key of ordered) {
+    await sequelize.query(
+      `SELECT 1 FROM inventory_balance_guard WHERE location_id=:locationId AND batch_id=:batchId FOR UPDATE`,
+      { replacements: key, transaction },
+    );
+  }
+}
+
+export async function postMovementInTransaction({
+  movementKind, eventId = null, lines, reason = null, occurredAt, auth, transaction, mutationId,
+}) {
+  const keys = sortKeys(lines);
+  await lockCommercialChains(lines, transaction);
+  await lockInventoryBalanceKeys(keys, transaction);
+  const deltas = new Map(keys.map((key) => [`${key.locationId}:${key.batchId}`, 0n]));
+  for (const line of lines) {
+    const key = `${line.locationId}:${line.batchId}`;
+    deltas.set(key, deltas.get(key) + (line.direction === 'IN' ? gramsToMicros(line.quantityGrams) : -gramsToMicros(line.quantityGrams)));
+  }
+  for (const key of keys) {
+    const [balance] = await sequelize.query(
+      `SELECT COALESCE(sum(CASE WHEN ml.direction='IN' THEN ml.posted_quantity_g ELSE -ml.posted_quantity_g END),0)::NUMERIC(20,6) AS quantity_g
+       FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id
+       WHERE m.current_status='ACCEPTED' AND ml.location_id=:locationId AND ml.batch_id=:batchId`,
+      { replacements: key, type: QueryTypes.SELECT, transaction },
+    );
+    if (gramsToMicros(balance.quantity_g) + deltas.get(`${key.locationId}:${key.batchId}`) < 0n) {
+      throw new AppError(409, 'INSUFFICIENT_INVENTORY', 'The movement would make an inventory balance negative.');
+    }
+  }
+  const movementId = randomUUID();
+  await sequelize.query(
+    `INSERT INTO inventory_movement(id,event_id,movement_kind,current_status,reason,actor_user_id,occurred_at_claimed)
+     VALUES (:id,:eventId,:movementKind,'DRAFT',:reason,:actorUserId,:occurredAt)`,
+    { replacements: { id: movementId, eventId, movementKind, reason, actorUserId: auth.userId, occurredAt }, transaction },
+  );
+  for (const [index, line] of lines.entries()) {
+    await sequelize.query(
+      `INSERT INTO inventory_movement_line(
+         id,inventory_movement_id,batch_id,location_id,direction,posted_quantity_g,basis_measurement_set_id,basis_measurement_id,
+         consignment_item_id,consignment_stage,material_event_input_id,material_event_output_id,gold_trade_line_id,residue_sale_line_id,
+         inventory_count_id,reverses_line_id,source_material_event_output_id,consignment_receipt_item_id,line_no
+       ) VALUES (
+         :id,:movementId,:batchId,:locationId,:direction,:quantity,:measurementSetId,:measurementId,
+         :consignmentItemId,:consignmentStage,:eventInputId,:eventOutputId,:goldTradeLineId,:residueSaleLineId,
+         :inventoryCountId,:reversesLineId,:sourceOutputId,:receiptItemId,:lineNo
+       )`,
+      { replacements: {
+        id: randomUUID(), movementId, batchId: line.batchId, locationId: line.locationId, direction: line.direction,
+        quantity: line.quantityGrams, measurementSetId: line.measurementSetId ?? null, measurementId: line.measurementId ?? null,
+        consignmentItemId: line.consignmentItemId ?? null, consignmentStage: line.consignmentStage ?? null,
+        eventInputId: line.materialEventInputId ?? null, eventOutputId: line.materialEventOutputId ?? null,
+        goldTradeLineId: line.goldTradeLineId ?? null, residueSaleLineId: line.residueSaleLineId ?? null,
+        inventoryCountId: line.inventoryCountId ?? null, reversesLineId: line.reversesLineId ?? null,
+        sourceOutputId: line.sourceMaterialEventOutputId ?? null, receiptItemId: line.consignmentReceiptItemId ?? null,
+        lineNo: index + 1,
+      }, transaction },
+    );
+  }
+  await sequelize.query(`UPDATE inventory_movement SET current_status='ACCEPTED' WHERE id=:movementId`, { replacements: { movementId }, transaction });
+  const streamRefs = [
+    { kind: 'inventory_movement', id: movementId },
+    ...(eventId ? [{ kind: 'material_event', id: eventId }] : []),
+    ...keys.map((key) => ({ kind: 'material_batch', id: key.batchId })),
+    ...keys.map((key) => ({ kind: 'inventory_location', id: key.locationId })),
+  ];
+  await appendAuditEvent({
+    transaction, eventType: `INVENTORY.${movementKind}_ACCEPTED`, actorUserId: auth.userId,
+    actorPartyId: auth.personPartyId, occurredAt: new Date(occurredAt), clientMutationId: mutationId,
+    payload: { movement_id: movementId, movement_kind: movementKind, event_id: eventId, line_count: lines.length, batch_ids: [...new Set(lines.map((line) => line.batchId))] },
+    streams: streamRefs,
+  });
+  await sequelize.query(
+    'SET CONSTRAINTS inventory_validate_header_deferred, inventory_validate_line_deferred, phase_three_inventory_header_guard, phase_three_inventory_line_guard, phase_three_movement_links_header_guard, phase_three_movement_links_line_guard IMMEDIATE',
+    { transaction },
+  );
+  return { id: movementId, movementKind, status: 'ACCEPTED', lineCount: lines.length };
+}
+

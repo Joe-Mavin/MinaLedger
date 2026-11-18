@@ -2,7 +2,7 @@
 
 ## Current status
 
-These are criteria for a future implementation and pilot. Phase 0 has delivered design documentation only; none of the application behaviors below should be described as implemented or verified until built and tested.
+The PostgreSQL backend currently passes `npm run lint` for 23 ES modules and the complete integration suite with 42 tests, 42 passed and 0 failed. Phase 3 covers 26 nested scenarios for stockpiling/pooling, sale decisions, consignment, transport, custody, dispatch/receipt, recovery inventory and genealogy; the combined suite also covers Phase 1/2 integrity and regression cases. Migration 004 rollback/reapplication is verified. Criteria below that concern payments, merchant gold trading, frontend/offline workflows, production rollout, broad pilot acceptance or blockchain remain future work unless the implementation status above explicitly says otherwise.
 
 ## Domain coverage
 
@@ -58,7 +58,7 @@ These are criteria for a future implementation and pilot. Phase 0 has delivered 
 
 ## Suggested automated verification
 
-Before a pilot, automate unit tests for allocation cardinality, homogeneous basis, explicit authorized basis selection (including conflicting and corrected observations), complete revisions, unique active-approved pointer and serialized competing approvals; typed measurement ownership, same-batch composite FKs and reassignment rejection; parent currency update rejection and payment parent/event currency mismatch rejection; role decisions and quantity conversions; database constraint/migration tests; API integration tests for both routes and both payment parents; valid/invalid movement reference combinations; inventory transfer/transformation/reconciliation tests; concurrent overspend and concurrent trade-line cap attempts for both commercial line families; correction/reversal and duplicate-command handling; failure rollback; end-to-end journeys including shared-device assisted capture, paper transcription, offline restart/reconnect and dispute; idempotency and concurrent same-stream/cross-stream tests; property-based split/merge lineage checks; canonicalization/hash/checkpoint verification; forbidden-payload/privacy checks; and recovery/backup checks. Test cases should use synthetic participant and transaction data. Tests are planned here only; they have not been added or run during Phase 0.
+For remaining pilot scope, add tests for allocation approval policy, parent/payment currency integrity behavior as used by future payment commands, both merchant routes and payment parents, shared-device and paper transcription, offline restart/reconnect, dispute handling, property-based lineage, canonicalization/hash/checkpoint verification, privacy payload review, and recovery/backup. The current combined integration suite uses synthetic data and covers production/allocation constraints, QR, movement/currency/audit integrity, Phase 3 recovery genealogy, idempotency and migration rollback/reapply. Passing software tests does not validate a local business practice, assay, legal relationship or participant agreement.
 
 ## Pilot exit decision
 

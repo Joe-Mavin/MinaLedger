@@ -1,5 +1,11 @@
 # Domain terminology and proposed business rules
 
+## Phase 3 implementation status (verified 2026-11-18)
+
+The backend implements and tests Dora residue intake from typed processing outputs, partial/cross-Dora stockpile transfers, count-backed inventory adjustments, residue sale proposals and bilateral line decisions, itemized consignments, transport legs, separate custody offers and decisions, paired dispatch/receipt, recovery-facility inventory, multi-source recovery events, output genealogy and recorded variances. These commands reuse the authoritative inventory journal and append-only audit streams. The full PostgreSQL suite passes 42/42 tests, including 26 nested Phase 3 scenarios.
+
+Implemented behavior records commercial acceptance without processing payment; records custody acceptance independently of dispatch/receipt; retains disputed/rejected quantities as evidence in transit; and does not allocate recovered output quantities to individual miners. Physical pooling remains evidential and movement-based. Pilot policy remains unresolved for ownership/service terms, accepted measurements and discrepancy evidence, custody authority, adjustment/reversal authority, residue-sale terms and whether any future source allocation method is defensible. The rules below continue to distinguish confirmed requirements, proposals and open questions.
+
 ## Status labels
 
 - **Confirmed project requirements** are constraints from the project specification.

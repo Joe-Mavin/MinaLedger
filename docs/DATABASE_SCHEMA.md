@@ -1,5 +1,11 @@
 # Proposed database schema
 
+## Phase 3 implementation overlay (verified 2026-11-18)
+
+Additive migration `004_phase_three_residue_recovery.sql` extends the Phase 1/2 schema; it does not create a second inventory journal or editable stockpile balance. It adds source-output and accepted-receipt references to movement lines; consignment recipient, dispatch and recorded-time fields; append-only status and receipt evidence; custody items and counterparty decisions; recovery input/output wrappers, source receipt mappings, output-to-input genealogy, process-stage classifications and variance records; and residue-sale decision history. Existing `residue_stockpile`, `recovery_inventory_location`, `inventory_movement`, `consignment`, `residue_sale` and material event tables remain the authoritative domain records.
+
+PostgreSQL FKs and checks bind measurements, batches, consignment items, receipts and recovery events. Deferred triggers validate atomic stockpile/transit and transit/facility movement pairs, accepted receipt postings, recovery input consumption, complete output genealogy, custody offer/decision structure, and phase-specific status transitions. Append-only triggers protect evidence rows. `inventory_balance_guard` serializes batch/location balance changes in stable order; adjustments take that lock before reading the derived balance. The rollback checks for recorded Phase 3 evidence and refuses destructive rollback while it exists. The full test suite applies from an empty schema and rolls back/reapplies migrations 003 and 004.
+
 ## Status and design decisions
 
 This document defines the relational design baseline. The Phase 1 implementation uses PostgreSQL with Sequelize for application access and reviewed SQL migrations for schema features, triggers and deferred integrity rules that need database-level enforcement. This supersedes the earlier conditional Prisma proposal recorded in D-14; see D-26. Do not weaken integrity for ORM convenience.

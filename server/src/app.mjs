@@ -17,6 +17,12 @@ import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/d
 import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
 import { createBatchQr, rotateBatchQr, lookupQr, canAccessBatch } from './modules/qr/qr.service.mjs';
+import {
+  createStockpile, listStockpiles, receiveDoraResidue, transferBetweenStockpiles, createConsignment,
+  dispatchConsignment, addTransportLeg, readConsignment, createRecoveryInventoryLocation, listLocationBalances,
+  receiveConsignment, createCustodyOffer, decideCustodyTransfer, createResidueSale, decideResidueSaleLine,
+  readResidueSale, adjustInventory, createRecoveryEvent, readRecoveryEvent,
+} from './modules/residue/residue.service.mjs';
 import { AppError, errorHandler, validateBody } from './utils/errors.mjs';
 
 const decimal = (places) => z.string().regex(new RegExp(`^(0|[1-9][0-9]*)(\\.[0-9]{1,${places}})?$`));
@@ -139,6 +145,110 @@ const processingSchema = z.object({
 }).strict().superRefine((value, context) => {
   if (Boolean(value.compensationArrangementCode) !== Boolean(value.serviceTermsRef)) context.addIssue({ code: 'custom', path: ['serviceTermsRef'], message: 'Record both the applicable arrangement code and its source reference.' });
   if (new Set(value.inputs.map((input) => input.sourceProductionOutputId)).size !== value.inputs.length) context.addIssue({ code: 'custom', path: ['inputs'], message: 'A source production output may appear once per processing event.' });
+});
+const positiveGrams = decimal(6).refine((value) => Number(value) > 0, 'Quantity must be greater than zero.');
+const measurementEvidenceSchema = z.object({
+  kind: z.enum(['DECLARED', 'MEASURED', 'VERIFIED']).optional(),
+  sourceValue: decimal(12).optional(),
+  sourceUnit: z.string().trim().min(1).max(20).optional(),
+  conversionVersion: z.string().trim().min(1).max(40).optional(),
+  sourceRole: z.enum(['SELLER', 'BUYER', 'RECORDER', 'WITNESS', 'WEIGHER', 'OTHER']).optional(),
+  methodCode: z.string().max(80).optional(),
+  instrumentRef: z.string().max(160).optional(),
+  occurredAt: dateTime.optional(),
+  evidenceRef: z.string().max(255).optional(),
+}).strict().optional();
+const stockpileSchema = z.object({
+  stockpileCode: z.string().trim().min(1).max(100),
+  locationCode: z.string().trim().min(1).max(100),
+  physicalPlaceRef: z.string().trim().min(1).max(255).optional(),
+}).strict();
+const stockpileIntakeSchema = z.object({
+  occurredAt: dateTime,
+  evidenceRef: z.string().trim().min(1).max(255).optional(),
+  outputs: z.array(z.object({ outputId: z.string().uuid(), measurementId: z.string().uuid() }).strict()).min(1).max(40),
+}).strict();
+const stockpileTransferSchema = z.object({
+  destinationStockpileId: z.string().uuid(),
+  occurredAt: dateTime,
+  evidenceRef: z.string().trim().min(1).max(255),
+  items: z.array(z.object({ batchId: z.string().uuid(), quantityGrams: positiveGrams, measurement: measurementEvidenceSchema }).strict()).min(1).max(40),
+}).strict();
+const consignmentSchema = z.object({
+  consignmentCode: z.string().trim().min(1).max(100).optional(),
+  recoveryFacilityId: z.string().uuid(),
+  transporterPartyId: z.string().uuid().optional(),
+  transitLocationRef: z.string().trim().min(1).max(255).optional(),
+  occurredAt: dateTime,
+  items: z.array(z.object({
+    sourceStockpileId: z.string().uuid(), batchId: z.string().uuid(), quantityGrams: positiveGrams,
+    measurement: measurementEvidenceSchema, residueSaleLineId: z.string().uuid().optional(), saleMappedQuantityGrams: positiveGrams.optional(),
+  }).strict().refine((row) => !row.saleMappedQuantityGrams || Boolean(row.residueSaleLineId), 'Sale mapped quantity requires a residue sale line.')).min(1).max(40),
+}).strict();
+const dispatchSchema = z.object({
+  occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional(),
+  items: z.array(z.object({ consignmentItemId: z.string().uuid(), measurementId: z.string().uuid() }).strict()).min(1).max(40),
+}).strict();
+const transportLegSchema = z.object({
+  carrierPartyId: z.string().uuid().optional(), vehicleRef: z.string().trim().min(1).max(120).optional(),
+  departureAt: dateTime.optional(), arrivalAt: dateTime.optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict().refine((value) => Boolean(value.departureAt || value.arrivalAt), 'A transport leg needs a departure or arrival time.')
+  .refine((value) => !value.departureAt || !value.arrivalAt || new Date(value.arrivalAt) >= new Date(value.departureAt), 'Arrival cannot be before departure.');
+const recoveryLocationSchema = z.object({ locationCode: z.string().trim().min(1).max(100), physicalPlaceRef: z.string().trim().min(1).max(255).optional() }).strict();
+const receiptSchema = z.object({
+  recoveryInventoryLocationId: z.string().uuid(), occurredAt: dateTime,
+  evidenceRef: z.string().trim().min(1).max(255).optional(), note: z.string().trim().min(1).max(1000).optional(),
+  items: z.array(z.object({
+    consignmentItemId: z.string().uuid(), quantityGrams: positiveGrams, outcome: z.enum(['ACCEPTED', 'DISPUTED', 'REJECTED']),
+    reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(), measurement: measurementEvidenceSchema,
+  }).strict().superRefine((value, context) => {
+    if (value.outcome === 'ACCEPTED' && value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'Accepted receipt does not require a discrepancy reason.' });
+    if (value.outcome !== 'ACCEPTED' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'Disputed and rejected quantities need a reason.' });
+  })).min(1).max(40),
+}).strict();
+const custodyOfferSchema = z.object({ destinationLocationId: z.string().uuid(), occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional() }).strict();
+const custodyDecisionSchema = z.object({
+  decision: z.enum(['ACCEPT', 'DISPUTE', 'REJECT', 'WITHDRAW']), occurredAt: dateTime,
+  reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.decision !== 'ACCEPT' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'A non-acceptance decision needs a reason.' });
+});
+const residueSaleSchema = z.object({
+  saleCode: z.string().trim().min(1).max(100).optional(), processingFacilityId: z.string().uuid(), recoveryFacilityId: z.string().uuid(),
+  agreedAt: dateTime, currencyCode: z.string().regex(/^[A-Z]{3}$/), termsRef: z.string().trim().min(1).max(255).optional(),
+  lines: z.array(z.object({ batchId: z.string().uuid(), quantityGrams: positiveGrams, unitPrice: decimal(8).optional(), lineAmount: decimal(8).optional() }).strict()).min(1).max(40),
+}).strict();
+const residueSaleDecisionSchema = z.object({
+  decision: z.enum(['ACCEPT', 'DISPUTE', 'REJECT']), acceptedQuantityGrams: positiveGrams.optional(), occurredAt: dateTime,
+  reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict().superRefine((value, context) => {
+  if ((value.decision === 'ACCEPT') !== Boolean(value.acceptedQuantityGrams)) context.addIssue({ code: 'custom', path: ['acceptedQuantityGrams'], message: 'Accept requires an agreed quantity; other decisions omit it.' });
+  if (value.decision !== 'ACCEPT' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'A dispute or rejection needs a reason.' });
+});
+const adjustmentSchema = z.object({
+  batchId: z.string().uuid(), countedQuantityGrams: decimal(6), reason: z.string().trim().min(1).max(500),
+  evidenceRef: z.string().trim().min(1).max(255), occurredAt: dateTime, measurement: measurementEvidenceSchema,
+}).strict();
+const recoveryEventSchema = z.object({
+  recoveryInventoryLocationId: z.string().uuid(), occurredAt: dateTime, methodRef: z.string().trim().min(1).max(255).optional(),
+  notesRef: z.string().trim().min(1).max(255).optional(), varianceNote: z.string().trim().min(1).max(500).optional(),
+  inputs: z.array(z.object({
+    batchId: z.string().uuid(), quantityGrams: positiveGrams, measurement: measurementEvidenceSchema,
+    sources: z.array(z.object({ receiptItemId: z.string().uuid(), quantityGrams: positiveGrams }).strict()).min(1).max(40),
+  }).strict()).min(1).max(40),
+  outputs: z.array(z.object({
+    materialKind: z.enum(['RECOVERED_GOLD', 'PROCESS_OUTPUT']), outputRole: z.enum(['RECOVERED_GOLD', 'OTHER_OUTPUT']),
+    outputKind: z.string().trim().min(1).max(40).optional(), quantityGrams: positiveGrams, measurement: measurementEvidenceSchema,
+  }).strict()).min(1).max(40),
+  stages: z.array(z.object({ stageCode: z.enum(['LEACHING', 'CARBON_RELATED', 'ELUTION', 'FINAL_RECOVERY', 'OTHER']), occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional(), note: z.string().trim().min(1).max(500).optional() }).strict()).max(20).optional(),
+  variances: z.array(z.object({
+    varianceKind: z.enum(['INPUT', 'OUTPUT', 'PROCESS']), expectedQuantityGrams: decimal(6).optional(), observedQuantityGrams: decimal(6).optional(), varianceQuantityGrams: decimal(6).optional(),
+    reason: z.string().trim().min(1).max(500), evidenceRef: z.string().trim().min(1).max(255).optional(),
+  }).strict().refine((value) => value.expectedQuantityGrams !== undefined || value.observedQuantityGrams !== undefined || value.varianceQuantityGrams !== undefined, 'A variance needs at least one quantity value.')).max(40).optional(),
+}).strict().superRefine((value, context) => {
+  value.outputs.forEach((output, index) => {
+    if ((output.materialKind === 'RECOVERED_GOLD') !== (output.outputRole === 'RECOVERED_GOLD')) context.addIssue({ code: 'custom', path: ['outputs', index, 'outputRole'], message: 'Recovered gold batch classification and output role must agree.' });
+  });
 });
 
 function requireIdempotencyKey(req, res, next) {
@@ -303,6 +413,67 @@ app.post('/api/v1/material-batches/:batchId/qr/rotate', requireUuidParams('batch
 app.get('/api/v1/qr/:token', asyncRoute(async (req, res) => {
   if (!/^[A-Za-z0-9_-]{40,60}$/.test(req.params.token)) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   return res.json(await lookupQr(req.params.token, req.auth));
+}));
+
+app.get('/api/v1/doras/:facilityId/stockpiles', requireUuidParams('facilityId'), asyncRoute(async (req, res) => {
+  return res.json(await listStockpiles(req.params.facilityId, req.auth));
+}));
+app.post('/api/v1/doras/:facilityId/stockpiles', requireUuidParams('facilityId'), requireIdempotencyKey, validateBody(stockpileSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createStockpile(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/stockpiles/:stockpileId/intake', requireUuidParams('stockpileId'), requireIdempotencyKey, validateBody(stockpileIntakeSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await receiveDoraResidue(req.params.stockpileId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/stockpiles/:stockpileId/transfers', requireUuidParams('stockpileId'), requireIdempotencyKey, validateBody(stockpileTransferSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await transferBetweenStockpiles(req.params.stockpileId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/inventory/locations/:locationId/balances', requireUuidParams('locationId'), asyncRoute(async (req, res) => {
+  return res.json(await listLocationBalances(req.params.locationId, req.auth));
+}));
+app.post('/api/v1/inventory/locations/:locationId/adjustments', requireUuidParams('locationId'), requireIdempotencyKey, validateBody(adjustmentSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await adjustInventory(req.params.locationId, req.body, req.auth, req.get('idempotency-key')));
+}));
+
+app.post('/api/v1/consignments', requireIdempotencyKey, validateBody(consignmentSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createConsignment(req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/consignments/:consignmentId', requireUuidParams('consignmentId'), asyncRoute(async (req, res) => {
+  return res.json(await readConsignment(req.params.consignmentId, req.auth));
+}));
+app.post('/api/v1/consignments/:consignmentId/dispatch', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(dispatchSchema), asyncRoute(async (req, res) => {
+  return res.status(200).json(await dispatchConsignment(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/consignments/:consignmentId/transport-legs', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(transportLegSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await addTransportLeg(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/consignments/:consignmentId/receipts', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(receiptSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await receiveConsignment(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/consignments/:consignmentId/custody-offers', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(custodyOfferSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createCustodyOffer(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/custody-transfers/:transferId/decisions', requireUuidParams('transferId'), requireIdempotencyKey, validateBody(custodyDecisionSchema), asyncRoute(async (req, res) => {
+  return res.status(200).json(await decideCustodyTransfer(req.params.transferId, req.body, req.auth, req.get('idempotency-key')));
+}));
+
+app.post('/api/v1/residue-sales', requireIdempotencyKey, validateBody(residueSaleSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createResidueSale(req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/residue-sales/:saleId', requireUuidParams('saleId'), asyncRoute(async (req, res) => {
+  return res.json(await readResidueSale(req.params.saleId, req.auth));
+}));
+app.post('/api/v1/residue-sales/:saleId/lines/:lineId/decisions', requireUuidParams('saleId', 'lineId'), requireIdempotencyKey, validateBody(residueSaleDecisionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await decideResidueSaleLine(req.params.saleId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+
+app.post('/api/v1/recovery-facilities/:facilityId/inventory-locations', requireUuidParams('facilityId'), requireIdempotencyKey, validateBody(recoveryLocationSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createRecoveryInventoryLocation(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/recovery-facilities/:facilityId/recovery-events', requireUuidParams('facilityId'), requireIdempotencyKey, validateBody(recoveryEventSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createRecoveryEvent(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/recovery-events/:eventId', requireUuidParams('eventId'), asyncRoute(async (req, res) => {
+  return res.json(await readRecoveryEvent(req.params.eventId, req.auth));
 }));
 
 app.use((req, res, next) => next(new AppError(404, 'NOT_FOUND', 'The requested endpoint was not found.')));

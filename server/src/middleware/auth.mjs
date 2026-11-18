@@ -139,6 +139,48 @@ export async function canAccessProcessingFacility(auth, facilityId, { write = fa
   return false;
 }
 
+export async function canAccessRecoveryFacility(auth, facilityId, { write = false } = {}) {
+  if (!UUID_PATTERN.test(String(facilityId))) return false;
+  const scopedRoles = write ? ['RECOVERY_FACILITY_OPERATOR'] : ['RECOVERY_FACILITY_OPERATOR', 'AUDITOR'];
+  if (auth.roles.some((role) => scopedRoles.includes(role.role_code) && role.scope_kind === 'FACILITY' && role.scope_id === String(facilityId))) return true;
+
+  const relationshipRoles = write
+    ? ['RECOVERY_OPERATOR', 'FACILITY_OPERATOR', 'OPERATOR']
+    : ['RECOVERY_OPERATOR', 'FACILITY_OPERATOR', 'OPERATOR', 'AUDITOR'];
+  const direct = await sequelize.query(
+    `SELECT 1 FROM facility_party_role fpr
+     WHERE fpr.recovery_facility_id=:facilityId AND fpr.party_id=:partyId
+       AND fpr.role_code IN (:relationshipRoles) AND fpr.status='ACTIVE'
+       AND fpr.valid_from<=now() AND (fpr.valid_to IS NULL OR fpr.valid_to>now()) LIMIT 1`,
+    { replacements: { facilityId, partyId: auth.personPartyId, relationshipRoles }, type: QueryTypes.SELECT },
+  );
+  if (direct.length) return true;
+
+  for (const role of auth.roles.filter((item) => scopedRoles.includes(item.role_code) && item.scope_kind === 'ORGANISATION')) {
+    if (!(await hasActiveOrganisationMembership(auth, role.scope_id))) continue;
+    const affiliated = await sequelize.query(
+      `SELECT 1 FROM facility_party_role fpr
+       WHERE fpr.recovery_facility_id=:facilityId AND fpr.party_id=:organisationId
+         AND fpr.role_code IN (:relationshipRoles) AND fpr.status='ACTIVE'
+         AND fpr.valid_from<=now() AND (fpr.valid_to IS NULL OR fpr.valid_to>now()) LIMIT 1`,
+      { replacements: { facilityId, organisationId: role.scope_id, relationshipRoles }, type: QueryTypes.SELECT },
+    );
+    if (affiliated.length) return true;
+  }
+  return false;
+}
+
+export async function requireRecoveryFacilityAccess(req, res, next) {
+  try {
+    const facilityId = req.params.facilityId ?? req.body?.recoveryFacilityId;
+    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    if (!(await canAccessRecoveryFacility(req.auth, facilityId, { write }))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+
 export async function requireProcessingFacilityAccess(req, res, next) {
   try {
     const facilityId = req.params.facilityId ?? req.body?.processingFacilityId;

@@ -61,6 +61,18 @@ function testToken(userId) {
   });
 }
 
+function validRecoveryEventBody(locationId) {
+  return {
+    recoveryInventoryLocationId: locationId,
+    occurredAt: happenedAt,
+    inputs: [{
+      batchId: randomUUID(), quantityGrams: '1.000000',
+      sources: [{ receiptItemId: randomUUID(), quantityGrams: '1.000000' }],
+    }],
+    outputs: [{ materialKind: 'RECOVERED_GOLD', outputRole: 'RECOVERED_GOLD', quantityGrams: '0.100000' }],
+  };
+}
+
 async function createLocation(code, kind = 'OTHER') {
   const id = randomUUID();
   await db(`INSERT INTO inventory_location(id,location_code,location_kind,custodian_party_id) VALUES (:id,:code,:kind,:partyId)`, { id, code, kind, partyId: ids.adminPartyId });
@@ -135,7 +147,7 @@ after(async () => {
 });
 
 test('PostgreSQL foundation integrity and API integration', async (t) => {
-  await t.test('Phase 2 integrity migration rolls back and reapplies before its new participant kinds are used', async () => {
+  await t.test('Phase 2 and Phase 3 integrity migrations roll back and reapply before use', async () => {
     const rollbackSql = await readFile(new URL('../src/database/rollback/003_phase_two_integrity.sql', import.meta.url), 'utf8');
     const migrationSql = await readFile(new URL('../src/database/migrations/003_phase_two_integrity.sql', import.meta.url), 'utf8');
     const rollbackProbe = new Error('migration rollback probe');
@@ -148,6 +160,18 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       WHERE table_schema='public' AND table_name='hole_party_role'
         AND column_name IN ('source_reference','evidence_ref') ORDER BY column_name`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(columns.map((row) => row.column_name), ['evidence_ref', 'source_reference']);
+
+    const rollbackFour = await readFile(new URL('../src/database/rollback/004_phase_three_residue_recovery.sql', import.meta.url), 'utf8');
+    const migrationFour = await readFile(new URL('../src/database/migrations/004_phase_three_residue_recovery.sql', import.meta.url), 'utf8');
+    const phaseThreeRollbackProbe = new Error('Phase 3 migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackFour, { transaction, raw: true });
+      await sequelize.query(migrationFour, { transaction, raw: true });
+      throw phaseThreeRollbackProbe;
+    }), (error) => error === phaseThreeRollbackProbe);
+    const phaseThreeTables = await db(`SELECT table_name AS phase_three_table_name FROM information_schema.tables WHERE table_schema='public'
+      AND table_name IN ('consignment_receipt','recovery_output_input_link','residue_sale_decision_event','phase_three_migration_marker') ORDER BY table_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseThreeTables.map((row) => row.phase_three_table_name), ['consignment_receipt', 'phase_three_migration_marker', 'recovery_output_input_link', 'residue_sale_decision_event']);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -733,6 +757,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const doraUser = await seedUser('dora-operator@example.test', 'Fictional Dora Operator', {
       roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId,
     });
+    ids.doraUserId = doraUser.userId;
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
       id: randomUUID(), userId: doraUser.userId, holeId: ids.holeId,
     });
@@ -766,7 +791,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(processed.status, 201, processed.text);
     assert.equal(processReplay.status, 201, processReplay.text);
     assert.equal(processReplay.body.id, processed.body.id);
-    assert.equal(processReplay.body.replayed, true);
+    assert.equal([processed, processReplay].filter((response) => response.body.replayed).length, 1);
     ids.processingEventId = processed.body.id;
     ids.processingOutputs = processed.body.outputs;
     assert.equal(processed.body.processingFacilityId, ids.doraOneId);
@@ -862,6 +887,8 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       id: randomUUID(), userId: secondDoraUser.userId, holeId: ids.holeId,
     });
     const secondDoraToken = testToken(secondDoraUser.userId);
+    ids.doraTwoOperatorUserId = secondDoraUser.userId;
+    ids.doraTwoToken = secondDoraToken;
     const deniedFacilityCreate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
       .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
     const deniedFacilityRotate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr/rotate`)
@@ -934,6 +961,485 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const rotation = await db(`SELECT status,rotated_from_id FROM qr_record WHERE id=:id`, { id: rotated.body.qrRecordId }, undefined, QueryTypes.SELECT);
     assert.equal(rotation[0].status, 'ACTIVE');
     assert.equal(rotation[0].rotated_from_id, sourceQr.body.qrRecordId);
+  });
+
+  await t.test('Phase 3 residue pooling, consignment, custody, receipt, and recovery workflows', async (phase) => {
+    ids.phaseThree = {};
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'DORA_OPERATOR','FACILITY',:facilityId)`, {
+      id: randomUUID(), userId: ids.doraUserId, facilityId: ids.doraTwoId,
+    });
+    const secondDoraProcessing = await request(app).post(`/api/v1/sites/${ids.siteId}/processing-events`)
+      .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        processingFacilityId: ids.doraTwoId, occurredAt: happenedAt,
+        inputs: [{ sourceProductionOutputId: ids.phase2Outputs[0].id, measurements: [{ kind: 'MEASURED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] }],
+        outputs: [
+          { materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: [{ kind: 'MEASURED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] },
+          { materialKind: 'GOLD_DORE', outputRole: 'MINER_RETAINED_GOLD', measurements: [{ kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] },
+        ],
+      });
+    assert.equal(secondDoraProcessing.status, 201, secondDoraProcessing.text);
+    ids.phaseThree.secondDoraResidue = secondDoraProcessing.body.outputs[0];
+
+    ids.phaseThree.recoveryPartyId = await seedParty('ORGANISATION', 'Fictional Recovery Facility', 'RECOVERY_FACILITY');
+    ids.phaseThree.recoveryFacilityId = randomUUID();
+    await db(`INSERT INTO recovery_facility(id,party_id,name,status) VALUES (:id,:partyId,'Fictional Recovery Facility','ACTIVE')`, {
+      id: ids.phaseThree.recoveryFacilityId, partyId: ids.phaseThree.recoveryPartyId,
+    });
+    const recoveryOperator = await seedUser('recovery-operator@example.test', 'Fictional Recovery Operator', {
+      roleCode: 'RECOVERY_FACILITY_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.recoveryFacilityId,
+    });
+    ids.phaseThree.recoveryUserId = recoveryOperator.userId;
+    ids.phaseThree.recoveryPartyUserId = recoveryOperator.partyId;
+    ids.phaseThree.recoveryRoleId = recoveryOperator.roleAssignmentId;
+    ids.phaseThree.recoveryToken = testToken(recoveryOperator.userId);
+    const recoveryAuditor = await seedUser('recovery-auditor@example.test', 'Fictional Recovery Auditor', {
+      roleCode: 'AUDITOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.recoveryFacilityId,
+    });
+    ids.phaseThree.recoveryAuditorToken = testToken(recoveryAuditor.userId);
+    ids.phaseThree.otherRecoveryPartyId = await seedParty('ORGANISATION', 'Unrelated Fictional Recovery Facility', 'RECOVERY_FACILITY');
+    ids.phaseThree.otherRecoveryFacilityId = randomUUID();
+    await db(`INSERT INTO recovery_facility(id,party_id,name,status) VALUES (:id,:partyId,'Unrelated Fictional Recovery Facility','ACTIVE')`, {
+      id: ids.phaseThree.otherRecoveryFacilityId, partyId: ids.phaseThree.otherRecoveryPartyId,
+    });
+    const unrelatedRecoveryUser = await seedUser('unrelated-recovery-operator@example.test', 'Unrelated Fictional Recovery Operator', {
+      roleCode: 'RECOVERY_FACILITY_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.otherRecoveryFacilityId,
+    });
+    ids.phaseThree.otherRecoveryToken = testToken(unrelatedRecoveryUser.userId);
+
+    await phase.test('authorized Dora operators create typed stockpile locations', async () => {
+      const first = await request(app).post(`/api/v1/doras/${ids.doraOneId}/stockpiles`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ stockpileCode: 'P3-DORA1-PILE-A', locationCode: 'P3-DORA1-LOC-A' });
+      const second = await request(app).post(`/api/v1/doras/${ids.doraOneId}/stockpiles`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ stockpileCode: 'P3-DORA1-PILE-B', locationCode: 'P3-DORA1-LOC-B' });
+      const other = await request(app).post(`/api/v1/doras/${ids.doraTwoId}/stockpiles`).set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({ stockpileCode: 'P3-DORA2-PILE-A', locationCode: 'P3-DORA2-LOC-A' });
+      assert.equal(first.status, 201, first.text);
+      assert.equal(second.status, 201, second.text);
+      assert.equal(other.status, 201, other.text);
+      ids.phaseThree.stockpileOne = first.body.id;
+      ids.phaseThree.stockpileTwo = second.body.id;
+      ids.phaseThree.stockpileOtherDora = other.body.id;
+      assert.equal((await db(`SELECT count(*)::int AS total FROM inventory_location l JOIN residue_stockpile s ON s.inventory_location_id=l.id WHERE l.id IN (:one,:two,:other) AND l.location_kind='STOCKPILE'`, { one: first.body.id, two: second.body.id, other: other.body.id }, undefined, QueryTypes.SELECT))[0].total, 3);
+    });
+
+    await phase.test('Dora residue intake preserves selected output lineage and idempotent retries', async () => {
+      const body = { occurredAt: happenedAt, evidenceRef: 'fictional-stockpile-intake-a', outputs: [{ outputId: ids.processingOutputs[1].id, measurementId: ids.processingOutputs[1].measurements[0].id }] };
+      const key = randomUUID();
+      const [first, retry] = await Promise.all([
+        request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', key).send(body),
+        request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', key).send(body),
+      ]);
+      assert.equal(first.status, 201, first.text);
+      assert.equal(retry.status, 201, retry.text);
+      assert.equal([first, retry].filter((response) => response.body.replayed).length, 1);
+      assert.equal(retry.body.id, first.body.id);
+      const [intake] = await db(`SELECT source_material_event_output_id,batch_id FROM inventory_movement_line WHERE inventory_movement_id=:movementId`, { movementId: first.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(intake.source_material_event_output_id, ids.processingOutputs[1].id);
+      assert.equal(intake.batch_id, ids.processingOutputs[1].batchId);
+      assert.equal((await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send(body)).body.error.code, 'RESIDUE_ALREADY_RECEIVED');
+    });
+
+    await phase.test('unrelated facilities and invalid source outputs cannot stockpile material', async () => {
+      const ownWrongOutput = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, outputs: [{ outputId: ids.phaseThree.secondDoraResidue.id, measurementId: ids.phaseThree.secondDoraResidue.measurements[0].id }] });
+      const goldOutput = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, outputs: [{ outputId: ids.processingOutputs[0].id, measurementId: ids.processingOutputs[0].measurements[0].id }] });
+      const crossFacility = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`).set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, outputs: [{ outputId: ids.processingOutputs[1].id, measurementId: ids.processingOutputs[1].measurements[0].id }] });
+      assert.equal(ownWrongOutput.status, 400);
+      assert.equal(goldOutput.status, 400);
+      assert.equal(crossFacility.status, 404);
+      const [total] = await db(`SELECT count(*)::int AS total FROM inventory_movement_line WHERE source_material_event_output_id IN (:residueId,:otherResidueId)`, { residueId: ids.processingOutputs[1].id, otherResidueId: ids.phaseThree.secondDoraResidue.id }, undefined, QueryTypes.SELECT);
+      assert.equal(total.total, 1);
+    });
+
+    await phase.test('a second Dora source batch enters its own stockpile with full origin', async () => {
+      const output = ids.phaseThree.secondDoraResidue;
+      const response = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOtherDora}/intake`).set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, outputs: [{ outputId: output.id, measurementId: output.measurements[0].id }] });
+      assert.equal(response.status, 201, response.text);
+      const [origin] = await db(`SELECT pe.processing_facility_id,peo.output_role FROM material_event_output eo JOIN processing_event_output peo ON peo.material_event_output_id=eo.id JOIN processing_event pe ON pe.event_id=peo.processing_event_id WHERE eo.id=:outputId`, { outputId: output.id }, undefined, QueryTypes.SELECT);
+      assert.equal(origin.processing_facility_id, ids.doraTwoId);
+      assert.equal(origin.output_role, 'DORA_RETAINED_RESIDUE');
+    });
+
+    await phase.test('pooling can move a measured partial batch between stockpiles without a second ledger', async () => {
+      const response = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        destinationStockpileId: ids.phaseThree.stockpileTwo, occurredAt: happenedAt, evidenceRef: 'fictional-pile-split',
+        items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.500000' }],
+      });
+      assert.equal(response.status, 201, response.text);
+      ids.phaseThree.poolMovementId = response.body.id;
+      const balances = await db(`SELECT location_id,quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id IN (:source,:target) ORDER BY location_id`, { batchId: ids.processingOutputs[1].batchId, source: ids.phaseThree.stockpileOne, target: ids.phaseThree.stockpileTwo }, undefined, QueryTypes.SELECT);
+      assert.equal(balances.find((row) => row.location_id === ids.phaseThree.stockpileOne).quantity_g, '2.500000');
+      assert.equal(balances.find((row) => row.location_id === ids.phaseThree.stockpileTwo).quantity_g, '1.500000');
+      assert.equal((await db(`SELECT count(*)::int AS total FROM inventory_movement_line WHERE inventory_movement_id=:id`, { id: response.body.id }, undefined, QueryTypes.SELECT))[0].total, 2);
+      assert.equal((await db(`SELECT count(*)::int AS total FROM information_schema.tables WHERE table_schema='public' AND table_name='stockpile_movement'`, {}, undefined, QueryTypes.SELECT))[0].total, 0);
+
+      const otherDoraBatchId = ids.phaseThree.secondDoraResidue.batchId;
+      const pooledAcrossDoras = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOtherDora}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        destinationStockpileId: ids.phaseThree.stockpileTwo, occurredAt: happenedAt, evidenceRef: 'fictional-cross-dora-pooling',
+        items: [{ batchId: otherDoraBatchId, quantityGrams: '0.500000' }],
+      });
+      assert.equal(pooledAcrossDoras.status, 201, pooledAcrossDoras.text);
+      let crossDoraBalances = await db(`SELECT location_id,quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id IN (:source,:target) ORDER BY location_id`, { batchId: otherDoraBatchId, source: ids.phaseThree.stockpileOtherDora, target: ids.phaseThree.stockpileTwo }, undefined, QueryTypes.SELECT);
+      assert.equal(crossDoraBalances.find((row) => row.location_id === ids.phaseThree.stockpileOtherDora).quantity_g, '2.500000');
+      assert.equal(crossDoraBalances.find((row) => row.location_id === ids.phaseThree.stockpileTwo).quantity_g, '0.500000');
+      const restored = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileTwo}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        destinationStockpileId: ids.phaseThree.stockpileOtherDora, occurredAt: happenedAt, evidenceRef: 'fictional-cross-dora-pooling-restore',
+        items: [{ batchId: otherDoraBatchId, quantityGrams: '0.500000' }],
+      });
+      assert.equal(restored.status, 201, restored.text);
+      crossDoraBalances = await db(`SELECT location_id,quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id IN (:source,:target) ORDER BY location_id`, { batchId: otherDoraBatchId, source: ids.phaseThree.stockpileOtherDora, target: ids.phaseThree.stockpileTwo }, undefined, QueryTypes.SELECT);
+      assert.equal(crossDoraBalances.find((row) => row.location_id === ids.phaseThree.stockpileOtherDora).quantity_g, '3.000000');
+      assert.equal(crossDoraBalances.find((row) => row.location_id === ids.phaseThree.stockpileTwo).quantity_g, '0.000000');
+    });
+
+    await phase.test('stockpile transfers reject overdraw, same-location transfer, and cross-Dora access', async () => {
+      const overdraw = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ destinationStockpileId: ids.phaseThree.stockpileTwo, occurredAt: happenedAt, evidenceRef: 'fictional-overdraw', items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '9.000000' }] });
+      const sameLocation = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ destinationStockpileId: ids.phaseThree.stockpileOne, occurredAt: happenedAt, evidenceRef: 'fictional-same-pile', items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.000000' }] });
+      const crossDora = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({ destinationStockpileId: ids.phaseThree.stockpileOtherDora, occurredAt: happenedAt, evidenceRef: 'fictional-cross-pile', items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.000000' }] });
+      assert.equal(overdraw.status, 409);
+      assert.equal(sameLocation.status, 400);
+      assert.equal(crossDora.status, 404);
+      assert.equal((await request(app).get(`/api/v1/doras/${ids.doraOneId}/stockpiles`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 200);
+      assert.equal((await request(app).get(`/api/v1/doras/${ids.doraOneId}/stockpiles`).set('Authorization', `Bearer ${ids.doraTwoToken}`)).status, 404);
+    });
+
+    await phase.test('residue sale proposal is commercial only and has no payment or inventory effect', async () => {
+      const [movementBefore] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const response = await request(app).post('/api/v1/residue-sales').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        processingFacilityId: ids.doraOneId, recoveryFacilityId: ids.phaseThree.recoveryFacilityId,
+        agreedAt: happenedAt, currencyCode: 'USD', termsRef: 'fictional-residue-sale-terms',
+        lines: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.500000', unitPrice: '100.00000000', lineAmount: '150.00000000' }],
+      });
+      assert.equal(response.status, 201, response.text);
+      assert.equal(response.body.status, 'PROPOSED');
+      ids.phaseThree.saleId = response.body.id;
+      ids.phaseThree.proposedSaleLineId = response.body.lines[0].id;
+      const [movementAfter] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const [payments] = await db(`SELECT count(*)::int AS total FROM payment WHERE residue_sale_id=:saleId`, { saleId: response.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(movementAfter.total, movementBefore.total);
+      assert.equal(payments.total, 0);
+      assert.equal(response.body.lines[0].accepted, false);
+    });
+
+    await phase.test('residue sale acceptance requires both counterparties and records an accepted successor', async () => {
+      const body = { decision: 'ACCEPT', acceptedQuantityGrams: '1.500000', occurredAt: happenedAt };
+      const sellerDecision = await request(app).post(`/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/decisions`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      assert.equal(sellerDecision.status, 201, sellerDecision.text);
+      assert.equal(sellerDecision.body.acceptedLineId, null);
+      const buyerDecision = await request(app).post(`/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      assert.equal(buyerDecision.status, 201, buyerDecision.text);
+      assert.ok(buyerDecision.body.acceptedLineId);
+      ids.phaseThree.acceptedSaleLineId = buyerDecision.body.acceptedLineId;
+      const [accepted] = await db(`SELECT is_accepted,accepted_trade_quantity_g,supersedes_line_id FROM residue_sale_line WHERE id=:id`, { id: ids.phaseThree.acceptedSaleLineId }, undefined, QueryTypes.SELECT);
+      assert.equal(accepted.is_accepted, true);
+      assert.equal(accepted.accepted_trade_quantity_g, '1.500000');
+      assert.equal(accepted.supersedes_line_id, ids.phaseThree.proposedSaleLineId);
+      const secondProposal = await request(app).post('/api/v1/residue-sales').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        processingFacilityId: ids.doraOneId, recoveryFacilityId: ids.phaseThree.recoveryFacilityId, agreedAt: happenedAt, currencyCode: 'USD',
+        lines: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.500000' }],
+      });
+      const overQuantity = await request(app).post(`/api/v1/residue-sales/${secondProposal.body.id}/lines/${secondProposal.body.lines[0].id}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ ...body, acceptedQuantityGrams: '2.000000' });
+      assert.equal(secondProposal.status, 201, secondProposal.text);
+      assert.equal(overQuantity.status, 400);
+      assert.equal((await request(app).get(`/api/v1/residue-sales/${ids.phaseThree.saleId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).status, 200);
+    });
+
+    await phase.test('itemized consignment can combine residue from separate Doras and map a sale line', async () => {
+      const body = {
+        recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt,
+        items: [
+          { sourceStockpileId: ids.phaseThree.stockpileTwo, batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.500000', residueSaleLineId: ids.phaseThree.acceptedSaleLineId },
+          { sourceStockpileId: ids.phaseThree.stockpileOtherDora, batchId: ids.phaseThree.secondDoraResidue.batchId, quantityGrams: '3.000000' },
+        ],
+      };
+      const response = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      assert.equal(response.status, 201, response.text);
+      assert.equal(response.body.items.length, 2);
+      assert.equal(new Set(response.body.items.map((row) => row.batchId)).size, 2);
+      ids.phaseThree.consignmentId = response.body.id;
+      ids.phaseThree.consignmentItems = response.body.items;
+      const [mapped] = await db(`SELECT rssi.mapped_quantity_g,rsl.batch_id,ci.batch_id AS item_batch FROM residue_sale_shipment_item rssi JOIN residue_sale_line rsl ON rsl.id=rssi.residue_sale_line_id JOIN consignment_item ci ON ci.id=rssi.consignment_item_id WHERE ci.consignment_id=:id`, { id: response.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(mapped.mapped_quantity_g, '1.500000');
+      assert.equal(mapped.batch_id, mapped.item_batch);
+    });
+
+    await phase.test('unrelated Dora and read-only auditor cannot create the consignment', async () => {
+      const body = { recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt, items: [{ sourceStockpileId: ids.phaseThree.stockpileTwo, batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.500000' }] };
+      const unrelated = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      const auditor = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      assert.equal(unrelated.status, 404);
+      assert.equal(auditor.status, 404);
+      assert.equal((await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`)).status, 404);
+    });
+
+    await phase.test('dispatch posts paired stockpile OUT and transit IN exactly once', async () => {
+      const items = ids.phaseThree.consignmentItems.map((row) => ({ consignmentItemId: row.id, measurementId: row.measurementId }));
+      const body = { occurredAt: happenedAt, evidenceRef: 'fictional-dispatch-manifest', items };
+      const key = randomUUID();
+      const [first, retry] = await Promise.all([
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/dispatch`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', key).send(body),
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/dispatch`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', key).send(body),
+      ]);
+      assert.equal(first.status, 200, first.text);
+      assert.equal(retry.status, 200, retry.text);
+      assert.equal([first, retry].filter((response) => response.body.replayed).length, 1);
+      assert.equal(retry.body.id, first.body.id);
+      const postings = await db(`SELECT direction,count(*)::int AS lines,sum(posted_quantity_g)::NUMERIC(20,6) AS quantity_g FROM inventory_movement_line WHERE inventory_movement_id=:movementId GROUP BY direction ORDER BY direction`, { movementId: first.body.id }, undefined, QueryTypes.SELECT);
+      assert.deepEqual(postings.map((row) => [row.direction, row.lines]), [['IN', 2], ['OUT', 2]]);
+      assert.equal((await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.doraToken}`)).body.status, 'DISPATCHED');
+      const [saleOut] = await db(`SELECT sum(posted_quantity_g)::NUMERIC(20,6) AS quantity_g FROM inventory_movement_line WHERE inventory_movement_id=:id AND residue_sale_line_id=:lineId`, { id: first.body.id, lineId: ids.phaseThree.acceptedSaleLineId }, undefined, QueryTypes.SELECT);
+      assert.equal(saleOut.quantity_g, '1.500000');
+    });
+
+    await phase.test('over-dispatch fails atomically and leaves no movement', async () => {
+      const manifest = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt,
+        items: [{ sourceStockpileId: ids.phaseThree.stockpileOne, batchId: ids.processingOutputs[1].batchId, quantityGrams: '20.000000' }],
+      });
+      assert.equal(manifest.status, 201, manifest.text);
+      const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const dispatch = await request(app).post(`/api/v1/consignments/${manifest.body.id}/dispatch`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, items: [{ consignmentItemId: manifest.body.items[0].id, measurementId: manifest.body.items[0].measurementId }] });
+      const [after] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(dispatch.status, 409);
+      assert.equal(after.total, before.total);
+      assert.equal((await db(`SELECT status FROM consignment WHERE id=:id`, { id: manifest.body.id }, undefined, QueryTypes.SELECT))[0].status, 'DRAFT');
+    });
+
+    await phase.test('transport legs record journey evidence without changing inventory', async () => {
+      const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const response = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/transport-legs`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        carrierPartyId: ids.doraWeigherPartyId, vehicleRef: 'FICTIONAL-TRUCK-01', departureAt: happenedAt, arrivalAt: '2026-11-10T10:30:00.000Z', evidenceRef: 'fictional-transport-note',
+      });
+      assert.equal(response.status, 201, response.text);
+      const [after] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(after.total, before.total);
+      assert.equal((await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/transport-legs`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ departureAt: '2026-11-10T11:00:00.000Z', arrivalAt: happenedAt })).status, 400);
+    });
+
+    await phase.test('recovery facility creates a typed inventory location and auditors retain read-only access', async () => {
+      const response = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/inventory-locations`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ locationCode: 'P3-RECOVERY-VAULT-A', physicalPlaceRef: 'fictional-vault-a' });
+      assert.equal(response.status, 201, response.text);
+      ids.phaseThree.recoveryLocationId = response.body.id;
+      const [type] = await db(`SELECT l.location_kind,ril.recovery_facility_id FROM inventory_location l JOIN recovery_inventory_location ril ON ril.inventory_location_id=l.id WHERE l.id=:id`, { id: response.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(type.location_kind, 'RECOVERY_FACILITY');
+      assert.equal(type.recovery_facility_id, ids.phaseThree.recoveryFacilityId);
+      assert.equal((await request(app).get(`/api/v1/inventory/locations/${response.body.id}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`)).status, 200);
+      const deniedWrite = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/inventory-locations`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send({ locationCode: 'P3-RECOVERY-AUDITOR-LOCATION' });
+      assert.equal(deniedWrite.status, 404);
+    });
+
+    await phase.test('Dora offers custody separately from dispatch and the receiving facility accepts it explicitly', async () => {
+      const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const offer = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/custody-offers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ destinationLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, evidenceRef: 'fictional-custody-offer' });
+      assert.equal(offer.status, 201, offer.text);
+      ids.phaseThree.custodyTransferId = offer.body.id;
+      assert.equal(offer.body.status, 'OFFERED');
+      const [afterOffer] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(afterOffer.total, before.total);
+      const denied = await request(app).post(`/api/v1/custody-transfers/${offer.body.id}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', occurredAt: happenedAt });
+      assert.equal(denied.status, 404);
+      const accepted = await request(app).post(`/api/v1/custody-transfers/${offer.body.id}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', occurredAt: happenedAt });
+      assert.equal(accepted.status, 200, accepted.text);
+      assert.equal(accepted.body.status, 'ACCEPTED');
+      const [afterAccept] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(afterAccept.total, before.total);
+    });
+
+    await phase.test('partial receipt transfers only accepted quantities and leaves disputes in transit', async () => {
+      const items = ids.phaseThree.consignmentItems;
+      const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const body = {
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, evidenceRef: 'fictional-partial-receipt',
+        items: [
+          { consignmentItemId: items[0].id, quantityGrams: '0.500000', outcome: 'ACCEPTED' },
+          { consignmentItemId: items[1].id, quantityGrams: '0.500000', outcome: 'DISPUTED', reason: 'Recorded count needs review.' },
+        ],
+      };
+      const key = randomUUID();
+      const [first, retry] = await Promise.all([
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', key).send(body),
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', key).send(body),
+      ]);
+      assert.equal(first.status, 201, first.text);
+      assert.equal(retry.status, 201, retry.text);
+      assert.equal([first, retry].filter((response) => response.body.replayed).length, 1);
+      assert.equal(retry.body.id, first.body.id);
+      ids.phaseThree.partialReceipt = first.body;
+      assert.equal(first.body.status, 'DISPUTED');
+      const [after] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(after.total, before.total + 1);
+      const [transit] = await db(`SELECT quantity_g FROM inventory_balance WHERE location_id=(SELECT transit_location_id FROM consignment WHERE id=:id) AND batch_id=:batchId`, { id: ids.phaseThree.consignmentId, batchId: ids.processingOutputs[1].batchId }, undefined, QueryTypes.SELECT);
+      assert.equal(transit.quantity_g, '1.000000');
+      const [destination] = await db(`SELECT quantity_g FROM inventory_balance WHERE location_id=:locationId AND batch_id=:batchId`, { locationId: ids.phaseThree.recoveryLocationId, batchId: ids.processingOutputs[1].batchId }, undefined, QueryTypes.SELECT);
+      assert.equal(destination.quantity_g, '0.500000');
+    });
+
+    await phase.test('disputed and rejected receipt claims remain evidence and create no movement', async () => {
+      const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      const response = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+        items: [{ consignmentItemId: ids.phaseThree.consignmentItems[1].id, quantityGrams: '0.250000', outcome: 'REJECTED', reason: 'Package measurement was not accepted.' }],
+      });
+      assert.equal(response.status, 201, response.text);
+      assert.equal(response.body.status, 'DISPUTED');
+      const [after] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(after.total, before.total);
+      assert.equal((await db(`SELECT outcome FROM consignment_receipt_item WHERE id=:id`, { id: response.body.items[0].id }, undefined, QueryTypes.SELECT))[0].outcome, 'REJECTED');
+    });
+
+    await phase.test('full receipt reconciles the remaining dispatch and closes transit inventory', async () => {
+      const body = {
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, evidenceRef: 'fictional-final-receipt',
+        items: [
+          { consignmentItemId: ids.phaseThree.consignmentItems[0].id, quantityGrams: '1.000000', outcome: 'ACCEPTED' },
+          { consignmentItemId: ids.phaseThree.consignmentItems[1].id, quantityGrams: '3.000000', outcome: 'ACCEPTED' },
+        ],
+      };
+      const response = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      assert.equal(response.status, 201, response.text);
+      assert.equal(response.body.status, 'RECEIVED');
+      const [transit] = await db(`SELECT COALESCE(sum(quantity_g),0)::NUMERIC(20,6) AS quantity_g FROM inventory_balance WHERE location_id=(SELECT transit_location_id FROM consignment WHERE id=:id)`, { id: ids.phaseThree.consignmentId }, undefined, QueryTypes.SELECT);
+      assert.equal(transit.quantity_g, '0.000000');
+      assert.equal((await db(`SELECT status FROM consignment WHERE id=:id`, { id: ids.phaseThree.consignmentId }, undefined, QueryTypes.SELECT))[0].status, 'RECEIVED');
+      assert.equal((await db(`SELECT sum(posted_quantity_g)::NUMERIC(20,6) AS quantity_g FROM inventory_movement_line WHERE consignment_item_id=:itemId AND consignment_stage='RECEIPT' AND direction='IN'`, { itemId: ids.phaseThree.consignmentItems[0].id }, undefined, QueryTypes.SELECT))[0].quantity_g, '1.500000');
+      ids.phaseThree.firstConsignmentFinalReceiptItems = response.body.items;
+    });
+
+    await phase.test('partial repeated dispatches can source one batch across multiple consignments', async () => {
+      const created = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt,
+        items: [{ sourceStockpileId: ids.phaseThree.stockpileOne, batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.000000' }],
+      });
+      assert.equal(created.status, 201, created.text);
+      ids.phaseThree.secondConsignmentId = created.body.id;
+      ids.phaseThree.secondConsignmentItem = created.body.items[0];
+      const dispatch = await request(app).post(`/api/v1/consignments/${created.body.id}/dispatch`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, items: [{ consignmentItemId: created.body.items[0].id, measurementId: created.body.items[0].measurementId }] });
+      assert.equal(dispatch.status, 200, dispatch.text);
+      const receipt = await request(app).post(`/api/v1/consignments/${created.body.id}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+        items: [{ consignmentItemId: created.body.items[0].id, quantityGrams: '1.000000', outcome: 'ACCEPTED' }],
+      });
+      assert.equal(receipt.status, 201, receipt.text);
+      assert.equal(receipt.body.status, 'RECEIVED');
+      ids.phaseThree.secondConsignmentReceiptItem = receipt.body.items[0];
+    });
+
+    await phase.test('recovery event consumes multiple batches from multiple consignments and preserves output genealogy', async () => {
+      const firstItems = ids.phaseThree.firstConsignmentFinalReceiptItems;
+      const firstBatchReceipt = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const firstFinalBatchReceipt = firstItems.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const secondBatchReceipt = firstItems.find((row) => row.batchId === ids.phaseThree.secondDoraResidue.batchId);
+      assert.equal(firstBatchReceipt.outcome, 'ACCEPTED');
+      const body = {
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, methodRef: 'fictional-recovery-run-1',
+        stages: [{ stageCode: 'LEACHING', occurredAt: happenedAt, note: 'Broad event classification only.' }, { stageCode: 'FINAL_RECOVERY', occurredAt: happenedAt }],
+        inputs: [
+          { batchId: ids.processingOutputs[1].batchId, quantityGrams: '2.500000', sources: [
+            { receiptItemId: firstBatchReceipt.id, quantityGrams: '0.500000' },
+            { receiptItemId: firstFinalBatchReceipt.id, quantityGrams: '1.000000' },
+            { receiptItemId: ids.phaseThree.secondConsignmentReceiptItem.id, quantityGrams: '1.000000' },
+          ] },
+          { batchId: ids.phaseThree.secondDoraResidue.batchId, quantityGrams: '3.000000', sources: [{ receiptItemId: secondBatchReceipt.id, quantityGrams: '3.000000' }] },
+        ],
+        outputs: [
+          { materialKind: 'RECOVERED_GOLD', outputRole: 'RECOVERED_GOLD', quantityGrams: '0.250000' },
+          { materialKind: 'PROCESS_OUTPUT', outputRole: 'OTHER_OUTPUT', quantityGrams: '0.100000' },
+        ],
+        variances: [{ varianceKind: 'PROCESS', expectedQuantityGrams: '5.500000', observedQuantityGrams: '0.350000', reason: 'Fictional recorded process variance; review required.' }],
+      };
+      const key = randomUUID();
+      const [first, retry] = await Promise.all([
+        request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', key).send(body),
+        request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', key).send(body),
+      ]);
+      assert.equal(first.status, 201, first.text);
+      assert.equal(retry.status, 201, retry.text);
+      assert.equal([first, retry].filter((response) => response.body.replayed).length, 1);
+      assert.equal(retry.body.id, first.body.id);
+      ids.phaseThree.recoveryEventId = first.body.id;
+      assert.equal(first.body.inputs.length, 2);
+      assert.equal(first.body.outputs.length, 2);
+      assert.equal(first.body.stages.length, 2);
+      assert.equal(first.body.variances.length, 1);
+      const [genealogy] = await db(`SELECT count(*)::int AS total FROM recovery_output_input_link WHERE recovery_event_id=:id`, { id: first.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(genealogy.total, 4);
+      const detail = await request(app).get(`/api/v1/recovery-events/${first.body.id}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(detail.status, 200, detail.text);
+      assert.equal(detail.body.outputs.every((output) => output.contributing_batch_ids.length === 2), true);
+      assert.equal(detail.body.inputs.reduce((sum, row) => sum + row.sources.length, 0), 4);
+      assert.equal((await request(app).get(`/api/v1/recovery-events/${first.body.id}`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`)).status, 404);
+    });
+
+    await phase.test('recovery cannot consume another facility, unsupported material, or already consumed sources', async () => {
+      const attempt = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send(validRecoveryEventBody(ids.phaseThree.recoveryLocationId));
+      assert.equal(attempt.status, 404);
+      const source = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const [before] = await db(`SELECT count(*)::int AS total FROM material_event WHERE event_kind='RECOVERY'`, {}, undefined, QueryTypes.SELECT);
+      const overuse = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+        inputs: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.100000', sources: [{ receiptItemId: source.id, quantityGrams: '0.100000' }] }],
+        outputs: [{ materialKind: 'RECOVERED_GOLD', outputRole: 'RECOVERED_GOLD', quantityGrams: '0.010000' }],
+      });
+      const [after] = await db(`SELECT count(*)::int AS total FROM material_event WHERE event_kind='RECOVERY'`, {}, undefined, QueryTypes.SELECT);
+      assert.equal(overuse.status, 409);
+      assert.equal(after.total, before.total);
+      const [badKinds] = await db(`SELECT count(*)::int AS total FROM recovery_event_input WHERE recovery_event_id=:id AND batch_id=:batchId`, { id: ids.phaseThree.recoveryEventId, batchId: ids.phaseThree.secondDoraResidue.batchId }, undefined, QueryTypes.SELECT);
+      assert.equal(badKinds.total, 1);
+    });
+
+    await phase.test('recovery outputs are aggregate records and are not assigned to source miners', async () => {
+      const [outputCount] = await db(`SELECT count(*)::int AS total FROM recovery_event_output WHERE recovery_event_id=:id`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      const [allocationCount] = await db(`SELECT count(*)::int AS total FROM production_allocation_row WHERE allocation_set_id IN (SELECT id FROM production_allocation_set WHERE allocation_chain_id IN (SELECT id FROM production_allocation_chain WHERE production_event_output_id IN (SELECT material_event_output_id FROM recovery_event_output WHERE recovery_event_id=:id)))`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      assert.equal(outputCount.total, 2);
+      assert.equal(allocationCount.total, 0);
+      assert.equal((await verifyAuditStream('recovery_facility', ids.phaseThree.recoveryFacilityId)).valid, true);
+    });
+
+    await phase.test('read-only auditors can read balances but cannot adjust or create recovery events', async () => {
+      const read = await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`);
+      assert.equal(read.status, 200, read.text);
+      const eventWrite = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send(validRecoveryEventBody(ids.phaseThree.recoveryLocationId));
+      const adjustment = await request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send({ batchId: ids.phaseThree.recoveryEventId, countedQuantityGrams: '1.000000', reason: 'not permitted', evidenceRef: 'fictional-evidence', occurredAt: happenedAt });
+      assert.equal(eventWrite.status, 404);
+      assert.equal(adjustment.status, 404, adjustment.text);
+    });
+
+    await phase.test('recovery inventory adjustment is count-backed and append-only', async () => {
+      const [output] = await db(`SELECT ro.batch_id FROM recovery_event_output ro JOIN material_batch mb ON mb.id=ro.batch_id WHERE ro.recovery_event_id=:id AND mb.material_kind='RECOVERED_GOLD'`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      const result = await request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+        batchId: output.batch_id, countedQuantityGrams: '0.200000', reason: 'Fictional evidenced count variance.', evidenceRef: 'fictional-count-record', occurredAt: happenedAt,
+      });
+      assert.equal(result.status, 201, result.text);
+      const [movement] = await db(`SELECT movement_kind,current_status FROM inventory_movement WHERE id=:id`, { id: result.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(movement.movement_kind, 'ADJUSTMENT');
+      assert.equal(movement.current_status, 'ACCEPTED');
+      assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).body.find((row) => row.batch_id === output.batch_id).quantity_g, '0.200000');
+      assert.equal((await db(`SELECT count(*)::int AS total FROM inventory_movement_line WHERE inventory_movement_id=:id AND inventory_count_id IS NOT NULL`, { id: result.body.id }, undefined, QueryTypes.SELECT))[0].total, 1);
+
+      const concurrentAdjustments = await Promise.all([
+        request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          batchId: output.batch_id, countedQuantityGrams: '0.300000', reason: 'Fictional concurrent count A.', evidenceRef: 'fictional-concurrent-count-a', occurredAt: happenedAt,
+        }),
+        request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          batchId: output.batch_id, countedQuantityGrams: '0.300000', reason: 'Fictional concurrent count B.', evidenceRef: 'fictional-concurrent-count-b', occurredAt: happenedAt,
+        }),
+      ]);
+      assert.deepEqual(concurrentAdjustments.map((response) => response.status).sort(), [201, 409]);
+      assert.equal(concurrentAdjustments.find((response) => response.status === 409).body.error.code, 'NO_ADJUSTMENT_REQUIRED');
+      assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).body.find((row) => row.batch_id === output.batch_id).quantity_g, '0.300000');
+    });
+
+    await phase.test('receipt, movement, and variance evidence cannot be overwritten', async () => {
+      await assert.rejects(db(`UPDATE consignment_receipt_item SET outcome='REJECTED' WHERE id=:id`, { id: ids.phaseThree.partialReceipt.items[0].id }), sqlError('55000'));
+      const [variance] = await db(`SELECT id FROM recovery_variance WHERE recovery_event_id=:id`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      await assert.rejects(db(`UPDATE recovery_variance SET reason='Changed' WHERE id=:id`, { id: variance.id }), sqlError('55000'));
+      const [acceptedMovement] = await db(`SELECT id FROM inventory_movement WHERE event_id=:id`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      await assert.rejects(db(`UPDATE inventory_movement SET reason='Changed' WHERE id=:id`, { id: acceptedMovement.id }), sqlError('55000'));
+    });
+
+    await phase.test('recovery facility permissions are live and role revocation takes effect immediately', async () => {
+      const revoked = await request(app).post(`/api/v1/admin/role-assignments/${ids.phaseThree.recoveryRoleId}/revoke`).set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({});
+      assert.equal(revoked.status, 200, revoked.text);
+      const stillToken = await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(stillToken.status, 404);
+      assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`)).status, 200);
+    });
   });
 
   await t.test('one inventory journal, nonnegative concurrent movements, rollback, and commercial cap', async () => {
