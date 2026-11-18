@@ -65,9 +65,9 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API, foreign-key, production-to-Dora lineage, allocation revision concurrency and eligibility, facility access, QR authorization/revocation, measurement source attribution and rollback, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only. The 15 integration scenarios include rollback/reapply coverage for migration 003 and regression assertions for the Phase 2 security corrections; rerun them after setting `TEST_DATABASE_URL`.
+Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API, foreign-key, production-to-Dora lineage, allocation revision concurrency and eligibility, facility access, QR authorization/revocation, measurement source attribution and rollback, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only. The verified suite reports 15 tests passed and 0 failed. The integration tests include rollback/reapply coverage for migration 003 and regression assertions for the Phase 2 security corrections.
 
-Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. The correction set's syntax check passed for 22 ES modules; its PostgreSQL integration result is pending the dedicated test database configuration.
+Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. The correction set's syntax check passed for 22 ES modules, and the PostgreSQL suite passed all 15 tests with no failures against the dedicated `_test` database.
 
 ## Available API routes
 

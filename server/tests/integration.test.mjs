@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const testUrl = process.env.TEST_DATABASE_URL;
 if (!testUrl) throw new Error('Set TEST_DATABASE_URL to a dedicated PostgreSQL database whose name ends in _test.');
@@ -50,10 +51,14 @@ async function seedUser(email, displayName, role = null) {
   return { userId, partyId, roleAssignmentId };
 }
 
-async function signIn(email, secret = password) {
-  const response = await request(app).post('/api/v1/auth/login').send({ email, password: secret });
-  assert.equal(response.status, 200, response.text);
-  return response.body.token;
+function testToken(userId) {
+  return jwt.sign({}, process.env.JWT_SECRET, {
+    subject: userId,
+    issuer: 'minaledger-api',
+    audience: 'minaledger-client',
+    expiresIn: '15m',
+    jwtid: randomUUID(),
+  });
 }
 
 async function createLocation(code, kind = 'OTHER') {
@@ -114,8 +119,8 @@ before(async () => {
   const pilot = await seedUser('pilot@example.test', 'Fictional Field Recorder', { roleCode: 'FIELD_OFFICER', scopeKind: 'PILOT', scopeId: 'default' });
   ids.pilotUserId = pilot.userId;
   ids.pilotPartyId = pilot.partyId;
-  ids.adminToken = await signIn('admin@example.test');
-  ids.pilotToken = await signIn('pilot@example.test');
+  ids.adminToken = testToken(ids.adminUserId);
+  ids.pilotToken = testToken(pilot.userId);
 });
 
 after(async () => {
@@ -188,7 +193,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const grant = await request(app).post(`/api/v1/admin/users/${ids.siteUserId}/roles`).set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({ roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteId });
     assert.equal(grant.status, 201, grant.text);
     ids.siteRoleId = grant.body.id;
-    ids.siteToken = await signIn('site-recorder@example.test');
+    ids.siteToken = testToken(ids.siteUserId);
 
     ids.siteBId = randomUUID();
     await db(`INSERT INTO mining_site(id,site_code,name,created_by_user_id) VALUES (:id,'FICTIONAL-SITE-02','Second Fictional Site',:userId)`, { id: ids.siteBId, userId: ids.adminUserId });
@@ -205,7 +210,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await db(`INSERT INTO organisation_membership(id,person_party_id,organisation_party_id,membership_type) VALUES (:id,:personId,:orgId,'MEMBER')`, { id: randomUUID(), personId: orgUser.partyId, orgId: ids.organisationId });
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'MINING_OPERATOR','ORGANISATION',:orgId)`, { id: randomUUID(), userId: orgUser.userId, orgId: ids.organisationId });
     await db(`INSERT INTO site_party_role(id,site_id,party_id,role_code,asserted_by_user_id) VALUES (:id,:siteId,:partyId,'SITE_OPERATOR',:actor)`, { id: randomUUID(), siteId: ids.siteBId, partyId: ids.organisationId, actor: ids.adminUserId });
-    ids.orgToken = await signIn('organisation-recorder@example.test');
+    ids.orgToken = testToken(orgUser.userId);
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 200);
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 403);
     const orgSites = await request(app).get('/api/v1/sites').set('Authorization', `Bearer ${ids.orgToken}`);
@@ -415,11 +420,11 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeId,
     });
     ids.holeA1RoleId = holeA1User.roleAssignmentId;
-    const holeA1Token = await signIn('hole-a1-recorder@example.test');
+    const holeA1Token = testToken(holeA1User.userId);
     const holeB1User = await seedUser('hole-b1-recorder@example.test', 'Fictional Hole B1 Recorder', {
       roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeB1Id,
     });
-    const holeB1Token = await signIn('hole-b1-recorder@example.test');
+    const holeB1Token = testToken(holeB1User.userId);
 
     const a1 = await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeA1Token}`);
     assert.equal(a1.status, 200, a1.text);
@@ -470,7 +475,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const siteAuditor = await seedUser('site-auditor@example.test', 'Fictional Site Auditor', {
       roleCode: 'AUDITOR', scopeKind: 'SITE', scopeId: ids.siteId,
     });
-    const siteAuditorToken = await signIn('site-auditor@example.test');
+    const siteAuditorToken = testToken(siteAuditor.userId);
     ids.siteAuditorToken = siteAuditorToken;
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${siteAuditorToken}`)).status, 200);
     const auditorWrite = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}/outputs/${holeA2Output.id}/measurements`)
@@ -735,7 +740,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await db(`INSERT INTO facility_party_role(id,processing_facility_id,party_id,role_code,valid_from,asserted_by_user_id) VALUES (:id,:facilityId,:partyId,'WEIGHER','2026-11-01T00:00:00.000Z',:actor)`, {
       id: randomUUID(), facilityId: ids.doraOneId, partyId: ids.doraWeigherPartyId, actor: ids.siteUserId,
     });
-    ids.doraToken = await signIn('dora-operator@example.test');
+    ids.doraToken = testToken(doraUser.userId);
     assert.equal((await request(app).get(`/api/v1/doras/${ids.doraOneId}`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 200);
     assert.equal((await request(app).get(`/api/v1/doras/${ids.doraTwoId}`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 404);
 
@@ -856,7 +861,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
       id: randomUUID(), userId: secondDoraUser.userId, holeId: ids.holeId,
     });
-    const secondDoraToken = await signIn('other-dora-operator@example.test');
+    const secondDoraToken = testToken(secondDoraUser.userId);
     const deniedFacilityCreate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
       .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
     const deniedFacilityRotate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr/rotate`)
@@ -876,7 +881,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const siteOperator = await seedUser('site-mining-operator@example.test', 'Fictional Site Mining Operator', {
       roleCode: 'MINING_OPERATOR', scopeKind: 'SITE', scopeId: ids.siteId,
     });
-    const siteOperatorToken = await signIn('site-mining-operator@example.test');
+    const siteOperatorToken = testToken(siteOperator.userId);
     const siteOperatorQr = await request(app).post(`/api/v1/material-batches/${ids.outputs[0].batchId}/qr`)
       .set('Authorization', `Bearer ${siteOperatorToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(siteOperatorQr.status, 201, siteOperatorQr.text);
@@ -895,7 +900,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const holeUser = await seedUser('hole-qr-operator@example.test', 'Fictional Hole QR Operator', {
       roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.secondHoleId,
     });
-    const holeToken = await signIn('hole-qr-operator@example.test');
+    const holeToken = testToken(holeUser.userId);
     const holeQr = await request(app).post(`/api/v1/material-batches/${ids.holeA2BatchId}/qr`)
       .set('Authorization', `Bearer ${holeToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(holeQr.status, 201, holeQr.text);
@@ -912,7 +917,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const otherSiteUser = await seedUser('other-site-qr-operator@example.test', 'Fictional Other Site Operator', {
       roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId,
     });
-    const otherSiteToken = await signIn('other-site-qr-operator@example.test');
+    const otherSiteToken = testToken(otherSiteUser.userId);
     const crossSiteCreate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
       .set('Authorization', `Bearer ${otherSiteToken}`).set('Idempotency-Key', randomUUID()).send({});
     const crossSiteRotate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
