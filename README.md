@@ -6,7 +6,7 @@ MinaLedger is a gold-only production accountability and traceability platform fo
 
 **The Phase 1 foundation and a Phase 2 production-to-Dora backend slice are verified; the overall implementation remains partial.** The backend uses Node.js ES modules, Express, Sequelize and PostgreSQL. It includes scoped accounts and roles, effective-dated site and hole participants, production outputs and capture provenance, typed append-only measurement observations, complete allocation proposals and revisions, independently authorized Dora facilities, processing inputs and outputs, protected opaque QR lookup, a single inventory movement journal, and per-aggregate hash-linked audit streams.
 
-Allocation proposals start as `PENDING`; the API does not expose approval, dispute or rejection commands while the pilot reviewer, eligible measurement kinds, review evidence and dispute rules remain unresolved. Processing records the selected Dora and source production outputs, input/output measurements, and each output's recorded role. Miner-retained gold and Dora-retained residue remain separate batches; these records do not establish legal entitlement or custody. Inventory posting remains internal, and complete movement, consignment, residue recovery and trade APIs are later work. There is no frontend, offline sync engine or distributed blockchain network.
+Allocation proposals start as `PENDING` and require an active, effective site or hole `BENEFICIARY` relationship for every named party; the model supports miners and recorded non-miner beneficiaries without treating land access as entitlement. The API does not expose approval, dispute or rejection commands while the pilot reviewer, eligible measurement kinds, review evidence and dispute rules remain unresolved. Production and processing measurements validate source parties against effective participant or facility relationships; only an explicit `RECORDER` observation defaults to the authenticated recorder. Processing records the selected Dora and source production outputs, input/output measurements, and each output's recorded role. Miner-retained gold and Dora-retained residue remain separate batches; these records do not establish legal entitlement or custody. Inventory posting remains internal, and complete movement, consignment, residue recovery and trade APIs are later work. There is no frontend, offline sync engine or distributed blockchain network.
 
 The two approved routes remain in scope: direct gold sales through local and larger merchants, and residue through Dora processing, aggregation, recovery and later gold sale. A cooperative is optional. Participant identity, role, entitlement, custody, measurement and commercial events remain separate concepts.
 
@@ -65,9 +65,9 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API, foreign-key, production-to-Dora lineage, allocation revision concurrency, facility access, QR revocation, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only. The current verified suite reports 14 tests with no failures.
+Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API, foreign-key, production-to-Dora lineage, allocation revision concurrency and eligibility, facility access, QR authorization/revocation, measurement source attribution and rollback, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only. The 15 integration scenarios include rollback/reapply coverage for migration 003 and regression assertions for the Phase 2 security corrections; rerun them after setting `TEST_DATABASE_URL`.
 
-Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`.
+Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. The correction set's syntax check passed for 22 ES modules; its PostgreSQL integration result is pending the dedicated test database configuration.
 
 ## Available API routes
 
@@ -107,7 +107,7 @@ Production measurement quantities are JSON decimal strings, such as `"10.250000"
 - Hole-scoped grants apply only to the assigned hole. Site details and site-wide participant/production listings require a site-level grant; nested production and measurement requests verify the event's actual site and hole.
 - Site, production, allocation proposal, Dora, processing, QR, user/role, measurement and inventory writes append redacted business audit events in the same transaction. Audit streams are per aggregate and are not a distributed blockchain.
 - A Dora's site association does not grant processing access. Direct facility and processing-event access requires a matching facility role/relationship plus access to every source hole. Administrators do not receive automatic access to production or processing details.
-- QR payloads contain only random opaque tokens. The database stores the QR token hash on its QR record; resolution still requires authentication and authorization for the source hole and, for processed material, the selected facility.
+- QR payloads contain only random opaque tokens. The database stores the QR token hash on its QR record; resolution still requires authentication and read authorization for every source hole and processing facility. Creation and rotation require write authorization across that same lineage.
 - `.env`, credentials, and local database files are excluded from Git.
 
 ## Approved project documents

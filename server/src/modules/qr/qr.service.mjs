@@ -31,12 +31,12 @@ async function batchOrigins(batchId) {
   );
 }
 
-export async function canAccessBatch(auth, batchId) {
+export async function canAccessBatch(auth, batchId, { write = false } = {}) {
   const origins = await batchOrigins(batchId);
   if (!origins.length) return false;
   for (const origin of origins) {
-    if (!(await canAccessHole(auth, origin.site_id, origin.hole_id))) return false;
-    if (origin.processing_facility_id && !(await canAccessProcessingFacility(auth, origin.processing_facility_id))) return false;
+    if (!(await canAccessHole(auth, origin.site_id, origin.hole_id, { write }))) return false;
+    if (origin.processing_facility_id && !(await canAccessProcessingFacility(auth, origin.processing_facility_id, { write }))) return false;
   }
   return true;
 }
@@ -69,14 +69,14 @@ async function createQrRecord(batchId, auth, mutationId, transaction, previousId
 }
 
 export async function createBatchQr(batchId, auth, mutationId) {
-  if (!(await canAccessBatch(auth, batchId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  if (!(await canAccessBatch(auth, batchId, { write: true }))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   return sequelize.transaction(async (transaction) => executeIdempotent({
     actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'qr.create', batchId }, transaction,
   }, () => createQrRecord(batchId, auth, mutationId, transaction)));
 }
 
 export async function rotateBatchQr(batchId, auth, mutationId) {
-  if (!(await canAccessBatch(auth, batchId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  if (!(await canAccessBatch(auth, batchId, { write: true }))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   return sequelize.transaction(async (transaction) => executeIdempotent({
     actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'qr.rotate', batchId }, transaction,
   }, async () => {

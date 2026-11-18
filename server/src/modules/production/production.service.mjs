@@ -5,6 +5,7 @@ import { MaterialBatch, MaterialEvent, MiningHole, ProductionEvent } from '../..
 import { AppError } from '../../utils/errors.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
+import { assertMeasurementSource, resolveMeasurementSourceParty } from '../measurements/source-attribution.service.mjs';
 
 export async function createProductionEvent(siteId, input, auth, mutationId) {
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'production.create', siteId, input }, transaction }, async () => {
@@ -106,14 +107,19 @@ export async function createProductionEvent(siteId, input, auth, mutationId) {
       const measurements = [];
       for (const measure of outputInput.measurements ?? []) {
         const measurementId = randomUUID();
+        const occurredAt = measure.occurredAt ?? input.occurredAt;
+        const sourcePartyId = resolveMeasurementSourceParty(measure, auth);
+        await assertMeasurementSource({
+          sourcePartyId, sourceRole: measure.sourceRole, auth, occurredAt, productionEventId: eventId, transaction,
+        });
         await sequelize.query(
           `INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,method_code,instrument_ref,occurred_at_claimed,evidence_ref)
            VALUES (:id,:setId,:kind,:quantity,:sourceValue,:unit,:conversion,:sourceRole,:sourcePartyId,:userId,:method,:instrument,:occurredAt,:evidenceRef)`,
           { replacements: {
             id: measurementId, setId: measurementSetId, kind: measure.kind, quantity: measure.quantityGrams, sourceValue: measure.sourceValue,
             unit: measure.sourceUnit, conversion: measure.conversionVersion, sourceRole: measure.sourceRole,
-            sourcePartyId: measure.sourcePartyId ?? actor[0].person_party_id, userId: auth.userId, method: measure.methodCode ?? null,
-            instrument: measure.instrumentRef ?? null, occurredAt: measure.occurredAt ?? input.occurredAt, evidenceRef: measure.evidenceRef ?? null,
+            sourcePartyId, userId: auth.userId, method: measure.methodCode ?? null,
+            instrument: measure.instrumentRef ?? null, occurredAt, evidenceRef: measure.evidenceRef ?? null,
           }, transaction },
         );
         measurements.push({ id: measurementId, kind: measure.kind, quantityGrams: measure.quantityGrams, enteredAt: new Date() });
@@ -133,7 +139,7 @@ export async function createProductionEvent(siteId, input, auth, mutationId) {
 export async function addOutputMeasurement(siteId, eventId, outputId, input, auth, mutationId) {
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'measurement.add', siteId, eventId, outputId, input }, transaction }, async () => {
     const rows = await sequelize.query(
-      `SELECT eo.id AS output_id, eo.batch_id, ms.id AS measurement_set_id
+      `SELECT eo.id AS output_id, eo.batch_id, ms.id AS measurement_set_id, pe.event_id AS production_event_id
        FROM production_event pe JOIN mining_hole h ON h.id=pe.hole_id
        JOIN production_event_output peo ON peo.production_event_id=pe.event_id
        JOIN material_event_output eo ON eo.id=peo.material_event_output_id
@@ -142,11 +148,17 @@ export async function addOutputMeasurement(siteId, eventId, outputId, input, aut
       { replacements: { eventId, outputId, siteId }, type: QueryTypes.SELECT, transaction },
     );
     if (!rows.length) throw new AppError(404, 'PRODUCTION_OUTPUT_NOT_FOUND', 'Production output was not found for this site.');
+    const occurredAt = input.occurredAt;
+    const sourcePartyId = resolveMeasurementSourceParty(input, auth);
+    await assertMeasurementSource({
+      sourcePartyId, sourceRole: input.sourceRole, auth, occurredAt,
+      productionEventId: rows[0].production_event_id, transaction,
+    });
     const measurementId = randomUUID();
     await sequelize.query(
       `INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,method_code,instrument_ref,occurred_at_claimed,evidence_ref,supersedes_measurement_id)
        VALUES (:id,:setId,:kind,:quantity,:sourceValue,:unit,:conversion,:sourceRole,:sourcePartyId,:userId,:method,:instrument,:occurredAt,:evidenceRef,:supersedesId)`,
-      { replacements: { id: measurementId, setId: rows[0].measurement_set_id, kind: input.kind, quantity: input.quantityGrams, sourceValue: input.sourceValue, unit: input.sourceUnit, conversion: input.conversionVersion, sourceRole: input.sourceRole, sourcePartyId: input.sourcePartyId ?? auth.personPartyId, userId: auth.userId, method: input.methodCode ?? null, instrument: input.instrumentRef ?? null, occurredAt: input.occurredAt, evidenceRef: input.evidenceRef ?? null, supersedesId: input.supersedesMeasurementId ?? null }, transaction },
+      { replacements: { id: measurementId, setId: rows[0].measurement_set_id, kind: input.kind, quantity: input.quantityGrams, sourceValue: input.sourceValue, unit: input.sourceUnit, conversion: input.conversionVersion, sourceRole: input.sourceRole, sourcePartyId, userId: auth.userId, method: input.methodCode ?? null, instrument: input.instrumentRef ?? null, occurredAt, evidenceRef: input.evidenceRef ?? null, supersedesId: input.supersedesMeasurementId ?? null }, transaction },
     );
     await appendAuditEvent({ transaction, eventType: 'MEASUREMENT.RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { measurement_id: measurementId, measurement_set_id: rows[0].measurement_set_id, batch_id: rows[0].batch_id, kind: input.kind, quantity_grams: input.quantityGrams }, streams: [{ kind: 'material_batch', id: rows[0].batch_id }, { kind: 'material_event', id: eventId }] });
     return { id: measurementId, measurementSetId: rows[0].measurement_set_id, batchId: rows[0].batch_id, kind: input.kind, quantityGrams: input.quantityGrams, occurredAt: input.occurredAt, supersedesMeasurementId: input.supersedesMeasurementId ?? null, enteredAt: new Date() };

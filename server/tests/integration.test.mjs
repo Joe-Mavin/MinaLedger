@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import bcrypt from 'bcryptjs';
 
@@ -129,6 +130,21 @@ after(async () => {
 });
 
 test('PostgreSQL foundation integrity and API integration', async (t) => {
+  await t.test('Phase 2 integrity migration rolls back and reapplies before its new participant kinds are used', async () => {
+    const rollbackSql = await readFile(new URL('../src/database/rollback/003_phase_two_integrity.sql', import.meta.url), 'utf8');
+    const migrationSql = await readFile(new URL('../src/database/migrations/003_phase_two_integrity.sql', import.meta.url), 'utf8');
+    const rollbackProbe = new Error('migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackSql, { transaction, raw: true });
+      await sequelize.query(migrationSql, { transaction, raw: true });
+      throw rollbackProbe;
+    }), (error) => error === rollbackProbe);
+    const columns = await db(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='hole_party_role'
+        AND column_name IN ('source_reference','evidence_ref') ORDER BY column_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(columns.map((row) => row.column_name), ['evidence_ref', 'source_reference']);
+  });
+
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
     const health = await request(app).get('/healthz');
     assert.equal(health.status, 200);
@@ -231,7 +247,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await assert.rejects(db(`INSERT INTO hole_party_role(id,hole_id,party_id,role_code,asserted_by_user_id) VALUES (:id,:holeId,:partyId,'NOT_A_ROLE',:actor)`, { id: randomUUID(), holeId: ids.holeId, partyId: ids.minerPartyId, actor: ids.siteUserId }), sqlError('23514'));
   });
 
-  await t.test('production outputs, measurement ownership, source integrity, and event-time provenance', async () => {
+  await t.test('production measurement attribution, rollback, ownership, and event-time provenance', async () => {
     const body = {
       holeId: ids.holeId, occurredAt: happenedAt, shiftOrPeriodRef: 'FICTIONAL-PERIOD-1',
       participantRelationshipIds: [ids.holeOperatorRelationshipId],
@@ -240,7 +256,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
         occurredAt: happenedAt, acknowledgement: { status: 'PENDING', reason: 'Awaiting participant review' },
       },
       outputs: [
-        { materialKind: 'GOLD_BEARING_FEED', outputKind: 'TEST_FEED', measurements: [{ kind: 'MEASURED', quantityGrams: '10.000000', sourceValue: '10', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WITNESS', occurredAt: happenedAt }] },
+        { materialKind: 'GOLD_BEARING_FEED', outputKind: 'TEST_FEED', measurements: [{ kind: 'MEASURED', quantityGrams: '10.000000', sourceValue: '10', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WITNESS', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt }] },
         { materialKind: 'GOLD_DORE', outputKind: 'TEST_DORE', measurements: [{ kind: 'DECLARED', quantityGrams: '5.000000', sourceValue: '5', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt }] },
       ],
     };
@@ -261,6 +277,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(stored.body.participants[0].party_id, ids.minerPartyId);
     assert.equal(stored.body.captureProvenance.source_kind, 'ASSISTED_VERBAL');
     assert.equal(stored.body.captureProvenance.acknowledgement_status, 'PENDING');
+    assert.equal((await db(`SELECT source_party_id FROM material_measurement WHERE id=:id`, { id: ids.measurementId }, undefined, QueryTypes.SELECT))[0].source_party_id, ids.minerPartyId);
     const columns = await db(`SELECT column_name FROM information_schema.columns WHERE table_name='material_batch' AND column_name LIKE '%quantity%'`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(columns, []);
 
@@ -272,14 +289,103 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await assert.rejects(db(`INSERT INTO material_measurement_set(id,batch_id,material_event_output_id) VALUES (:id,:batchId,:outputId)`, { id: randomUUID(), batchId: ids.batchId, outputId: ids.outputs[1].id }), sqlError('23503'));
     await assert.rejects(db(`UPDATE material_measurement SET quantity_g=11 WHERE id=:id`, { id: ids.measurementId }), sqlError('55000'));
     await assert.rejects(db(`DELETE FROM material_measurement WHERE id=:id`, { id: ids.measurementId }), sqlError('55000'));
-    const appended = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`).set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({ kind: 'MEASURED', quantityGrams: '9.750000', sourceValue: '9.75', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt });
+    const appended = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`).set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({ kind: 'MEASURED', quantityGrams: '9.750000', sourceValue: '9.75', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt });
     assert.equal(appended.status, 201, appended.text);
     assert.equal((await db(`SELECT quantity_g FROM material_measurement WHERE id=:id`, { id: ids.measurementId }, undefined, QueryTypes.SELECT))[0].quantity_g, '10.000000');
     const corrected = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
-      .send({ kind: 'MEASURED', quantityGrams: '9.700000', sourceValue: '9.7', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt, supersedesMeasurementId: appended.body.id });
+      .send({ kind: 'MEASURED', quantityGrams: '9.700000', sourceValue: '9.7', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt, supersedesMeasurementId: appended.body.id });
     assert.equal(corrected.status, 201, corrected.text);
     assert.equal((await db(`SELECT supersedes_measurement_id FROM material_measurement WHERE id=:id`, { id: corrected.body.id }, undefined, QueryTypes.SELECT))[0].supersedes_measurement_id, appended.body.id);
+
+    const unrelatedSourceParty = await seedParty('PERSON', 'Fictional Unrelated Weigher');
+    const measurementCountsBeforeReject = await db(`SELECT
+      (SELECT count(*)::int FROM material_measurement) AS measurements,
+      (SELECT count(*)::int FROM audit_event) AS audit_events`, {}, undefined, QueryTypes.SELECT);
+    const unrelatedMeasurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ kind: 'MEASURED', quantityGrams: '9.600000', sourceValue: '9.6', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: unrelatedSourceParty, occurredAt: happenedAt });
+    assert.equal(unrelatedMeasurement.status, 400, unrelatedMeasurement.text);
+    assert.equal(unrelatedMeasurement.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
+    await assert.rejects(db(`INSERT INTO material_measurement(
+      id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,
+      source_role,source_party_id,entered_by_user_id,occurred_at_claimed
+    ) VALUES (:id,:setId,'MEASURED','1.000000','1','g','test-v1','WEIGHER',:sourceParty,:userId,:at)`, {
+      id: randomUUID(), setId: ids.measurementSetId, sourceParty: unrelatedSourceParty, userId: ids.siteUserId, at: happenedAt,
+    }), sqlError('23514'));
+    const missingMeasurementSource = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ kind: 'MEASURED', quantityGrams: '9.600000', sourceValue: '9.6', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt });
+    assert.equal(missingMeasurementSource.status, 400, missingMeasurementSource.text);
+    assert.equal(missingMeasurementSource.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
+    const measurementCountsAfterReject = await db(`SELECT
+      (SELECT count(*)::int FROM material_measurement) AS measurements,
+      (SELECT count(*)::int FROM audit_event) AS audit_events`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(measurementCountsAfterReject[0], measurementCountsBeforeReject[0]);
+
+    const eventCountsBeforeReject = await db(`SELECT
+      (SELECT count(*)::int FROM material_event WHERE event_kind='PRODUCTION') AS events,
+      (SELECT count(*)::int FROM material_batch) AS batches,
+      (SELECT count(*)::int FROM material_measurement) AS measurements,
+      (SELECT count(*)::int FROM audit_event) AS audit_events`, {}, undefined, QueryTypes.SELECT);
+    const invalidSourceEvent = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [ids.holeOperatorRelationshipId],
+        outputs: [{ materialKind: 'RESIDUE', measurements: [{
+          kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g',
+          conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: unrelatedSourceParty, occurredAt: happenedAt,
+        }] }],
+      });
+    assert.equal(invalidSourceEvent.status, 400, invalidSourceEvent.text);
+    assert.equal(invalidSourceEvent.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
+    const eventCountsAfterReject = await db(`SELECT
+      (SELECT count(*)::int FROM material_event WHERE event_kind='PRODUCTION') AS events,
+      (SELECT count(*)::int FROM material_batch) AS batches,
+      (SELECT count(*)::int FROM material_measurement) AS measurements,
+      (SELECT count(*)::int FROM audit_event) AS audit_events`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(eventCountsAfterReject[0], eventCountsBeforeReject[0]);
+
+    const expiredSource = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        partyKind: 'PERSON', displayName: 'Fictional Expired Weigher', participantKind: 'SERVICE_PROVIDER',
+        roleCode: 'OTHER', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z', validTo: '2026-11-11T00:00:00.000Z',
+      });
+    assert.equal(expiredSource.status, 201, expiredSource.text);
+    const expiredSourceEvent = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [expiredSource.body.relationshipId],
+        outputs: [{ materialKind: 'RESIDUE' }],
+      });
+    assert.equal(expiredSourceEvent.status, 201, expiredSourceEvent.text);
+    const expiredMeasurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${expiredSourceEvent.body.id}/outputs/${expiredSourceEvent.body.outputs[0].id}/measurements`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g',
+        conversionVersion: 'test-v1', sourceRole: 'OTHER', sourcePartyId: expiredSource.body.partyId,
+        occurredAt: '2026-11-12T08:30:00.000Z',
+      });
+    assert.equal(expiredMeasurement.status, 400, expiredMeasurement.text);
+    assert.equal(expiredMeasurement.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
+
+    const inactiveSource = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        partyKind: 'PERSON', displayName: 'Fictional Inactive Weigher', participantKind: 'SERVICE_PROVIDER',
+        roleCode: 'OTHER', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z',
+      });
+    assert.equal(inactiveSource.status, 201, inactiveSource.text);
+    const inactiveSourceEvent = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [inactiveSource.body.relationshipId],
+        outputs: [{ materialKind: 'RESIDUE' }],
+      });
+    assert.equal(inactiveSourceEvent.status, 201, inactiveSourceEvent.text);
+    await db(`UPDATE hole_party_role SET status='REVOKED' WHERE id=:id`, { id: inactiveSource.body.relationshipId });
+    const inactiveMeasurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${inactiveSourceEvent.body.id}/outputs/${inactiveSourceEvent.body.outputs[0].id}/measurements`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g',
+        conversionVersion: 'test-v1', sourceRole: 'OTHER', sourcePartyId: inactiveSource.body.partyId, occurredAt: happenedAt,
+      });
+    assert.equal(inactiveMeasurement.status, 400, inactiveMeasurement.text);
+    assert.equal(inactiveMeasurement.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
     await assert.rejects(db(`INSERT INTO production_event_participant(id,production_event_id,party_id,hole_party_role_id) VALUES (:id,:eventId,:partyId,:relationshipId)`, {
       id: randomUUID(), eventId: ids.productionEventId, partyId: ids.minerPartyId, relationshipId: randomUUID(),
     }), sqlError('23514'));
@@ -303,6 +409,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(holeA2EventResponse.status, 201, holeA2EventResponse.text);
     const holeA2Event = holeA2EventResponse.body;
     const holeA2Output = holeA2Event.outputs[0];
+    ids.holeA2BatchId = holeA2Output.batchId;
 
     const holeA1User = await seedUser('hole-a1-recorder@example.test', 'Fictional Hole A1 Recorder', {
       roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeId,
@@ -350,7 +457,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.doesNotMatch(JSON.stringify(a2Event.body), new RegExp(holeA2Event.eventCode));
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/production-events/${ids.productionEventId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
 
-    const measurementInput = { kind: 'MEASURED', quantityGrams: '9.800000', sourceValue: '9.8', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt };
+    const measurementInput = { kind: 'MEASURED', quantityGrams: '9.800000', sourceValue: '9.8', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt };
     const a1Measurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`)
       .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
     assert.equal(a1Measurement.status, 201, a1Measurement.text);
@@ -364,6 +471,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       roleCode: 'AUDITOR', scopeKind: 'SITE', scopeId: ids.siteId,
     });
     const siteAuditorToken = await signIn('site-auditor@example.test');
+    ids.siteAuditorToken = siteAuditorToken;
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${siteAuditorToken}`)).status, 200);
     const auditorWrite = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}/outputs/${holeA2Output.id}/measurements`)
       .set('Authorization', `Bearer ${siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
@@ -408,6 +516,10 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
 
   await t.test('allocation basis, revisions, homogeneous rows, approval totals, and current pointer', async () => {
     const beneficiary = await seedParty('PERSON', 'Fictional Allocation Beneficiary');
+    await db(`INSERT INTO site_party_role(id,site_id,party_id,role_code,valid_from,asserted_by_user_id)
+      VALUES (:id,:siteId,:partyId,'BENEFICIARY','2026-11-01T00:00:00.000Z',:actor)`, {
+      id: randomUUID(), siteId: ids.siteId, partyId: beneficiary, actor: ids.siteUserId,
+    });
     const chainId = randomUUID();
     const setId = randomUUID();
     await sequelize.transaction(async (transaction) => {
@@ -422,9 +534,22 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     ids.allocationChainId = chainId;
     ids.allocationSetId = setId;
     assert.equal((await db(`SELECT active_approved_set_id FROM production_allocation_chain WHERE id=:id`, { id: chainId }, undefined, QueryTypes.SELECT))[0].active_approved_set_id, setId);
-    await assert.rejects(db(`INSERT INTO production_allocation_row(id,allocation_set_id,beneficiary_party_id,allocation_basis,allocated_share) VALUES (:id,:setId,:beneficiary,'SHARE',0.5)`, { id: randomUUID(), setId, beneficiary: await seedParty('PERSON', 'Fictional Other Beneficiary') }), sqlError('23503'));
+    const wrongBasisBeneficiary = await seedParty('PERSON', 'Fictional Other Beneficiary');
+    await db(`INSERT INTO site_party_role(id,site_id,party_id,role_code,valid_from,asserted_by_user_id)
+      VALUES (:id,:siteId,:partyId,'BENEFICIARY','2026-11-01T00:00:00.000Z',:actor)`, {
+      id: randomUUID(), siteId: ids.siteId, partyId: wrongBasisBeneficiary, actor: ids.siteUserId,
+    });
+    await assert.rejects(db(`INSERT INTO production_allocation_row(id,allocation_set_id,beneficiary_party_id,allocation_basis,allocated_share) VALUES (:id,:setId,:beneficiary,'SHARE',0.5)`, { id: randomUUID(), setId, beneficiary: wrongBasisBeneficiary }), sqlError('23503'));
+    await assert.rejects(db(`INSERT INTO production_allocation_row(id,allocation_set_id,beneficiary_party_id,allocation_basis,allocated_quantity_g) VALUES (:id,:setId,:beneficiary,'QUANTITY','1.000000')`, {
+      id: randomUUID(), setId, beneficiary: await seedParty('PERSON', 'Fictional Unrelated Beneficiary'),
+    }), sqlError('23514'));
+    const missingValueBeneficiary = await seedParty('PERSON', 'Fictional Missing Allocation Value');
+    await db(`INSERT INTO site_party_role(id,site_id,party_id,role_code,valid_from,asserted_by_user_id)
+      VALUES (:id,:siteId,:partyId,'BENEFICIARY','2026-11-01T00:00:00.000Z',:actor)`, {
+      id: randomUUID(), siteId: ids.siteId, partyId: missingValueBeneficiary, actor: ids.siteUserId,
+    });
     await assert.rejects(db(`INSERT INTO production_allocation_row(id,allocation_set_id,beneficiary_party_id,allocation_basis,allocated_quantity_g,allocated_share) VALUES (:id,:setId,:beneficiary,'QUANTITY',NULL,NULL)`, {
-      id: randomUUID(), setId, beneficiary: await seedParty('PERSON', 'Fictional Missing Allocation Value'),
+      id: randomUUID(), setId, beneficiary: missingValueBeneficiary,
     }), sqlError('23514'));
     await assert.rejects(db(`UPDATE production_allocation_row SET allocated_quantity_g='7.000000' WHERE allocation_set_id=:setId`, { setId }), sqlError('55000'));
 
@@ -448,24 +573,67 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       VALUES (:id,:chainId,1,'ORIGINAL','QUANTITY',:measurementSetId,:measurementId,:userId)`, { id: randomUUID(), chainId: otherChain, measurementSetId: ids.measurementSetId, measurementId: ids.measurementId, userId: ids.siteUserId }), sqlError('23514'));
   });
 
-  await t.test('allocation proposal API keeps explicit bases, complete revisions, and approval policy gated', async () => {
+  await t.test('allocation proposals require effective beneficiaries and keep review policy gated', async () => {
     const created = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
-        holeId: ids.holeId, occurredAt: happenedAt,
+        holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [ids.holeOperatorRelationshipId],
         outputs: [
           { materialKind: 'GOLD_BEARING_FEED', measurements: [
-            { kind: 'MEASURED', quantityGrams: '10.000000', sourceValue: '10', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt },
+            { kind: 'MEASURED', quantityGrams: '10.000000', sourceValue: '10', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt },
             { kind: 'DECLARED', quantityGrams: '11.000000', sourceValue: '11', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt },
           ] },
           { materialKind: 'RESIDUE', measurements: [
-            { kind: 'MEASURED', quantityGrams: '4.000000', sourceValue: '4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt },
+            { kind: 'MEASURED', quantityGrams: '4.000000', sourceValue: '4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.minerPartyId, occurredAt: happenedAt },
           ] },
         ],
       });
     assert.equal(created.status, 201, created.text);
     ids.phase2ProductionEventId = created.body.id;
     ids.phase2Outputs = created.body.outputs;
-    ids.phase2BeneficiaryId = await seedParty('PERSON', 'Fictional Second Beneficiary');
+    const minerBeneficiary = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ partyId: ids.minerPartyId, participantKind: 'MINER', roleCode: 'BENEFICIARY', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z', sourceReference: 'FICTIONAL-AGREEMENT-1', evidenceRef: 'FICTIONAL-EVIDENCE-1' });
+    assert.equal(minerBeneficiary.status, 201, minerBeneficiary.text);
+    const nonMinerBeneficiary = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'PERSON', displayName: 'Fictional Family Beneficiary', participantKind: 'FAMILY_OR_AGREED_BENEFICIARY', roleCode: 'BENEFICIARY', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z', sourceReference: 'FICTIONAL-AGREEMENT-2' });
+    assert.equal(nonMinerBeneficiary.status, 201, nonMinerBeneficiary.text);
+    ids.phase2BeneficiaryId = nonMinerBeneficiary.body.partyId;
+    assert.equal(nonMinerBeneficiary.body.participantKind, 'FAMILY_OR_AGREED_BENEFICIARY');
+    const persistedRelationship = await db(`SELECT role_code, source_reference, evidence_ref, asserted_by_user_id FROM hole_party_role WHERE id=:id`, { id: nonMinerBeneficiary.body.relationshipId }, undefined, QueryTypes.SELECT);
+    assert.equal(persistedRelationship[0].role_code, 'BENEFICIARY');
+    assert.equal(persistedRelationship[0].source_reference, 'FICTIONAL-AGREEMENT-2');
+    assert.equal(persistedRelationship[0].asserted_by_user_id, ids.siteUserId);
+    const unrelatedBeneficiaryId = await seedParty('PERSON', 'Fictional Unrelated Beneficiary');
+    const unrelatedProposal = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.phase2ProductionEventId}/outputs/${ids.phase2Outputs[1].id}/allocation-sets`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        basisKind: 'SHARE', rows: [{ beneficiaryPartyId: unrelatedBeneficiaryId, allocatedShare: '0.100000000' }],
+      });
+    assert.equal(unrelatedProposal.status, 400, unrelatedProposal.text);
+    assert.equal(unrelatedProposal.body.error.code, 'INVALID_ALLOCATION_BENEFICIARY');
+
+    const expiredBeneficiary = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'PERSON', displayName: 'Fictional Expired Beneficiary', participantKind: 'FAMILY_OR_AGREED_BENEFICIARY', roleCode: 'BENEFICIARY', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z', validTo: '2026-11-09T00:00:00.000Z' });
+    assert.equal(expiredBeneficiary.status, 201, expiredBeneficiary.text);
+    const expiredProposal = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.phase2ProductionEventId}/outputs/${ids.phase2Outputs[1].id}/allocation-sets`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        basisKind: 'SHARE', rows: [{ beneficiaryPartyId: expiredBeneficiary.body.partyId, allocatedShare: '0.100000000' }],
+      });
+    assert.equal(expiredProposal.status, 400, expiredProposal.text);
+    assert.equal(expiredProposal.body.error.code, 'INVALID_ALLOCATION_BENEFICIARY');
+
+    const inactiveBeneficiary = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'ORGANISATION', displayName: 'Fictional Service Provider', organisationKind: 'SERVICE_PROVIDER', participantKind: 'SERVICE_PROVIDER', roleCode: 'BENEFICIARY', holeId: ids.holeId, validFrom: '2026-11-01T00:00:00.000Z' });
+    assert.equal(inactiveBeneficiary.status, 201, inactiveBeneficiary.text);
+    await db(`UPDATE hole_party_role SET status='REVOKED' WHERE id=:id`, { id: inactiveBeneficiary.body.relationshipId });
+    const inactiveProposal = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.phase2ProductionEventId}/outputs/${ids.phase2Outputs[1].id}/allocation-sets`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
+        basisKind: 'SHARE', rows: [{ beneficiaryPartyId: inactiveBeneficiary.body.partyId, allocatedShare: '0.100000000' }],
+      });
+    assert.equal(inactiveProposal.status, 400, inactiveProposal.text);
+    assert.equal(inactiveProposal.body.error.code, 'INVALID_ALLOCATION_BENEFICIARY');
 
     const quantityProposal = {
       basisKind: 'QUANTITY', basisMeasurementId: ids.phase2Outputs[0].measurements[0].id,
@@ -544,7 +712,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal((await verifyAuditStream('material_event', ids.phase2ProductionEventId)).valid, true);
   });
 
-  await t.test('independent Dora facilities and processing preserve inputs, separate outputs, and residue lineage', async () => {
+  await t.test('Dora processing validates sources and preserves inputs, outputs, and residue lineage', async () => {
     const doraOne = await request(app).post(`/api/v1/sites/${ids.siteId}/doras`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({ name: 'Fictional Dora One' });
     const doraTwo = await request(app).post(`/api/v1/sites/${ids.siteId}/doras`)
@@ -563,6 +731,10 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
       id: randomUUID(), userId: doraUser.userId, holeId: ids.holeId,
     });
+    ids.doraWeigherPartyId = await seedParty('PERSON', 'Fictional Dora Weigher');
+    await db(`INSERT INTO facility_party_role(id,processing_facility_id,party_id,role_code,valid_from,asserted_by_user_id) VALUES (:id,:facilityId,:partyId,'WEIGHER','2026-11-01T00:00:00.000Z',:actor)`, {
+      id: randomUUID(), facilityId: ids.doraOneId, partyId: ids.doraWeigherPartyId, actor: ids.siteUserId,
+    });
     ids.doraToken = await signIn('dora-operator@example.test');
     assert.equal((await request(app).get(`/api/v1/doras/${ids.doraOneId}`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 200);
     assert.equal((await request(app).get(`/api/v1/doras/${ids.doraTwoId}`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 404);
@@ -571,12 +743,12 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       processingFacilityId: ids.doraOneId, occurredAt: happenedAt,
       compensationArrangementCode: 'RESIDUE_SERVICE_CONSIDERATION', serviceTermsRef: 'FICTIONAL-SERVICE-TERMS-1',
       inputs: [
-        { sourceProductionOutputId: ids.phase2Outputs[0].id, measurements: [{ kind: 'MEASURED', quantityGrams: '9.500000', sourceValue: '9.5', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt }] },
-        { sourceProductionOutputId: ids.phase2Outputs[1].id, measurements: [{ kind: 'MEASURED', quantityGrams: '3.750000', sourceValue: '3.75', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt }] },
+        { sourceProductionOutputId: ids.phase2Outputs[0].id, measurements: [{ kind: 'MEASURED', quantityGrams: '9.500000', sourceValue: '9.5', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.doraWeigherPartyId, occurredAt: happenedAt }] },
+        { sourceProductionOutputId: ids.phase2Outputs[1].id, measurements: [{ kind: 'MEASURED', quantityGrams: '3.750000', sourceValue: '3.75', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.doraWeigherPartyId, occurredAt: happenedAt }] },
       ],
       outputs: [
-        { materialKind: 'GOLD_DORE', outputRole: 'MINER_RETAINED_GOLD', measurements: [{ kind: 'MEASURED', quantityGrams: '7.000000', sourceValue: '7', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt }] },
-        { materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: [{ kind: 'MEASURED', quantityGrams: '4.000000', sourceValue: '4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt }] },
+        { materialKind: 'GOLD_DORE', outputRole: 'MINER_RETAINED_GOLD', measurements: [{ kind: 'MEASURED', quantityGrams: '7.000000', sourceValue: '7', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.doraWeigherPartyId, occurredAt: happenedAt }] },
+        { materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: [{ kind: 'MEASURED', quantityGrams: '4.000000', sourceValue: '4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.doraWeigherPartyId, occurredAt: happenedAt }] },
       ],
     };
     const processKey = randomUUID();
@@ -602,11 +774,12 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(processDetails.status, 200, processDetails.text);
     assert.equal(processDetails.body.inputs.length, 2);
     assert.equal(processDetails.body.outputs.find((row) => row.output_role === 'DORA_RETAINED_RESIDUE').measurements.length, 1);
+    assert.equal(processDetails.body.outputs[0].measurements[0].source_party_id, ids.doraWeigherPartyId);
     assert.equal((await request(app).get(`/api/v1/processing-events/${ids.processingEventId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 404);
 
     const appended = await request(app).post(`/api/v1/processing-events/${ids.processingEventId}/outputs/${ids.processingOutputs[0].id}/measurements`)
       .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
-        kind: 'MEASURED', quantityGrams: '6.900000', sourceValue: '6.9', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER',
+        kind: 'MEASURED', quantityGrams: '6.900000', sourceValue: '6.9', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', sourcePartyId: ids.doraWeigherPartyId,
         occurredAt: happenedAt, supersedesMeasurementId: ids.processingOutputs[0].measurements[0].id,
       });
     assert.equal(appended.status, 201, appended.text);
@@ -629,6 +802,17 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
         { materialKind: 'GOLD_DORE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: processingBody.outputs[0].measurements },
       ] });
     assert.equal(invalidOutput.status, 400, invalidOutput.text);
+    const unrelatedProcessingParty = await seedParty('PERSON', 'Fictional Unrelated Processing Weigher');
+    const invalidSourceProcessing = await request(app).post(`/api/v1/sites/${ids.siteId}/processing-events`)
+      .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        ...processingBody,
+        inputs: [{
+          ...processingBody.inputs[0],
+          measurements: [{ ...processingBody.inputs[0].measurements[0], sourcePartyId: unrelatedProcessingParty }],
+        }],
+      });
+    assert.equal(invalidSourceProcessing.status, 400, invalidSourceProcessing.text);
+    assert.equal(invalidSourceProcessing.body.error.code, 'INVALID_MEASUREMENT_SOURCE');
     const afterFailures = await db(`SELECT
       (SELECT count(*)::int FROM material_event WHERE event_kind='PROCESSING') AS events,
       (SELECT count(*)::int FROM processing_event_input) AS processing_inputs,
@@ -652,7 +836,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     }), sqlError('23514'));
   });
 
-  await t.test('QR lookup requires authorization, stores only token hashes, and supports revocation', async () => {
+  await t.test('QR writes require lineage access; lookup stays authorized and revocation works', async () => {
     const processingQr = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
       .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(processingQr.status, 201, processingQr.text);
@@ -666,6 +850,20 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(resolved.body.material_batch_id, ids.processingOutputs[1].batchId);
     assert.equal(resolved.body.origins[0].processing_facility_id, ids.doraOneId);
 
+    const secondDoraUser = await seedUser('other-dora-operator@example.test', 'Fictional Other Dora Operator', {
+      roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraTwoId,
+    });
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
+      id: randomUUID(), userId: secondDoraUser.userId, holeId: ids.holeId,
+    });
+    const secondDoraToken = await signIn('other-dora-operator@example.test');
+    const deniedFacilityCreate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
+      .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
+    const deniedFacilityRotate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(deniedFacilityCreate.status, 404);
+    assert.equal(deniedFacilityRotate.status, 404);
+
     const sourceBatchId = ids.phase2Outputs[0].batchId;
     const qrKey = randomUUID();
     const sourceQr = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
@@ -674,6 +872,54 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', qrKey).send({});
     assert.equal(sourceQr.status, 201, sourceQr.text);
     assert.equal(sourceReplay.body.payload, sourceQr.body.payload);
+
+    const siteOperator = await seedUser('site-mining-operator@example.test', 'Fictional Site Mining Operator', {
+      roleCode: 'MINING_OPERATOR', scopeKind: 'SITE', scopeId: ids.siteId,
+    });
+    const siteOperatorToken = await signIn('site-mining-operator@example.test');
+    const siteOperatorQr = await request(app).post(`/api/v1/material-batches/${ids.outputs[0].batchId}/qr`)
+      .set('Authorization', `Bearer ${siteOperatorToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(siteOperatorQr.status, 201, siteOperatorQr.text);
+    const siteOperatorRotation = await request(app).post(`/api/v1/material-batches/${ids.outputs[0].batchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${siteOperatorToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(siteOperatorRotation.status, 201, siteOperatorRotation.text);
+
+    const auditorCreate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
+      .set('Authorization', `Bearer ${ids.siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send({});
+    const auditorRotate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${ids.siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(auditorCreate.status, 404);
+    assert.equal(auditorRotate.status, 404);
+    assert.equal((await request(app).get(`/api/v1/qr/${sourceQr.body.payload}`).set('Authorization', `Bearer ${ids.siteAuditorToken}`)).status, 200);
+
+    const holeUser = await seedUser('hole-qr-operator@example.test', 'Fictional Hole QR Operator', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.secondHoleId,
+    });
+    const holeToken = await signIn('hole-qr-operator@example.test');
+    const holeQr = await request(app).post(`/api/v1/material-batches/${ids.holeA2BatchId}/qr`)
+      .set('Authorization', `Bearer ${holeToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(holeQr.status, 201, holeQr.text);
+    const holeRotated = await request(app).post(`/api/v1/material-batches/${ids.holeA2BatchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${holeToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(holeRotated.status, 201, holeRotated.text);
+    const crossHoleCreate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
+      .set('Authorization', `Bearer ${holeToken}`).set('Idempotency-Key', randomUUID()).send({});
+    const crossHoleRotate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${holeToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(crossHoleCreate.status, 404);
+    assert.equal(crossHoleRotate.status, 404);
+
+    const otherSiteUser = await seedUser('other-site-qr-operator@example.test', 'Fictional Other Site Operator', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId,
+    });
+    const otherSiteToken = await signIn('other-site-qr-operator@example.test');
+    const crossSiteCreate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
+      .set('Authorization', `Bearer ${otherSiteToken}`).set('Idempotency-Key', randomUUID()).send({});
+    const crossSiteRotate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
+      .set('Authorization', `Bearer ${otherSiteToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(crossSiteCreate.status, 404);
+    assert.equal(crossSiteRotate.status, 404);
+
     const rotated = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(rotated.status, 201, rotated.text);

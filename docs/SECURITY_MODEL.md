@@ -30,6 +30,8 @@ Several people can perform one role, and one user can have multiple roles. Role 
 ## Data visibility principles
 
 - A participant sees records they created or are authorized to transact on, plus source/provenance fields explicitly shared for traceability.
+- QR creation and rotation require write access to every source hole in the batch lineage and, for processing-origin batches, write access to each processing facility in that lineage. Lookup remains authenticated and read-authorized. Auditors may receive scoped read grants but cannot create or rotate QR identities.
+- Measurement source attribution is checked against active effective-dated event participants, source-production participants or facility relationships. The authenticated recorder is the default physical source only for an explicit `RECORDER` source role; otherwise a source party must be supplied and validated. A database trigger enforces the same rule for production and processing observations.
 - For assisted or paper-transcribed records, preserve the authenticated recorder and actual participant as separate identities. The participant can acknowledge, decline or dispute through the pilot-approved process; recorder entry alone is not consent, approval or proof of identity.
 - Counterparties see the shared transaction facts needed to verify declared/measured weight, assay reference, agreed price, payment status and custody acceptance. Pilot policy must define which commercial fields are shared at each step.
 - Keep unrelated prices, participant contact details, identity documents, exact coordinates and internal notes private. A QR scan resolves through an authorized API and must not expose raw data in the encoded token.

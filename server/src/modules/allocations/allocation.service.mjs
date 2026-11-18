@@ -16,15 +16,39 @@ export async function createAllocationSet(siteId, eventId, outputId, input, auth
     payload: { action: 'allocation.propose', siteId, eventId, outputId, input }, transaction,
   }, async () => {
     const [output] = await sequelize.query(
-      `SELECT eo.id AS output_id, eo.batch_id, pe.event_id, h.id AS hole_id
+      `SELECT eo.id AS output_id, eo.batch_id, pe.event_id, h.id AS hole_id, me.occurred_at_claimed AS event_occurred_at
        FROM production_event_output peo JOIN material_event_output eo ON eo.id=peo.material_event_output_id
        JOIN production_event pe ON pe.event_id=peo.production_event_id
+       JOIN material_event me ON me.id=pe.event_id
        JOIN mining_hole h ON h.id=pe.hole_id
        WHERE pe.event_id=:eventId AND eo.id=:outputId AND h.site_id=:siteId
        FOR UPDATE OF peo, eo`,
       { replacements: { siteId, eventId, outputId }, type: QueryTypes.SELECT, transaction },
     );
     if (!output) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+
+    const beneficiaryIds = input.rows.map((row) => row.beneficiaryPartyId);
+    const eligibleBeneficiaries = await sequelize.query(
+      `SELECT DISTINCT candidate.party_id
+       FROM unnest(ARRAY[:beneficiaryIds]::uuid[]) AS candidate(party_id)
+       JOIN party beneficiary ON beneficiary.id=candidate.party_id AND beneficiary.status='ACTIVE'
+       WHERE EXISTS (
+         SELECT 1 FROM site_party_role r
+         WHERE r.site_id=:siteId AND r.party_id=candidate.party_id AND r.role_code='BENEFICIARY'
+           AND r.status='ACTIVE' AND r.valid_from<=:eventOccurredAt AND (r.valid_to IS NULL OR r.valid_to>:eventOccurredAt)
+       ) OR EXISTS (
+         SELECT 1 FROM hole_party_role r
+         WHERE r.hole_id=:holeId AND r.party_id=candidate.party_id AND r.role_code='BENEFICIARY'
+           AND r.status='ACTIVE' AND r.valid_from<=:eventOccurredAt AND (r.valid_to IS NULL OR r.valid_to>:eventOccurredAt)
+       )`,
+      {
+        replacements: { beneficiaryIds, siteId, holeId: output.hole_id, eventOccurredAt: output.event_occurred_at },
+        type: QueryTypes.SELECT, transaction,
+      },
+    );
+    if (eligibleBeneficiaries.length !== beneficiaryIds.length) {
+      throw new AppError(400, 'INVALID_ALLOCATION_BENEFICIARY', 'Each beneficiary needs an active, effective beneficiary relationship to this site or hole at the production event time.');
+    }
 
     let [chain] = await sequelize.query(
       `SELECT id, active_approved_set_id FROM production_allocation_chain

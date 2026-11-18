@@ -5,8 +5,18 @@ import { AppError } from '../../utils/errors.mjs';
 import { canAccessHole, canAccessProcessingFacility } from '../../middleware/auth.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
+import { assertMeasurementSource, resolveMeasurementSourceParty } from '../measurements/source-attribution.service.mjs';
 
-async function insertMeasurement({ measurementSetId, batchId, measure, auth, fallbackOccurredAt, transaction }) {
+async function insertMeasurement({
+  measurementSetId, batchId, measure, auth, fallbackOccurredAt, transaction,
+  processingEventId, sourceProductionEventId = null,
+}) {
+  const occurredAt = measure.occurredAt ?? fallbackOccurredAt;
+  const sourcePartyId = resolveMeasurementSourceParty(measure, auth);
+  await assertMeasurementSource({
+    sourcePartyId, sourceRole: measure.sourceRole, auth, occurredAt,
+    processingEventId, sourceProductionEventId, transaction,
+  });
   const measurementId = randomUUID();
   await sequelize.query(
     `INSERT INTO material_measurement(
@@ -19,9 +29,9 @@ async function insertMeasurement({ measurementSetId, batchId, measure, auth, fal
     { replacements: {
       id: measurementId, setId: measurementSetId, kind: measure.kind, quantity: measure.quantityGrams,
       sourceValue: measure.sourceValue, unit: measure.sourceUnit, conversion: measure.conversionVersion,
-      sourceRole: measure.sourceRole, sourcePartyId: measure.sourcePartyId ?? auth.personPartyId,
+      sourceRole: measure.sourceRole, sourcePartyId,
       userId: auth.userId, method: measure.methodCode ?? null, instrument: measure.instrumentRef ?? null,
-      occurredAt: measure.occurredAt ?? fallbackOccurredAt, evidenceRef: measure.evidenceRef ?? null,
+      occurredAt, evidenceRef: measure.evidenceRef ?? null,
       supersedesId: measure.supersedesMeasurementId ?? null,
     }, transaction },
   );
@@ -29,7 +39,7 @@ async function insertMeasurement({ measurementSetId, batchId, measure, auth, fal
 }
 
 export async function createProcessingEvent(siteId, input, auth, mutationId) {
-  if (!(await canAccessProcessingFacility(auth, input.processingFacilityId))) {
+  if (!(await canAccessProcessingFacility(auth, input.processingFacilityId, { write: true }))) {
     throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   }
   return sequelize.transaction(async (transaction) => executeIdempotent({
@@ -102,7 +112,8 @@ export async function createProcessingEvent(siteId, input, auth, mutationId) {
       const measurements = [];
       for (const measure of inputRow.measurements) measurements.push(await insertMeasurement({
         measurementSetId: setId, batchId: source.batch_id, measure, auth,
-        fallbackOccurredAt: input.occurredAt, transaction,
+        fallbackOccurredAt: input.occurredAt, transaction, processingEventId: eventId,
+        sourceProductionEventId: source.source_event_id,
       }));
       inputs.push({ id: inputId, sourceProductionOutputId: source.output_id, sourceEventId: source.source_event_id, batchId: source.batch_id, measurementSetId: setId, measurements });
     }
@@ -134,6 +145,7 @@ export async function createProcessingEvent(siteId, input, auth, mutationId) {
       const measurements = [];
       for (const measure of outputRow.measurements) measurements.push(await insertMeasurement({
         measurementSetId: setId, batchId, measure, auth, fallbackOccurredAt: input.occurredAt, transaction,
+        processingEventId: eventId,
       }));
       outputs.push({ id: outputId, batchId, batchCode, materialKind: outputRow.materialKind, outputRole: outputRow.outputRole, measurementSetId: setId, measurements });
     }
@@ -222,11 +234,15 @@ export async function addProcessingMeasurement(eventId, contextKind, contextId, 
   }, async () => {
     const contextSql = contextKind === 'INPUT'
       ? `SELECT mei.id AS context_id, mei.batch_id, ms.id AS measurement_set_id
+            , pe.processing_facility_id, source_peo.production_event_id AS source_production_event_id
          FROM processing_event_input pei JOIN material_event_input mei ON mei.id=pei.material_event_input_id
+         JOIN processing_event pe ON pe.event_id=pei.processing_event_id
+         JOIN production_event_output source_peo ON source_peo.material_event_output_id=pei.source_production_output_id
          JOIN material_measurement_set ms ON ms.material_event_input_id=mei.id AND ms.batch_id=mei.batch_id
          WHERE pei.processing_event_id=:eventId AND mei.id=:contextId FOR UPDATE OF ms`
-      : `SELECT eo.id AS context_id, eo.batch_id, ms.id AS measurement_set_id
+      : `SELECT eo.id AS context_id, eo.batch_id, ms.id AS measurement_set_id, pe.processing_facility_id
          FROM processing_event_output peo JOIN material_event_output eo ON eo.id=peo.material_event_output_id
+         JOIN processing_event pe ON pe.event_id=peo.processing_event_id
          JOIN material_measurement_set ms ON ms.material_event_output_id=eo.id AND ms.batch_id=eo.batch_id
          WHERE peo.processing_event_id=:eventId AND eo.id=:contextId FOR UPDATE OF ms`;
     const [context] = await sequelize.query(contextSql, {
@@ -236,6 +252,7 @@ export async function addProcessingMeasurement(eventId, contextKind, contextId, 
     const measurement = await insertMeasurement({
       measurementSetId: context.measurement_set_id, batchId: context.batch_id, measure: input,
       auth, fallbackOccurredAt: input.occurredAt ?? new Date(), transaction,
+      processingEventId: eventId, sourceProductionEventId: context.source_production_event_id ?? null,
     });
     await appendAuditEvent({
       transaction, eventType: 'MEASUREMENT.RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,

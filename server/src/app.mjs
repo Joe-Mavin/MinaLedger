@@ -31,7 +31,7 @@ const sitePatchSchema = z.object({ name: z.string().trim().min(1).max(160).optio
 const holeSchema = z.object({ holeCode: z.string().trim().min(1).max(80), name: z.string().trim().max(160).optional() }).strict();
 const siteRole = z.enum(['LANDOWNER', 'PERMIT_HOLDER', 'SITE_OPERATOR', 'MINER', 'BENEFICIARY', 'FIELD_RECORDER', 'OTHER']);
 const holeRole = z.enum(['HOLE_OPERATOR', 'MINER', 'BENEFICIARY', 'FIELD_RECORDER', 'OTHER']);
-const participantKinds = z.enum(['MINER', 'MINING_OPERATOR', 'LANDOWNER', 'PERMIT_HOLDER', 'DORA_OPERATOR', 'RECOVERY_FACILITY', 'LOCAL_MERCHANT', 'LARGER_MERCHANT', 'CARRIER', 'FIELD_OFFICER', 'AUDITOR', 'OTHER']);
+const participantKinds = z.enum(['MINER', 'MINING_OPERATOR', 'LANDOWNER', 'PERMIT_HOLDER', 'DORA_OPERATOR', 'RECOVERY_FACILITY', 'LOCAL_MERCHANT', 'LARGER_MERCHANT', 'CARRIER', 'FIELD_OFFICER', 'AUDITOR', 'SERVICE_PROVIDER', 'FAMILY_OR_AGREED_BENEFICIARY', 'OTHER']);
 const participantSchema = z.object({
   partyId: z.string().uuid().optional(),
   partyKind: z.enum(['PERSON', 'ORGANISATION']).optional(),
@@ -42,6 +42,8 @@ const participantSchema = z.object({
   holeId: z.string().uuid().optional(),
   validFrom: dateTime.optional(),
   validTo: dateTime.optional(),
+  sourceReference: z.string().trim().min(1).max(255).optional(),
+  evidenceRef: z.string().trim().min(1).max(255).optional(),
 }).strict().superRefine((value, context) => {
   if (value.partyId && (value.partyKind || value.displayName || value.organisationKind)) context.addIssue({ code: 'custom', path: ['partyId'], message: 'Existing participants are selected by partyId without replacement identity fields.' });
   if (!value.partyId && (!value.partyKind || !value.displayName)) context.addIssue({ code: 'custom', path: ['partyKind'], message: 'New participants require partyKind and displayName.' });
@@ -161,7 +163,7 @@ function asyncRoute(handler) {
 
 async function requireProcessingCommandAccess(req, res, next) {
   try {
-    if (!(await canAccessProcessingFacility(req.auth, req.body.processingFacilityId))) {
+    if (!(await canAccessProcessingFacility(req.auth, req.body.processingFacilityId, { write: true }))) {
       return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
     }
     const sourceIds = req.body.inputs.map((row) => row.sourceProductionOutputId);
@@ -185,10 +187,10 @@ async function requireProcessingCommandAccess(req, res, next) {
 async function requireProcessingEventAccess(req, res, next) {
   try {
     const rows = await processingEventAccessRows(req.params.eventId);
-    if (!rows.length || !(await canAccessProcessingFacility(req.auth, rows[0].processing_facility_id))) {
+    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    if (!rows.length || !(await canAccessProcessingFacility(req.auth, rows[0].processing_facility_id, { write }))) {
       return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
     }
-    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
     for (const row of rows) {
       if (!(await canAccessHole(req.auth, row.site_id, row.hole_id, { write }))) {
         return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
