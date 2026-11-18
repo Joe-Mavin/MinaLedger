@@ -98,18 +98,46 @@ export async function createParticipant(siteId, input, auth, mutationId) {
       const hole = await MiningHole.findOne({ where: { id: input.holeId, siteId }, transaction });
       if (!hole) throw new AppError(400, 'INVALID_HOLE', 'The hole must belong to the selected mining site.');
     }
-    const partyId = randomUUID();
-    await sequelize.query(`INSERT INTO party(id, party_kind) VALUES (:partyId, :kind)`, { replacements: { partyId, kind: input.partyKind }, transaction });
-    if (input.partyKind === 'PERSON') {
-      await sequelize.query(`INSERT INTO person_profile(party_id, display_name) VALUES (:partyId, :displayName)`, { replacements: { partyId, displayName: input.displayName.trim() }, transaction });
+    let partyId = input.partyId;
+    let partyKind = input.partyKind;
+    let displayName = input.displayName?.trim() ?? null;
+    if (partyId) {
+      const [party] = await sequelize.query(
+        `SELECT p.party_kind, COALESCE(pp.display_name, op.display_name) AS display_name
+         FROM party p LEFT JOIN person_profile pp ON pp.party_id=p.id
+         LEFT JOIN organisation_profile op ON op.party_id=p.id WHERE p.id=:partyId AND p.status='ACTIVE'`,
+        { replacements: { partyId }, type: QueryTypes.SELECT, transaction },
+      );
+      if (!party) throw new AppError(400, 'INVALID_PARTICIPANT', 'The selected participant is unavailable.');
+      partyKind = party.party_kind;
+      displayName = party.display_name;
     } else {
-      await sequelize.query(`INSERT INTO organisation_profile(party_id, display_name, organisation_kind) VALUES (:partyId, :displayName, :kind)`, { replacements: { partyId, displayName: input.displayName.trim(), kind: input.organisationKind }, transaction });
+      partyId = randomUUID();
+      await sequelize.query(`INSERT INTO party(id, party_kind) VALUES (:partyId, :kind)`, { replacements: { partyId, kind: input.partyKind }, transaction });
+      if (input.partyKind === 'PERSON') {
+        await sequelize.query(`INSERT INTO person_profile(party_id, display_name) VALUES (:partyId, :displayName)`, { replacements: { partyId, displayName }, transaction });
+      } else {
+        await sequelize.query(`INSERT INTO organisation_profile(party_id, display_name, organisation_kind) VALUES (:partyId, :displayName, :kind)`, { replacements: { partyId, displayName, kind: input.organisationKind }, transaction });
+      }
     }
-    await sequelize.query(`INSERT INTO party_participation(id, party_id, participant_kind) VALUES (:id, :partyId, :kind)`, { replacements: { id: randomUUID(), partyId, kind: input.participantKind }, transaction });
+    await sequelize.query(
+      `INSERT INTO party_participation(id, party_id, participant_kind, valid_from, valid_to)
+       VALUES (:id, :partyId, :kind, COALESCE(:validFrom, now()), :validTo)`,
+      { replacements: { id: randomUUID(), partyId, kind: input.participantKind, validFrom: input.validFrom ?? null, validTo: input.validTo ?? null }, transaction },
+    );
+    const relationshipId = randomUUID();
     if (input.holeId) {
-      await sequelize.query(`INSERT INTO hole_party_role(id, hole_id, party_id, role_code, asserted_by_user_id) VALUES (:id, :holeId, :partyId, :roleCode, :userId)`, { replacements: { id: randomUUID(), holeId: input.holeId, partyId, roleCode: input.roleCode, userId: auth.userId }, transaction });
+      await sequelize.query(
+        `INSERT INTO hole_party_role(id, hole_id, party_id, role_code, valid_from, valid_to, asserted_by_user_id)
+         VALUES (:id, :holeId, :partyId, :roleCode, COALESCE(:validFrom, now()), :validTo, :userId)`,
+        { replacements: { id: relationshipId, holeId: input.holeId, partyId, roleCode: input.roleCode, validFrom: input.validFrom ?? null, validTo: input.validTo ?? null, userId: auth.userId }, transaction },
+      );
     } else {
-      await sequelize.query(`INSERT INTO site_party_role(id, site_id, party_id, role_code, asserted_by_user_id) VALUES (:id, :siteId, :partyId, :roleCode, :userId)`, { replacements: { id: randomUUID(), siteId, partyId, roleCode: input.roleCode, userId: auth.userId }, transaction });
+      await sequelize.query(
+        `INSERT INTO site_party_role(id, site_id, party_id, role_code, valid_from, valid_to, asserted_by_user_id)
+         VALUES (:id, :siteId, :partyId, :roleCode, COALESCE(:validFrom, now()), :validTo, :userId)`,
+        { replacements: { id: relationshipId, siteId, partyId, roleCode: input.roleCode, validFrom: input.validFrom ?? null, validTo: input.validTo ?? null, userId: auth.userId }, transaction },
+      );
     }
     await appendAuditEvent({
       transaction, eventType: 'SITE_PARTICIPANT.ASSOCIATED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,
@@ -117,7 +145,7 @@ export async function createParticipant(siteId, input, auth, mutationId) {
       payload: { site_id: siteId, participant_party_id: partyId, participant_kind: input.participantKind, role_code: input.roleCode, hole_id: input.holeId ?? null },
       streams: [{ kind: 'mining_site', id: siteId }, { kind: 'party', id: partyId }],
     });
-    return { partyId, partyKind: input.partyKind, displayName: input.displayName.trim(), participantKind: input.participantKind, roleCode: input.roleCode, siteId, holeId: input.holeId ?? null };
+    return { partyId, partyKind, displayName, participantKind: input.participantKind, roleCode: input.roleCode, relationshipId, siteId, holeId: input.holeId ?? null, validFrom: input.validFrom ?? new Date().toISOString(), validTo: input.validTo ?? null };
   }));
 }
 

@@ -1,12 +1,12 @@
 # MinaLedger Kenya
 
-MinaLedger is a gold-only production accountability and traceability platform for Kenya's artisanal and small-scale gold supply chain. This repository contains the approved domain design and an initial PostgreSQL-backed backend foundation.
+MinaLedger is a gold-only production accountability and traceability platform for Kenya's artisanal and small-scale gold supply chain. This repository contains the approved domain design and a PostgreSQL-backed backend.
 
 ## Current implementation status
 
-**The Phase 1 backend foundation and its current integration suite are verified; Phase 1 remains partial.** The backend uses Node.js ES modules, Express, Sequelize and PostgreSQL. It includes scoped accounts and roles, sites, holes, participant relationships, production outputs, typed append-only measurement observations, a single inventory movement journal, and per-aggregate hash-linked audit streams.
+**The Phase 1 foundation and a Phase 2 production-to-Dora backend slice are verified; the overall implementation remains partial.** The backend uses Node.js ES modules, Express, Sequelize and PostgreSQL. It includes scoped accounts and roles, effective-dated site and hole participants, production outputs and capture provenance, typed append-only measurement observations, complete allocation proposals and revisions, independently authorized Dora facilities, processing inputs and outputs, protected opaque QR lookup, a single inventory movement journal, and per-aggregate hash-linked audit streams.
 
-The implementation is a foundation, not the complete product. Allocation persistence and database constraints exist, but allocation review endpoints are not enabled while the pilot reviewer policy remains unresolved. Inventory posting is available to internal domain code and the integration suite; complete movement, consignment and trade APIs are later work. There is no frontend, offline sync engine or distributed blockchain network in this phase.
+Allocation proposals start as `PENDING`; the API does not expose approval, dispute or rejection commands while the pilot reviewer, eligible measurement kinds, review evidence and dispute rules remain unresolved. Processing records the selected Dora and source production outputs, input/output measurements, and each output's recorded role. Miner-retained gold and Dora-retained residue remain separate batches; these records do not establish legal entitlement or custody. Inventory posting remains internal, and complete movement, consignment, residue recovery and trade APIs are later work. There is no frontend, offline sync engine or distributed blockchain network.
 
 The two approved routes remain in scope: direct gold sales through local and larger merchants, and residue through Dora processing, aggregation, recovery and later gold sale. A cooperative is optional. Participant identity, role, entitlement, custody, measurement and commercial events remain separate concepts.
 
@@ -65,7 +65,7 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply the SQL migration from an empty schema, and exercise API, foreign-key, measurement, allocation, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only.
+Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API, foreign-key, production-to-Dora lineage, allocation revision concurrency, facility access, QR revocation, inventory concurrency/rollback and partial reversal/correction caps, currency and audit-chain rules. They use synthetic fictional records only. The current verified suite reports 14 tests with no failures.
 
 Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`.
 
@@ -85,9 +85,17 @@ All write commands require an `Idempotency-Key` UUID. Sign in at `POST /api/v1/a
 | `GET /api/v1/sites/{siteId}/holes/{holeId}` | Read one hole when authorized for that hole or site |
 | `GET /api/v1/sites/{siteId}/holes/{holeId}/participants` | Read only the selected hole's participants |
 | `GET/POST /api/v1/sites/{siteId}/participants` | Read or associate a party and its site/hole role |
+| `GET/POST /api/v1/sites/{siteId}/doras` | List site-associated Doras or create a distinct facility record |
+| `GET/PATCH /api/v1/doras/{facilityId}` | Read/update a Dora with facility-scoped authorization |
 | `GET/POST /api/v1/sites/{siteId}/production-events` | List or record production events with output batches and optional observations |
 | `GET /api/v1/sites/{siteId}/production-events/{eventId}` | Read event and output measurement history |
 | `POST /api/v1/sites/{siteId}/production-events/{eventId}/outputs/{outputId}/measurements` | Append an output measurement observation |
+| `GET/POST /api/v1/sites/{siteId}/production-events/{eventId}/outputs/{outputId}/allocation-sets` | Read allocation history or submit a complete pending quantity/share proposal or revision |
+| `POST /api/v1/sites/{siteId}/processing-events` | Record a Dora processing event with production inputs and distinct measured outputs |
+| `GET /api/v1/processing-events/{eventId}` | Read processing lineage when authorized for both source holes and the selected facility |
+| `POST /api/v1/processing-events/{eventId}/inputs/{inputId}/measurements`, `POST /api/v1/processing-events/{eventId}/outputs/{outputId}/measurements` | Append input/output measurement observations and corrections |
+| `POST /api/v1/material-batches/{batchId}/qr`, `POST /api/v1/material-batches/{batchId}/qr/rotate` | Create or rotate an opaque QR identity |
+| `GET /api/v1/qr/{opaqueToken}` | Resolve a QR identity after authentication and resource authorization |
 
 Production measurement quantities are JSON decimal strings, such as `"10.250000"`, to preserve PostgreSQL numeric precision. A batch carries identity and lineage, not a duplicate quantity. A measurement correction is a new observation.
 
@@ -97,7 +105,9 @@ Production measurement quantities are JSON decimal strings, such as `"10.250000"
 - `inventory_balance` is derived from accepted lines in `inventory_movement_line`; there is no second stockpile journal or writable balance table.
 - Passwords are bcrypt hashes. Tokens are short-lived signed bearer tokens; account and role status is rechecked on every authenticated request. Access is filtered by site, hole or active organisation relationship.
 - Hole-scoped grants apply only to the assigned hole. Site details and site-wide participant/production listings require a site-level grant; nested production and measurement requests verify the event's actual site and hole.
-- Site and production writes, user/role changes, measurements and inventory transfers append redacted business audit events in the same transaction. Audit streams are per aggregate and are not a distributed blockchain.
+- Site, production, allocation proposal, Dora, processing, QR, user/role, measurement and inventory writes append redacted business audit events in the same transaction. Audit streams are per aggregate and are not a distributed blockchain.
+- A Dora's site association does not grant processing access. Direct facility and processing-event access requires a matching facility role/relationship plus access to every source hole. Administrators do not receive automatic access to production or processing details.
+- QR payloads contain only random opaque tokens. The database stores the QR token hash on its QR record; resolution still requires authentication and authorization for the source hole and, for processed material, the selected facility.
 - `.env`, credentials, and local database files are excluded from Git.
 
 ## Approved project documents

@@ -18,6 +18,78 @@ export async function createProductionEvent(siteId, input, auth, mutationId) {
       actorUserId: auth.userId, currentStatus: 'SUBMITTED', schemaVersion: 1,
     }, { transaction });
     await ProductionEvent.create({ eventId, holeId: input.holeId, shiftOrPeriodRef: input.shiftOrPeriodRef ?? null }, { transaction });
+    const participantRows = [];
+    if (input.participantRelationshipIds?.length) {
+      const relationships = await sequelize.query(
+        `SELECT 'SITE'::text AS relationship_kind, r.id AS relationship_id, r.party_id, r.role_code,
+                r.valid_from, r.valid_to, r.site_id AS site_id, NULL::uuid AS hole_id
+         FROM site_party_role r WHERE r.id IN (:relationshipIds)
+         UNION ALL
+         SELECT 'HOLE'::text, r.id, r.party_id, r.role_code, r.valid_from, r.valid_to, h.site_id, r.hole_id
+         FROM hole_party_role r JOIN mining_hole h ON h.id=r.hole_id WHERE r.id IN (:relationshipIds)`,
+        { replacements: { relationshipIds: input.participantRelationshipIds }, type: QueryTypes.SELECT, transaction },
+      );
+      const occurredAt = new Date(input.occurredAt);
+      if (relationships.length !== input.participantRelationshipIds.length || relationships.some((relationship) => (
+        relationship.site_id !== siteId
+        || (relationship.relationship_kind === 'HOLE' && relationship.hole_id !== input.holeId)
+        || new Date(relationship.valid_from) > occurredAt
+        || (relationship.valid_to && new Date(relationship.valid_to) <= occurredAt)
+      ))) {
+        throw new AppError(400, 'INVALID_PARTICIPANT_RELATIONSHIP', 'Each participant relationship must be effective for this production event and its selected site or hole.');
+      }
+      for (const relationship of relationships) {
+        const participantId = randomUUID();
+        await sequelize.query(
+          `INSERT INTO production_event_participant(id,production_event_id,party_id,site_party_role_id,hole_party_role_id)
+           VALUES (:id,:eventId,:partyId,:siteRoleId,:holeRoleId)`,
+          { replacements: {
+            id: participantId, eventId, partyId: relationship.party_id,
+            siteRoleId: relationship.relationship_kind === 'SITE' ? relationship.relationship_id : null,
+            holeRoleId: relationship.relationship_kind === 'HOLE' ? relationship.relationship_id : null,
+          }, transaction },
+        );
+        participantRows.push({ partyId: relationship.party_id, roleCode: relationship.role_code, relationshipId: relationship.relationship_id, relationshipKind: relationship.relationship_kind });
+      }
+    }
+    let captureResult = null;
+    if (input.captureProvenance) {
+      const capture = input.captureProvenance;
+      const captureId = randomUUID();
+      await sequelize.query(
+        `INSERT INTO capture_provenance(id,material_event_id,actual_participant_party_id,participant_identity_state,entered_by_user_id,source_kind,occurred_at_claimed,source_reference,evidence_ref,note)
+         VALUES (:id,:eventId,:actualPartyId,:identityState,:userId,:sourceKind,:occurredAt,:sourceReference,:evidenceRef,:note)`,
+        { replacements: {
+          id: captureId, eventId, actualPartyId: capture.actualParticipantPartyId ?? null,
+          identityState: capture.participantIdentityState, userId: auth.userId,
+          sourceKind: capture.sourceKind, occurredAt: capture.occurredAt ?? input.occurredAt,
+          sourceReference: capture.sourceReference ?? null, evidenceRef: capture.evidenceRef ?? null, note: capture.note ?? null,
+        }, transaction },
+      );
+      await sequelize.query(
+        `INSERT INTO production_event_capture(production_event_id,capture_provenance_id) VALUES (:eventId,:captureId)`,
+        { replacements: { eventId, captureId }, transaction },
+      );
+      let acknowledgement = null;
+      if (capture.acknowledgement) {
+        const supplied = capture.acknowledgement;
+        if (supplied.status === 'ACKNOWLEDGED' && supplied.acknowledgedByPartyId !== capture.actualParticipantPartyId) {
+          throw new AppError(400, 'INVALID_ACKNOWLEDGEMENT', 'An acknowledgement must identify the recorded participant.');
+        }
+        const acknowledgementId = randomUUID();
+        await sequelize.query(
+          `INSERT INTO capture_acknowledgement_event(id,capture_provenance_id,status,acknowledged_by_party_id,recorded_by_user_id,method,occurred_at_claimed,reason)
+           VALUES (:id,:captureId,:status,:partyId,:userId,:method,:occurredAt,:reason)`,
+          { replacements: {
+            id: acknowledgementId, captureId, status: supplied.status,
+            partyId: supplied.acknowledgedByPartyId ?? null, userId: auth.userId,
+            method: supplied.method ?? null, occurredAt: supplied.occurredAt ?? null, reason: supplied.reason ?? null,
+          }, transaction },
+        );
+        acknowledgement = { id: acknowledgementId, status: supplied.status, acknowledgedByPartyId: supplied.acknowledgedByPartyId ?? null };
+      }
+      captureResult = { id: captureId, participantIdentityState: capture.participantIdentityState, actualParticipantPartyId: capture.actualParticipantPartyId ?? null, sourceKind: capture.sourceKind, acknowledgement };
+    }
     const outputs = [];
     for (const [index, outputInput] of input.outputs.entries()) {
       const batchId = randomUUID();
@@ -54,7 +126,7 @@ export async function createProductionEvent(siteId, input, auth, mutationId) {
       payload: { production_event_id: eventId, site_id: siteId, hole_id: input.holeId, output_ids: outputs.map((row) => row.id), output_count: outputs.length },
       streams: [{ kind: 'material_event', id: eventId }, { kind: 'mining_hole', id: input.holeId }, ...outputs.map((row) => ({ kind: 'material_batch', id: row.batchId }))],
     });
-    return { id: event.id, eventCode: event.eventCode, eventKind: event.eventKind, siteId, holeId: input.holeId, occurredAt: input.occurredAt, recordedAt: event.recordedAt, outputs };
+    return { id: event.id, eventCode: event.eventCode, eventKind: event.eventKind, siteId, holeId: input.holeId, occurredAt: input.occurredAt, recordedAt: event.recordedAt, participants: participantRows, captureProvenance: captureResult, outputs };
   }));
 }
 
@@ -72,12 +144,12 @@ export async function addOutputMeasurement(siteId, eventId, outputId, input, aut
     if (!rows.length) throw new AppError(404, 'PRODUCTION_OUTPUT_NOT_FOUND', 'Production output was not found for this site.');
     const measurementId = randomUUID();
     await sequelize.query(
-      `INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,method_code,instrument_ref,occurred_at_claimed,evidence_ref)
-       VALUES (:id,:setId,:kind,:quantity,:sourceValue,:unit,:conversion,:sourceRole,:sourcePartyId,:userId,:method,:instrument,:occurredAt,:evidenceRef)`,
-      { replacements: { id: measurementId, setId: rows[0].measurement_set_id, kind: input.kind, quantity: input.quantityGrams, sourceValue: input.sourceValue, unit: input.sourceUnit, conversion: input.conversionVersion, sourceRole: input.sourceRole, sourcePartyId: input.sourcePartyId ?? auth.personPartyId, userId: auth.userId, method: input.methodCode ?? null, instrument: input.instrumentRef ?? null, occurredAt: input.occurredAt, evidenceRef: input.evidenceRef ?? null }, transaction },
+      `INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,method_code,instrument_ref,occurred_at_claimed,evidence_ref,supersedes_measurement_id)
+       VALUES (:id,:setId,:kind,:quantity,:sourceValue,:unit,:conversion,:sourceRole,:sourcePartyId,:userId,:method,:instrument,:occurredAt,:evidenceRef,:supersedesId)`,
+      { replacements: { id: measurementId, setId: rows[0].measurement_set_id, kind: input.kind, quantity: input.quantityGrams, sourceValue: input.sourceValue, unit: input.sourceUnit, conversion: input.conversionVersion, sourceRole: input.sourceRole, sourcePartyId: input.sourcePartyId ?? auth.personPartyId, userId: auth.userId, method: input.methodCode ?? null, instrument: input.instrumentRef ?? null, occurredAt: input.occurredAt, evidenceRef: input.evidenceRef ?? null, supersedesId: input.supersedesMeasurementId ?? null }, transaction },
     );
     await appendAuditEvent({ transaction, eventType: 'MEASUREMENT.RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { measurement_id: measurementId, measurement_set_id: rows[0].measurement_set_id, batch_id: rows[0].batch_id, kind: input.kind, quantity_grams: input.quantityGrams }, streams: [{ kind: 'material_batch', id: rows[0].batch_id }, { kind: 'material_event', id: eventId }] });
-    return { id: measurementId, measurementSetId: rows[0].measurement_set_id, batchId: rows[0].batch_id, kind: input.kind, quantityGrams: input.quantityGrams, occurredAt: input.occurredAt, enteredAt: new Date() };
+    return { id: measurementId, measurementSetId: rows[0].measurement_set_id, batchId: rows[0].batch_id, kind: input.kind, quantityGrams: input.quantityGrams, occurredAt: input.occurredAt, supersedesMeasurementId: input.supersedesMeasurementId ?? null, enteredAt: new Date() };
   }));
 }
 
@@ -109,10 +181,38 @@ export async function getProductionEvent(siteId, eventId) {
     { replacements: { eventId }, type: QueryTypes.SELECT },
   );
   const measurements = await sequelize.query(
-    `SELECT id, measurement_set_id, measurement_kind, quantity_g, source_value, source_unit_code, conversion_version, source_role, source_party_id, occurred_at_claimed, entered_at, method_code, instrument_ref
+    `SELECT id, measurement_set_id, measurement_kind, quantity_g, source_value, source_unit_code, conversion_version, source_role, source_party_id, occurred_at_claimed, entered_at, method_code, instrument_ref, supersedes_measurement_id
      FROM material_measurement WHERE measurement_set_id IN (SELECT id FROM material_measurement_set WHERE material_event_output_id IN (SELECT material_event_output_id FROM production_event_output WHERE production_event_id=:eventId))
      ORDER BY entered_at, id`,
     { replacements: { eventId }, type: QueryTypes.SELECT },
   );
-  return { ...event, outputs: outputs.map((output) => ({ ...output, measurements: measurements.filter((measurement) => measurement.measurement_set_id === output.measurement_set_id) })) };
+  const participants = await sequelize.query(
+    `SELECT p.party_id, COALESCE(sr.role_code, hr.role_code) AS role_code,
+            COALESCE(p.site_party_role_id, p.hole_party_role_id) AS relationship_id,
+            CASE WHEN p.site_party_role_id IS NULL THEN 'HOLE' ELSE 'SITE' END AS relationship_kind
+     FROM production_event_participant p
+     LEFT JOIN site_party_role sr ON sr.id=p.site_party_role_id
+     LEFT JOIN hole_party_role hr ON hr.id=p.hole_party_role_id
+     WHERE p.production_event_id=:eventId ORDER BY relationship_id`,
+    { replacements: { eventId }, type: QueryTypes.SELECT },
+  );
+  const [capture] = await sequelize.query(
+    `SELECT cp.id, cp.actual_participant_party_id, cp.participant_identity_state, cp.source_kind,
+            cp.occurred_at_claimed, cp.entered_at, cp.source_reference, cp.evidence_ref,
+            ack.status AS acknowledgement_status, ack.acknowledged_by_party_id, ack.occurred_at_claimed AS acknowledgement_occurred_at
+     FROM production_event_capture pec JOIN capture_provenance cp ON cp.id=pec.capture_provenance_id
+     LEFT JOIN LATERAL (
+       SELECT status, acknowledged_by_party_id, occurred_at_claimed
+       FROM capture_acknowledgement_event WHERE capture_provenance_id=cp.id
+       ORDER BY recorded_at DESC, id DESC LIMIT 1
+     ) ack ON true
+     WHERE pec.production_event_id=:eventId`,
+    { replacements: { eventId }, type: QueryTypes.SELECT },
+  );
+  return {
+    ...event,
+    participants,
+    captureProvenance: capture ?? null,
+    outputs: outputs.map((output) => ({ ...output, measurements: measurements.filter((measurement) => measurement.measurement_set_id === output.measurement_set_id) })),
+  };
 }

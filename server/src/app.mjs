@@ -4,19 +4,25 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import pinoHttp from 'pino-http';
 import { randomUUID } from 'node:crypto';
+import { QueryTypes } from 'sequelize';
 import { z } from 'zod';
 import { env } from './config/env.mjs';
 import { logger } from './config/logger.mjs';
 import { sequelize } from './database/connection.mjs';
-import { authenticate, canAccessSite, hasRole, requireHoleAccess, requirePilotFieldOfficer, requireParticipantWriteAccess, requireProductionEventAccess, requireProductionHoleAccess, requireSiteAccess, requireSystemAdministrator } from './middleware/auth.mjs';
+import { authenticate, canAccessHole, canAccessProcessingFacility, canAccessSite, hasRole, requireHoleAccess, requirePilotFieldOfficer, requireParticipantWriteAccess, requireProcessingFacilityAccess, requireProductionEventAccess, requireProductionHoleAccess, requireSiteAccess, requireSystemAdministrator } from './middleware/auth.mjs';
 import { login, getProfile, createAccount, createOrganisation, addRoleAssignment, revokeRoleAssignment } from './modules/identity/identity.service.mjs';
 import { createSite, listSites, getSite, updateSite, createHole, getHole, listHoles, createParticipant, listParticipants, listHoleParticipants } from './modules/mining-sites/site.service.mjs';
 import { createProductionEvent, addOutputMeasurement, listProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
+import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
+import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
+import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
+import { createBatchQr, rotateBatchQr, lookupQr, canAccessBatch } from './modules/qr/qr.service.mjs';
 import { AppError, errorHandler, validateBody } from './utils/errors.mjs';
 
 const decimal = (places) => z.string().regex(new RegExp(`^(0|[1-9][0-9]*)(\\.[0-9]{1,${places}})?$`));
 const dateTime = z.string().datetime({ offset: true });
 const loginSchema = z.object({ email: z.string().email().max(320), password: z.string().min(1).max(128) }).strict();
+const emptySchema = z.object({}).strict().default({});
 const accountSchema = z.object({ email: z.string().email().max(320), displayName: z.string().trim().min(1).max(160), password: z.string().min(12).max(72), organisationPartyId: z.string().uuid().optional() }).strict();
 const organisationSchema = z.object({ displayName: z.string().trim().min(1).max(160), organisationKind: z.string().trim().min(1).max(40) }).strict();
 const roleSchema = z.object({ roleCode: z.enum(['SYSTEM_ADMIN', 'FIELD_OFFICER', 'MINING_OPERATOR', 'MINER', 'DORA_OPERATOR', 'RECOVERY_FACILITY_OPERATOR', 'LOCAL_MERCHANT', 'LARGER_MERCHANT', 'AUDITOR']), scopeKind: z.enum(['GLOBAL', 'PILOT', 'ORGANISATION', 'SITE', 'HOLE', 'FACILITY']), scopeId: z.string().min(1).max(80) }).strict();
@@ -27,16 +33,22 @@ const siteRole = z.enum(['LANDOWNER', 'PERMIT_HOLDER', 'SITE_OPERATOR', 'MINER',
 const holeRole = z.enum(['HOLE_OPERATOR', 'MINER', 'BENEFICIARY', 'FIELD_RECORDER', 'OTHER']);
 const participantKinds = z.enum(['MINER', 'MINING_OPERATOR', 'LANDOWNER', 'PERMIT_HOLDER', 'DORA_OPERATOR', 'RECOVERY_FACILITY', 'LOCAL_MERCHANT', 'LARGER_MERCHANT', 'CARRIER', 'FIELD_OFFICER', 'AUDITOR', 'OTHER']);
 const participantSchema = z.object({
-  partyKind: z.enum(['PERSON', 'ORGANISATION']),
-  displayName: z.string().trim().min(1).max(160),
+  partyId: z.string().uuid().optional(),
+  partyKind: z.enum(['PERSON', 'ORGANISATION']).optional(),
+  displayName: z.string().trim().min(1).max(160).optional(),
   organisationKind: z.string().trim().min(1).max(40).optional(),
   participantKind: participantKinds,
   roleCode: z.union([siteRole, holeRole]),
   holeId: z.string().uuid().optional(),
+  validFrom: dateTime.optional(),
+  validTo: dateTime.optional(),
 }).strict().superRefine((value, context) => {
-  if (value.partyKind === 'ORGANISATION' && !value.organisationKind) context.addIssue({ code: 'custom', path: ['organisationKind'], message: 'organisationKind is required for organisation parties.' });
+  if (value.partyId && (value.partyKind || value.displayName || value.organisationKind)) context.addIssue({ code: 'custom', path: ['partyId'], message: 'Existing participants are selected by partyId without replacement identity fields.' });
+  if (!value.partyId && (!value.partyKind || !value.displayName)) context.addIssue({ code: 'custom', path: ['partyKind'], message: 'New participants require partyKind and displayName.' });
+  if (!value.partyId && value.partyKind === 'ORGANISATION' && !value.organisationKind) context.addIssue({ code: 'custom', path: ['organisationKind'], message: 'organisationKind is required for organisation parties.' });
   if (value.holeId && !holeRole.safeParse(value.roleCode).success) context.addIssue({ code: 'custom', path: ['roleCode'], message: 'roleCode is not a hole role.' });
   if (!value.holeId && !siteRole.safeParse(value.roleCode).success) context.addIssue({ code: 'custom', path: ['roleCode'], message: 'roleCode is not a site role.' });
+  if (value.validFrom && value.validTo && new Date(value.validTo) <= new Date(value.validFrom)) context.addIssue({ code: 'custom', path: ['validTo'], message: 'validTo must be later than validFrom.' });
 }).transform((value) => ({ ...value, organisationKind: value.organisationKind ?? null }));
 const measurementSchema = z.object({
   kind: z.enum(['DECLARED', 'MEASURED', 'VERIFIED']),
@@ -50,17 +62,82 @@ const measurementSchema = z.object({
   instrumentRef: z.string().max(160).optional(),
   occurredAt: dateTime.optional(),
   evidenceRef: z.string().max(255).optional(),
+  supersedesMeasurementId: z.string().uuid().optional(),
 }).strict();
+const newMeasurementSchema = measurementSchema.omit({ supersedesMeasurementId: true });
 const productionSchema = z.object({
   holeId: z.string().uuid(),
   occurredAt: dateTime,
   shiftOrPeriodRef: z.string().max(100).optional(),
+  participantRelationshipIds: z.array(z.string().uuid()).max(40).optional(),
+  captureProvenance: z.object({
+    actualParticipantPartyId: z.string().uuid().optional(),
+    participantIdentityState: z.enum(['IDENTIFIED', 'UNRESOLVED', 'UNKNOWN']),
+    sourceKind: z.enum(['DIRECT', 'ASSISTED_VERBAL', 'WITNESS', 'PAPER_TRANSCRIPTION', 'OTHER']),
+    occurredAt: dateTime.optional(),
+    sourceReference: z.string().max(255).optional(),
+    evidenceRef: z.string().max(255).optional(),
+    note: z.string().max(1000).optional(),
+    acknowledgement: z.object({
+      status: z.enum(['ACKNOWLEDGED', 'PENDING', 'DECLINED', 'DISPUTED', 'NOT_OBTAINED']),
+      acknowledgedByPartyId: z.string().uuid().optional(),
+      method: z.string().max(80).optional(),
+      occurredAt: dateTime.optional(),
+      reason: z.string().max(500).optional(),
+    }).strict().optional(),
+  }).strict().superRefine((value, context) => {
+    if ((value.participantIdentityState === 'IDENTIFIED') !== Boolean(value.actualParticipantPartyId)) context.addIssue({ code: 'custom', path: ['actualParticipantPartyId'], message: 'IDENTIFIED capture requires an actual participant; other identity states omit it.' });
+    if (value.acknowledgement?.status === 'ACKNOWLEDGED' && !value.acknowledgement.acknowledgedByPartyId) context.addIssue({ code: 'custom', path: ['acknowledgement', 'acknowledgedByPartyId'], message: 'ACKNOWLEDGED requires the acknowledging party.' });
+    if (value.acknowledgement?.status !== 'ACKNOWLEDGED' && value.acknowledgement?.acknowledgedByPartyId) context.addIssue({ code: 'custom', path: ['acknowledgement', 'acknowledgedByPartyId'], message: 'Only an ACKNOWLEDGED event names an acknowledging party.' });
+  }).optional(),
   outputs: z.array(z.object({
     materialKind: z.enum(['GOLD_BEARING_FEED', 'RESIDUE', 'GOLD_DORE', 'RECOVERED_GOLD', 'PROCESS_OUTPUT']),
     outputKind: z.string().trim().min(1).max(40).optional(),
-    measurements: z.array(measurementSchema).max(20).optional(),
+    measurements: z.array(newMeasurementSchema).max(20).optional(),
   }).strict()).min(1).max(20),
 }).strict();
+const doraSchema = z.object({ name: z.string().trim().min(1).max(160) }).strict();
+const doraPatchSchema = z.object({ name: z.string().trim().min(1).max(160).optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional() }).strict()
+  .refine((value) => Object.keys(value).length > 0, 'At least one permitted Dora field must be supplied.');
+const allocationRowSchema = z.object({
+  beneficiaryPartyId: z.string().uuid(),
+  allocatedQuantityGrams: decimal(6).optional(),
+  allocatedShare: decimal(9).optional(),
+}).strict();
+const allocationSchema = z.object({
+  basisKind: z.enum(['QUANTITY', 'SHARE']),
+  basisMeasurementId: z.string().uuid().optional(),
+  supersedesSetId: z.string().uuid().optional(),
+  correctionReason: z.string().trim().min(1).max(500).optional(),
+  rows: z.array(allocationRowSchema).min(1).max(100),
+}).strict().superRefine((value, context) => {
+  if (value.basisKind === 'QUANTITY' && !value.basisMeasurementId) context.addIssue({ code: 'custom', path: ['basisMeasurementId'], message: 'Choose the exact output observation for a quantity set.' });
+  if (value.basisKind === 'SHARE' && value.basisMeasurementId) context.addIssue({ code: 'custom', path: ['basisMeasurementId'], message: 'Share sets do not name a measurement basis.' });
+  if (Boolean(value.supersedesSetId) !== Boolean(value.correctionReason)) context.addIssue({ code: 'custom', path: ['correctionReason'], message: 'A complete revision names its predecessor and a reason.' });
+  const seen = new Set();
+  value.rows.forEach((row, index) => {
+    if (seen.has(row.beneficiaryPartyId)) context.addIssue({ code: 'custom', path: ['rows', index, 'beneficiaryPartyId'], message: 'A beneficiary may appear once per complete set.' });
+    seen.add(row.beneficiaryPartyId);
+    if (value.basisKind === 'QUANTITY' && (row.allocatedQuantityGrams === undefined || row.allocatedShare !== undefined)) context.addIssue({ code: 'custom', path: ['rows', index], message: 'Every row in a quantity set needs only allocatedQuantityGrams.' });
+    if (value.basisKind === 'SHARE' && (row.allocatedShare === undefined || row.allocatedQuantityGrams !== undefined)) context.addIssue({ code: 'custom', path: ['rows', index], message: 'Every row in a share set needs only allocatedShare.' });
+  });
+});
+const processingSchema = z.object({
+  processingFacilityId: z.string().uuid(),
+  occurredAt: dateTime,
+  compensationArrangementCode: z.string().trim().min(1).max(40).optional(),
+  serviceTermsRef: z.string().trim().min(1).max(255).optional(),
+  inputs: z.array(z.object({ sourceProductionOutputId: z.string().uuid(), measurements: z.array(newMeasurementSchema).min(1).max(20) }).strict()).min(1).max(20),
+  outputs: z.array(z.object({
+    materialKind: z.enum(['GOLD_BEARING_FEED', 'RESIDUE', 'GOLD_DORE', 'RECOVERED_GOLD', 'PROCESS_OUTPUT']),
+    outputRole: z.enum(['MINER_RETAINED_GOLD', 'DORA_RETAINED_RESIDUE', 'OTHER_OUTPUT']),
+    outputKind: z.string().trim().min(1).max(40).optional(),
+    measurements: z.array(newMeasurementSchema).min(1).max(20),
+  }).strict()).min(1).max(20),
+}).strict().superRefine((value, context) => {
+  if (Boolean(value.compensationArrangementCode) !== Boolean(value.serviceTermsRef)) context.addIssue({ code: 'custom', path: ['serviceTermsRef'], message: 'Record both the applicable arrangement code and its source reference.' });
+  if (new Set(value.inputs.map((input) => input.sourceProductionOutputId)).size !== value.inputs.length) context.addIssue({ code: 'custom', path: ['inputs'], message: 'A source production output may appear once per processing event.' });
+});
 
 function requireIdempotencyKey(req, res, next) {
   const key = req.get('idempotency-key');
@@ -80,6 +157,45 @@ function requireUuidParams(...names) {
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+async function requireProcessingCommandAccess(req, res, next) {
+  try {
+    if (!(await canAccessProcessingFacility(req.auth, req.body.processingFacilityId))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    const sourceIds = req.body.inputs.map((row) => row.sourceProductionOutputId);
+    const sources = await sequelize.query(
+      `SELECT peo.material_event_output_id AS output_id, h.site_id, h.id AS hole_id
+       FROM production_event_output peo JOIN production_event pe ON pe.event_id=peo.production_event_id
+       JOIN mining_hole h ON h.id=pe.hole_id
+       WHERE peo.material_event_output_id IN (:sourceIds) AND h.site_id=:siteId`,
+      { replacements: { sourceIds, siteId: req.params.siteId }, type: QueryTypes.SELECT },
+    );
+    if (sources.length !== sourceIds.length) return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    for (const source of sources) {
+      if (!(await canAccessHole(req.auth, req.params.siteId, source.hole_id, { write: true }))) {
+        return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+      }
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+
+async function requireProcessingEventAccess(req, res, next) {
+  try {
+    const rows = await processingEventAccessRows(req.params.eventId);
+    if (!rows.length || !(await canAccessProcessingFacility(req.auth, rows[0].processing_facility_id))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    for (const row of rows) {
+      if (!(await canAccessHole(req.auth, row.site_id, row.hole_id, { write }))) {
+        return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+      }
+    }
+    return next();
+  } catch (error) { return next(error); }
 }
 
 export const app = express();
@@ -143,6 +259,14 @@ app.get('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requi
 app.post('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(participantSchema), requireParticipantWriteAccess, asyncRoute(async (req, res) => {
   return res.status(201).json(await createParticipant(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
+app.get('/api/v1/sites/:siteId/doras', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listSiteDoras(req.params.siteId))));
+app.post('/api/v1/sites/:siteId/doras', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(doraSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createDora(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/doras/:facilityId', requireUuidParams('facilityId'), requireProcessingFacilityAccess, asyncRoute(async (req, res) => res.json(await getDora(req.params.facilityId))));
+app.patch('/api/v1/doras/:facilityId', requireUuidParams('facilityId'), requireProcessingFacilityAccess, requireIdempotencyKey, validateBody(doraPatchSchema), asyncRoute(async (req, res) => {
+  return res.json(await updateDora(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
+}));
 app.get('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listProductionEvents(req.params.siteId))));
 app.get('/api/v1/sites/:siteId/production-events/:eventId', requireUuidParams('siteId', 'eventId'), requireProductionEventAccess, asyncRoute(async (req, res) => res.json(await getProductionEvent(req.params.siteId, req.params.eventId))));
 app.post('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(productionSchema), requireProductionHoleAccess, asyncRoute(async (req, res) => {
@@ -151,6 +275,32 @@ app.post('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'),
 app.post('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/measurements', requireUuidParams('siteId', 'eventId', 'outputId'), requireProductionEventAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
   const input = { ...req.body, occurredAt: req.body.occurredAt ?? new Date().toISOString() };
   return res.status(201).json(await addOutputMeasurement(req.params.siteId, req.params.eventId, req.params.outputId, input, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/allocation-sets', requireUuidParams('siteId', 'eventId', 'outputId'), requireProductionEventAccess, asyncRoute(async (req, res) => {
+  return res.json(await getOutputAllocations(req.params.siteId, req.params.eventId, req.params.outputId));
+}));
+app.post('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/allocation-sets', requireUuidParams('siteId', 'eventId', 'outputId'), requireProductionEventAccess, requireIdempotencyKey, validateBody(allocationSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createAllocationSet(req.params.siteId, req.params.eventId, req.params.outputId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/sites/:siteId/processing-events', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(processingSchema), requireProcessingCommandAccess, asyncRoute(async (req, res) => {
+  return res.status(201).json(await createProcessingEvent(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/processing-events/:eventId', requireUuidParams('eventId'), requireProcessingEventAccess, asyncRoute(async (req, res) => res.json(await getProcessingEvent(req.params.eventId))));
+app.post('/api/v1/processing-events/:eventId/inputs/:inputId/measurements', requireUuidParams('eventId', 'inputId'), requireProcessingEventAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await addProcessingMeasurement(req.params.eventId, 'INPUT', req.params.inputId, { ...req.body, occurredAt: req.body.occurredAt ?? new Date().toISOString() }, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/processing-events/:eventId/outputs/:outputId/measurements', requireUuidParams('eventId', 'outputId'), requireProcessingEventAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await addProcessingMeasurement(req.params.eventId, 'OUTPUT', req.params.outputId, { ...req.body, occurredAt: req.body.occurredAt ?? new Date().toISOString() }, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/material-batches/:batchId/qr', requireUuidParams('batchId'), requireIdempotencyKey, validateBody(emptySchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createBatchQr(req.params.batchId, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/material-batches/:batchId/qr/rotate', requireUuidParams('batchId'), requireIdempotencyKey, validateBody(emptySchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await rotateBatchQr(req.params.batchId, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/qr/:token', asyncRoute(async (req, res) => {
+  if (!/^[A-Za-z0-9_-]{40,60}$/.test(req.params.token)) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return res.json(await lookupQr(req.params.token, req.auth));
 }));
 
 app.use((req, res, next) => next(new AppError(404, 'NOT_FOUND', 'The requested endpoint was not found.')));

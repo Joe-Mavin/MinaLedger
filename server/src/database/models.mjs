@@ -104,6 +104,31 @@ export const ProductionEvent = sequelize.define('production_event', {
   shiftOrPeriodRef: { type: DataTypes.STRING(100), field: 'shift_or_period_ref' },
 }, { tableName: 'production_event' });
 
+export const ProcessingFacility = sequelize.define('processing_facility', {
+  id: commonId,
+  partyId: { type: DataTypes.UUID, field: 'party_id' },
+  name: { type: DataTypes.STRING(160), allowNull: false },
+  status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'ACTIVE' },
+  createdAt,
+}, { tableName: 'processing_facility' });
+
+export const ProcessingEvent = sequelize.define('processing_event', {
+  eventId: { type: DataTypes.UUID, primaryKey: true, field: 'event_id' },
+  processingFacilityId: { type: DataTypes.UUID, field: 'processing_facility_id', allowNull: false },
+  operatorPartyId: { type: DataTypes.UUID, field: 'operator_party_id', allowNull: false },
+  serviceTermsRef: { type: DataTypes.STRING(255), field: 'service_terms_ref' },
+  compensationArrangementCode: { type: DataTypes.STRING(40), field: 'compensation_arrangement_code' },
+}, { tableName: 'processing_event' });
+
+export const ProductionEventParticipant = sequelize.define('production_event_participant', {
+  id: commonId,
+  productionEventId: { type: DataTypes.UUID, field: 'production_event_id', allowNull: false },
+  partyId: { type: DataTypes.UUID, field: 'party_id', allowNull: false },
+  sitePartyRoleId: { type: DataTypes.UUID, field: 'site_party_role_id' },
+  holePartyRoleId: { type: DataTypes.UUID, field: 'hole_party_role_id' },
+  createdAt,
+}, { tableName: 'production_event_participant' });
+
 MiningSite.hasMany(MiningHole, { foreignKey: 'siteId', as: 'holes' });
 MiningHole.belongsTo(MiningSite, { foreignKey: 'siteId', as: 'site' });
 Party.hasOne(PersonProfile, { foreignKey: 'partyId', as: 'personProfile' });
@@ -113,4 +138,5 @@ UserAccount.belongsTo(Party, { foreignKey: 'personPartyId', as: 'person' });
 export const models = {
   Party, PersonProfile, OrganisationProfile, UserAccount, OrganisationMembership,
   RoleAssignment, MiningSite, MiningHole, MaterialBatch, MaterialEvent, ProductionEvent,
+  ProcessingFacility, ProcessingEvent, ProductionEventParticipant,
 };

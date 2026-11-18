@@ -108,6 +108,43 @@ export async function canAccessHole(auth, siteId, holeId, { write = false } = {}
   return false;
 }
 
+export async function canAccessProcessingFacility(auth, facilityId) {
+  if (!UUID_PATTERN.test(String(facilityId))) return false;
+  if (auth.roles.some((role) => role.role_code === 'DORA_OPERATOR' && role.scope_kind === 'FACILITY' && role.scope_id === String(facilityId))) return true;
+
+  const direct = await sequelize.query(
+    `SELECT 1 FROM facility_party_role fpr
+     WHERE fpr.processing_facility_id=:facilityId AND fpr.party_id=:partyId
+       AND fpr.role_code IN ('DORA_OPERATOR','FACILITY_OPERATOR','OPERATOR') AND fpr.status='ACTIVE'
+       AND fpr.valid_from<=now() AND (fpr.valid_to IS NULL OR fpr.valid_to>now()) LIMIT 1`,
+    { replacements: { facilityId, partyId: auth.personPartyId }, type: QueryTypes.SELECT },
+  );
+  if (direct.length) return true;
+
+  for (const role of auth.roles.filter((item) => item.role_code === 'DORA_OPERATOR' && item.scope_kind === 'ORGANISATION')) {
+    if (!(await hasActiveOrganisationMembership(auth, role.scope_id))) continue;
+    const affiliated = await sequelize.query(
+      `SELECT 1 FROM facility_party_role fpr
+       WHERE fpr.processing_facility_id=:facilityId AND fpr.party_id=:organisationId
+         AND fpr.role_code IN ('DORA_OPERATOR','FACILITY_OPERATOR','OPERATOR') AND fpr.status='ACTIVE'
+         AND fpr.valid_from<=now() AND (fpr.valid_to IS NULL OR fpr.valid_to>now()) LIMIT 1`,
+      { replacements: { facilityId, organisationId: role.scope_id }, type: QueryTypes.SELECT },
+    );
+    if (affiliated.length) return true;
+  }
+  return false;
+}
+
+export async function requireProcessingFacilityAccess(req, res, next) {
+  try {
+    const facilityId = req.params.facilityId ?? req.body?.processingFacilityId;
+    if (!(await canAccessProcessingFacility(req.auth, facilityId))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+
 export async function requireSiteAccess(req, res, next) {
   try {
     const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
