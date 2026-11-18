@@ -1,0 +1,93 @@
+# Proposed implementation milestones
+
+## Phase 1 implementation status (2026-11-18)
+
+Phase 1 is underway with a tested backend foundation; Stages 1 and 2 are **partially implemented**, not complete. The PostgreSQL 18 migration and 10 integration checks pass against a dedicated database ending in `_test`.
+
+- Implemented and tested: ES-module Express API; Sequelize access layer and reviewed SQL migration; environment validation; health endpoint; bcrypt accounts and short-lived JWT authentication; audited user/role administration and organisation membership; scoped site reads; site/hole/participant commands; production events, output batches and append-only typed measurement observations; allocation revision constraints; one derived inventory journal with guarded transfer service; and per-aggregate hash-linked audit verification.
+- Still needed for Stage 1/2: client/PWA, deployment and backup policy, allocation-review API and pilot reviewer role, and complete operational inventory and processing APIs. Commercial correction and partial-reversal integrity rules are enforced and tested in PostgreSQL; a user-facing correction command is not implemented. No offline engine, distributed ledger, or full Dora/merchant/recovery workflow is implemented.
+- Verification commands: `cd server; npm run lint`, `npm run migrate`, then `npm test` with `TEST_DATABASE_URL` set to a dedicated PostgreSQL `_test` database. The suite resets and cleans that database's `public` schema.
+
+## Delivery rule
+
+These are proposed future stages, not work already completed. Phase 0 is specification only. Begin Phase 1 only after explicit project-owner approval of the architecture. Stage 1 may prove PostgreSQL/ORM constraint and locking behavior; participant-dependent decisions in the [decision log](DECISION_LOG.md) must be answered before their affected allocation, inventory, payment or custody features are built. Do not turn unresolved assumptions into defaults. Each implementation stage should ship a reviewable vertical slice with migrations, API/UI, permissions, observability and automated tests appropriate to the scope.
+
+## Stage 0 — Phase 0 specification (current assignment)
+
+- **Scope:** project charter, domain model, material routes, database proposal, security, offline, API/architecture, ledger choices, decisions, milestones and acceptance criteria.
+- **Dependencies:** supplied project specification.
+- **Deliverables:** completed `/docs` specification and README status update; diagrams; decision log with open questions.
+- **Acceptance criteria:** requested existing docs are populated; both routes and pooled genealogy are described; homogeneous-basis allocation revisions, typed measurement ownership, one inventory journal with transaction-level balance guards, trade/payment currency integrity, assisted capture and per-aggregate audit ordering are consistent across docs; requirements/observations/proposals/open questions are distinguished; project status says design only; approval gate is explicit.
+- **Automated checks:** documentation link check, Markdown lint and Mermaid syntax parse in the eventual repository workflow. No application tests apply to this documentation-only stage.
+- **Known risks:** pilot assumptions may be read as universal practice; unresolved terminology could become hard-coded if Phase 1 begins without participant review.
+
+## Stage 1 — application foundation, identity and audit
+
+- **Scope:** React/Vite/TypeScript PWA shell; Express ES-module API; PostgreSQL schema/migrations; scoped account/role model; idempotency and per-aggregate audit stream envelope; health/configuration endpoints; structured errors; CI baseline; a database-integrity proof for composite FKs, deferred cross-row constraints and transactional row-lock protocols, using reviewed SQL if the ORM cannot express them.
+- **Dependencies:** owner approval, pilot deployment boundary, authentication choice, initial party/role and data visibility review; verify ORM support for the required PostgreSQL constraints, triggers and transaction isolation before settling migration ownership.
+- **Deliverables:** runnable client/API, initial migrations, module boundaries, authentication integration, authorization middleware, audit log and development deployment instructions.
+- **Acceptance criteria:** an authorized user can sign in, choose an assigned acting context, access only its allowed records, and create an append-only auditable command. Database design proof demonstrates that inventory guards serialize balance updates and deferred constraints reject invalid movements; payment currency composite FKs and typed measurement-owner constraints work in PostgreSQL. Role revocation takes effect server-side. No feature claims legal validation.
+- **Automated tests:** unit tests for role/scope decisions and audit stream hashing; API tests for duplicate and concurrent command handling; integration tests for append and correction; migration smoke test against PostgreSQL; dependency/security baseline checks selected by maintainers.
+- **Known risks:** account recovery or identity collection could burden users; broad admin access may expose commercial data; authentication and offline policies may conflict.
+
+## Stage 2 — sites, holes, production and Dora processing
+
+- **Scope:** sites, holes, effective-dated party relationships, multiple independent processing facilities per site, multiple production outputs, output-specific allocation chains and complete homogeneous-basis revisions/reviews, material batches, typed measurement-set ownership/observations, assisted-capture provenance, processing inputs/outputs, residue retention and opaque QR lookup.
+- **Dependencies:** Stage 1; pilot agreement on minimum site/hole and production fields, measurement units, facility identification, allocation basis/review authority and whether a dispute applies to a whole set or a beneficiary row.
+- **Deliverables:** field capture and authorized genealogy views for production through one or more Dora facilities.
+- **Acceptance criteria:** a site supports multiple holes/operators and multiple Doras; an output can be allocated to many beneficiaries and one beneficiary can receive across outputs; each set uses one basis; pending/provisional/disputed/rejected/approved states and corrected revisions are retained; only one current-approved set exists per output; a miner's chosen Dora records multiple outputs; exactly-one typed measurement ownership and batch matching are enforced; measurements are not duplicated on batches; no allocation silently implies entitlement, custody, sale or payment.
+- **Automated tests:** domain tests for split/multiple outputs, allocation cardinality/revisions and role scope; API tests for duplicate retries and invalid facility access; database tests for foreign keys/constraints; end-to-end scenario across site → hole → production → output → multiple allocations → Dora processing.
+- **Known risks:** terminology and allocation practices vary; initial measurement may be estimated or disputed; QR labels may identify records without proving authenticity.
+
+## Stage 3 — residue pooling, transport and recovery
+
+- **Scope:** stockpile locations, one inventory movement journal with balance-key guards and deferred transfer/transformation constraints, Dora-to-facility residue sales, itemized residue consignments, transport legs, dispatch/receipt and discrepancies, recovery facility inventory, recovery events and outputs with input genealogy.
+- **Dependencies:** Stage 2; pilot agreement on residue ownership/service consideration, stockpile practice, dispatch/receipt evidence, facility inventory and recovery inputs/outputs; PostgreSQL transaction/locking proof from Stage 1.
+- **Deliverables:** traceable residue route from Dora output through pooled inventory, truck consignment and recovery output.
+- **Acceptance criteria:** a consignment can contain several residue batches; stockpile OUT + transit IN and transit OUT + facility IN are atomic paired postings; concurrent commands cannot overdraw inventory; transformations link consumed and created batches; manifests do not add a second balance; the residue sale is separate from shipment, custody and payment; a recovery event can consume multiple consignments; counts reconcile through explicit adjustments without inferring fraud; no exact source-miner recovery quantity is displayed without an approved allocation method.
+- **Automated tests:** property tests for movement/balance invariants, no-double-count transfer and split/merge genealogy; concurrent transfer tests; integration tests for multiple batch/consignment inputs; authorization tests across facility boundaries; failure tests for incomplete receipt, discrepancy and adjustment.
+- **Known risks:** physical mixing may make lineage evidential rather than exact; mass balance may be affected by process, moisture, sampling or measurement differences.
+
+## Stage 4 — gold purchases, merchant aggregation, assay, payment and custody
+
+- **Scope:** miner-to-local merchant purchases, local merchant aggregation/resale, facility-to-larger merchant trade, assay records, proposed/accepted trade quantities, seller/buyer measurement observations, shared gold/residue payment histories, partial settlement, offered/accepted custody and corrections/disputes.
+- **Dependencies:** Stages 2–3; participant agreement on weight/assay fields, price visibility, supported transaction currencies and money precision, payment states, who accepts custody and permitted aggregation allocation. No currency conversion is in scope without a separate approval and explicit conversion facts.
+- **Deliverables:** both routes converge on larger merchants while source purchases remain linked and commercial visibility is scoped.
+- **Acceptance criteria:** transaction quantity, accepted trade quantity, seller-declared weight, buyer-measured weight and inventory deduction are distinct; original measures remain visible; both gold trades and residue sales accept payments; database constraints reject parent/payment/event currency mismatches; reports/confirmations/reversals/corrections are append-only and net settlement is derived by currency; custody and inventory remain separate.
+- **Automated tests:** integration scenarios for both value-chain routes and both payment parents; authorization tests for counterpart versus unrelated prices; concurrency tests preventing overselling/overpayment; idempotency tests for trade/payment/custody; correction/reversal and disagreement tests.
+- **Known risks:** counterparties may disagree about price/assay or refuse detailed source disclosure; aggregation attribution may not be defensible.
+
+## Stage 5 — offline command queue and synchronization
+
+- **Scope:** IndexedDB command storage, service-worker app shell, sync status UI, idempotent upload/receipts, retries, dependency ordering, version conflicts, shared-device assisted capture, participant acknowledgement, paper transcription and offline-data lifecycle.
+- **Dependencies:** stable Stage 1–4 API schemas; pilot device/browser/connectivity observation; offline authentication and local data policy.
+- **Deliverables:** user-visible local/server/counterparty/ledger states and recoverable synchronization after app restart or interrupted upload.
+- **Acceptance criteria:** offline-created commands survive restart; no-phone participants can be captured by an authorized recorder; participant, recorder, source, acknowledgement, occurrence time and entry time are distinct; later paper transcription is labelled; no recorder entry implies consent/approval; duplicate retries and conflicts behave as specified.
+- **Automated tests:** browser storage/restart tests; network disconnect/reconnect tests; assisted/shared-device and paper-transcription tests; acknowledgement/dispute tests; idempotency and schema-version tests; conflict/ordering tests; local data clear/revocation tests.
+- **Known risks:** browser storage eviction, shared devices, stale permissions, local clock drift, poor connectivity and OS background-task limits.
+
+## Stage 6 — tamper-evidence prototype and conditional ledger pilot
+
+- **Scope:** append-only per-aggregate audit streams, sorted row locking, deterministic event canonicalization, salted commitment utility, independent checkpoint creation/verification, outbox worker, failure handling and receipt display. A separate network pilot is conditional.
+- **Dependencies:** Stage 1 audit envelope; selected event allowlist; approval of payload sharing, hash/key procedures, participant governance and independent verification criteria. Operational Fabric/Besu deployment needs explicit pilot approval.
+- **Deliverables:** first a database-backed hash-linked prototype; only if approved, a test permissioned network with separately controlled organizations and a documented chaincode/endorsement policy.
+- **Acceptance criteria:** concurrent same-stream appends form one ordered sequence; cross-stream transactions lock consistently; there is no global-order claim; a verifier validates through the latest independently held checkpoint and the UI states the uncheckpointed-tail limit; correction produces a new linked commitment; database acceptance and network commitment are visibly separate.
+- **Automated tests:** concurrent writer/same-stream and cross-stream tests; canonicalization cross-language vectors; payload/stream tamper, deletion/reordering and checkpoint verification tests; demonstrate that uncheckpointed tail rewriting is not necessarily detected; outbox retry/idempotency tests; simulated network outage; privacy checks.
+- **Known risks:** false confidence from hashes, metadata leakage, key loss, node concentration, network overhead and lack of a willing independent operator. Retain the signed-database alternative if consortium value is not demonstrated.
+
+## Stage 7 — pilot hardening and evaluation
+
+- **Scope:** selected-site deployment, user training, accessibility/language review, monitoring, backup/restore, security review, support and feedback; no automatic widening to all locations.
+- **Dependencies:** preceding stages and explicit pilot participant agreement; hosting and support owners; reviewed data access/retention policy; if ledger is used, completed governance and outage exercises.
+- **Deliverables:** bounded pilot release, support/runbook, measured feedback, defect and risk register, and recommendation to continue, change or stop.
+- **Acceptance criteria:** participants complete agreed end-to-end scenarios in real connectivity conditions; data visibility matches approved matrix; data restore and offline reconciliation are demonstrated; disputed/incorrect records can be corrected without erasure; pilot owner reviews evidence before expansion.
+- **Automated tests:** full critical-path end-to-end suite; regression/security/accessibility checks selected for the product; backup-restore verification; load and queue-recovery checks sized from observed pilot volumes.
+- **Known risks:** onboarding burden, literacy/language fit, disputed practices, connectivity, physical evidence quality and operational cost may outweigh the traceability benefit.
+
+## Suggested sequencing gates
+
+- Validate domain terms and role visibility with a small set of participants before building workflow-specific rules.
+- Complete a vertical path through each route before broadening reports or dashboards.
+- Demonstrate offline sync and correction before collecting consequential production/trade records.
+- Demonstrate independent verification and participant governance before calling the design a distributed blockchain system.
+- Reassess scope, cost, data sensitivity and participant benefit at the end of each stage.
