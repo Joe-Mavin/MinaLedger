@@ -101,7 +101,7 @@ export async function lockInventoryBalanceKeys(keys, transaction) {
 }
 
 export async function postMovementInTransaction({
-  movementKind, eventId = null, lines, reason = null, occurredAt, auth, transaction, mutationId,
+  movementKind, eventId = null, reversesMovementId = null, lines, reason = null, occurredAt, auth, transaction, mutationId,
 }) {
   const keys = sortKeys(lines);
   await lockCommercialChains(lines, transaction);
@@ -124,9 +124,9 @@ export async function postMovementInTransaction({
   }
   const movementId = randomUUID();
   await sequelize.query(
-    `INSERT INTO inventory_movement(id,event_id,movement_kind,current_status,reason,actor_user_id,occurred_at_claimed)
-     VALUES (:id,:eventId,:movementKind,'DRAFT',:reason,:actorUserId,:occurredAt)`,
-    { replacements: { id: movementId, eventId, movementKind, reason, actorUserId: auth.userId, occurredAt }, transaction },
+    `INSERT INTO inventory_movement(id,event_id,reverses_movement_id,movement_kind,current_status,reason,actor_user_id,occurred_at_claimed)
+     VALUES (:id,:eventId,:reversesMovementId,:movementKind,'DRAFT',:reason,:actorUserId,:occurredAt)`,
+    { replacements: { id: movementId, eventId, reversesMovementId, movementKind, reason, actorUserId: auth.userId, occurredAt }, transaction },
   );
   for (const [index, line] of lines.entries()) {
     await sequelize.query(

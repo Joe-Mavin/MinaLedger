@@ -65,9 +65,9 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt and recovery genealogy. They use synthetic fictional records only. The full verified suite reports **42 tests, 42 passed, 0 failed**, including rollback/reapply coverage for migrations 003 and 004.
+Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt and recovery genealogy. They use synthetic fictional records only. The full verified suite reports **47 tests, 47 passed, 0 failed**, including rollback/reapply coverage for migrations 003, 004 and 005.
 
-Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Verification on 2026-11-18 passed for **23 ES modules**; the full PostgreSQL suite passed **42/42 tests** against the dedicated `_test` database.
+Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Verification on 2026-11-19 passed for **23 ES modules**; the full PostgreSQL suite passed **47/47 tests** against the dedicated `_test` database.
 
 ## Available API routes
 
@@ -99,9 +99,9 @@ All write commands require an `Idempotency-Key` UUID. Sign in at `POST /api/v1/a
 | `GET/POST /api/v1/doras/{facilityId}/stockpiles` | List or create facility-scoped residue stockpile locations |
 | `POST /api/v1/stockpiles/{stockpileId}/intake`, `POST /api/v1/stockpiles/{stockpileId}/transfers` | Post Dora-output intake or paired stockpile transfer/pooling movements |
 | `GET /api/v1/inventory/locations/{locationId}/balances`, `POST /api/v1/inventory/locations/{locationId}/adjustments` | Read derived balances or record an evidenced count adjustment |
-| `POST /api/v1/residue-sales`, `GET /api/v1/residue-sales/{saleId}`, `POST /api/v1/residue-sales/{saleId}/lines/{lineId}/decisions` | Record and counterparty-accept a residue sale; no payment processing |
+| `POST /api/v1/residue-sales`, `GET /api/v1/residue-sales/{saleId}`, `POST /api/v1/residue-sales/{saleId}/lines/{lineId}/decisions`, `POST /api/v1/residue-sales/{saleId}/lines/{lineId}/revisions` | Record and counterparty-accept a residue sale or propose a linked revision after conflicting quantity decisions; no payment processing |
 | `POST /api/v1/consignments`, `GET /api/v1/consignments/{consignmentId}` | Create/read an itemized, multi-batch recovery consignment |
-| `POST /api/v1/consignments/{consignmentId}/dispatch`, `/api/v1/consignments/{consignmentId}/transport-legs`, `/api/v1/consignments/{consignmentId}/receipts`, `/api/v1/consignments/{consignmentId}/custody-offers` | Record paired dispatch, transport evidence, receipt and separate custody offer |
+| `POST /api/v1/consignments/{consignmentId}/dispatch`, `/api/v1/consignments/{consignmentId}/transport-legs`, `/api/v1/consignments/{consignmentId}/receipts`, `/api/v1/consignments/{consignmentId}/receipt-items/{receiptItemId}/corrections`, `/api/v1/consignments/{consignmentId}/custody-offers` | Record paired dispatch, transport, receipt, linked receipt correction and separate custody offer |
 | `POST /api/v1/custody-transfers/{transferId}/decisions` | Accept, dispute or reject an offered custody transfer |
 | `POST /api/v1/recovery-facilities/{facilityId}/inventory-locations`, `/api/v1/recovery-facilities/{facilityId}/recovery-events` | Create typed recovery inventory or consume accepted inputs and record outputs |
 | `GET /api/v1/recovery-events/{eventId}` | Read authorized recovery event and input/output genealogy |
@@ -112,7 +112,7 @@ Production measurement quantities are JSON decimal strings, such as `"10.250000"
 
 - Sequelize provides the application data layer. Reviewed SQL files under `server/src/database/migrations/` define composite foreign keys, append-only triggers, allocation checks, the inventory journal and database transaction protections.
 - `inventory_balance` is derived from accepted lines in `inventory_movement_line`; there is no second stockpile journal or writable balance table.
-- Migration `004_phase_three_residue_recovery.sql` adds receipt, custody-decision, recovery input/output genealogy, variance and sale-decision integrity around existing domain tables. Database triggers and deferred constraints require paired dispatch/receipt and recovery postings; the rollback refuses to discard recorded Phase 3 evidence.
+- Migration `004_phase_three_residue_recovery.sql` adds receipt, custody-decision, recovery input/output genealogy, variance and sale-decision integrity around existing domain tables. Additive migration `005_phase_three_integrity_corrections.sql` limits effective receipt claims to net accepted dispatch, requires current measured/verified Dora intake observations, and adds append-only receipt and residue-sale decision revisions. PostgreSQL triggers enforce these rules; migration 005 rollback refuses to remove its protections when correction records exist.
 - Passwords are bcrypt hashes. Tokens are short-lived signed bearer tokens; account and role status is rechecked on every authenticated request. Access is filtered by site, hole or active organisation relationship.
 - Hole-scoped grants apply only to the assigned hole. Site details and site-wide participant/production listings require a site-level grant; nested production and measurement requests verify the event's actual site and hole.
 - Site, production, allocation proposal, Dora, processing, QR, user/role, measurement and inventory writes append redacted business audit events in the same transaction. Audit streams are per aggregate and are not a distributed blockchain.

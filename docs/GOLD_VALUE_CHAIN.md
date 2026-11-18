@@ -1,8 +1,8 @@
 # Gold value chain and material genealogy
 
-## Phase 3 implementation status (verified 2026-11-18)
+## Phase 3 implementation status (verified 2026-11-19)
 
-The residue route is implemented through recovery outputs in the backend: typed Dora residue intake, multi-source stockpile movements, residue sale decisions without payment, itemized consignments, separate custody and transport evidence, paired dispatch/receipt, recovery inventory, multi-input recovery events and aggregate output genealogy. All physical quantities use the shared inventory journal and all movements preserve the source batch. No output quantity is assigned to an individual miner. The PostgreSQL integration suite passes 42/42 tests, including 26 Phase 3 workflow scenarios.
+The residue route is implemented through recovery outputs in the backend: typed Dora residue intake, multi-source stockpile movements, residue sale decisions without payment, itemized consignments, separate custody and transport evidence, paired dispatch/receipt, recovery inventory, multi-input recovery events and aggregate output genealogy. Current measured/verified Dora observations establish intake; receipt claims are capped at accepted dispatch and corrected through linked reversals/reposts; sale decision mismatches require fresh agreement from both parties. All physical quantities use the shared inventory journal and all movements preserve the source batch. No output quantity is assigned to an individual miner. The PostgreSQL integration suite passes 47/47 tests, including 31 Phase 3 workflow scenarios.
 
 Route A merchant purchases and aggregation, larger-merchant trading, payments, assay workflows, frontends/offline capture and production rollout remain future work. Physical pooling preserves recorded source quantities and movement history but does not claim particle-level identity. The design text below continues to describe the target value chain; only the implemented status above is verified behavior.
 

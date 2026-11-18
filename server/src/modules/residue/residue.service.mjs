@@ -58,6 +58,76 @@ async function assertRecoveryAccess(auth, facilityId, write) {
   }
 }
 
+async function lockAndGetEligibleResidueQuantity(batchId, facilityId, transaction) {
+  await query(`SELECT id FROM material_batch WHERE id=:batchId FOR UPDATE`, { batchId }, transaction);
+  const locations = await query(
+    `SELECT inventory_location_id AS location_id FROM residue_stockpile
+     WHERE processing_facility_id=:facilityId ORDER BY inventory_location_id`,
+    { facilityId }, transaction,
+  );
+  await lockInventoryBalanceKeys(locations.map((row) => ({ locationId: row.location_id, batchId })), transaction);
+  const [balance] = await query(
+    `SELECT COALESCE(sum(derived.quantity_g),0)::NUMERIC(20,6) AS quantity_g
+     FROM (
+       SELECT ml.location_id,sum(CASE WHEN ml.direction='IN' THEN ml.posted_quantity_g ELSE -ml.posted_quantity_g END)::NUMERIC(20,6) AS quantity_g
+       FROM inventory_movement_line ml JOIN inventory_movement movement ON movement.id=ml.inventory_movement_id AND movement.current_status='ACCEPTED'
+       JOIN residue_stockpile stockpile ON stockpile.inventory_location_id=ml.location_id AND stockpile.processing_facility_id=:facilityId
+       WHERE ml.batch_id=:batchId GROUP BY ml.location_id
+     ) derived`,
+    { facilityId, batchId }, transaction,
+  );
+  const [commitments] = await query(
+    `SELECT COALESCE(sum(GREATEST(line.accepted_trade_quantity_g-COALESCE(shipped.quantity_g,0),0)),0)::NUMERIC(20,6) AS quantity_g
+     FROM residue_sale_line line
+     JOIN residue_sale sale ON sale.id=line.residue_sale_id
+     JOIN material_event_output output ON output.batch_id=line.batch_id
+     JOIN processing_event_output po ON po.material_event_output_id=output.id AND po.output_role='DORA_RETAINED_RESIDUE'
+     JOIN processing_event processing ON processing.event_id=po.processing_event_id AND processing.processing_facility_id=:facilityId
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(sum(dispatch.posted_quantity_g-COALESCE(reversed.quantity_g,0)),0)::NUMERIC(20,6) AS quantity_g
+       FROM inventory_movement_line dispatch
+       JOIN inventory_movement movement ON movement.id=dispatch.inventory_movement_id AND movement.current_status='ACCEPTED' AND movement.movement_kind='TRANSFER'
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(sum(reverse_line.posted_quantity_g),0)::NUMERIC(20,6) AS quantity_g
+         FROM inventory_movement_line reverse_line
+         JOIN inventory_movement reverse_movement ON reverse_movement.id=reverse_line.inventory_movement_id AND reverse_movement.current_status='ACCEPTED' AND reverse_movement.movement_kind='REVERSAL'
+         WHERE reverse_line.reverses_line_id=dispatch.id
+       ) reversed ON true
+       WHERE dispatch.residue_sale_line_id=line.id AND dispatch.consignment_stage='DISPATCH' AND dispatch.direction='OUT'
+     ) shipped ON true
+     WHERE line.batch_id=:batchId AND line.is_accepted`,
+    { facilityId, batchId }, transaction,
+  );
+  const free = toMicros(balance.quantity_g) - toMicros(commitments.quantity_g);
+  return free > 0n ? free : 0n;
+}
+
+async function assertReceiptClaimWithinDispatch(consignmentItemId, quantityGrams, transaction, supersedesReceiptItemId = null) {
+  const [dispatch] = await query(
+    `SELECT COALESCE(sum(line.posted_quantity_g-COALESCE(reversed.quantity_g,0)),0)::NUMERIC(20,6) AS quantity_g
+     FROM inventory_movement_line line
+     JOIN inventory_movement movement ON movement.id=line.inventory_movement_id AND movement.current_status='ACCEPTED' AND movement.movement_kind='TRANSFER'
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(sum(reverse_line.posted_quantity_g),0)::NUMERIC(20,6) AS quantity_g
+       FROM inventory_movement_line reverse_line
+       JOIN inventory_movement reverse_movement ON reverse_movement.id=reverse_line.inventory_movement_id AND reverse_movement.current_status='ACCEPTED' AND reverse_movement.movement_kind='REVERSAL'
+       WHERE reverse_line.reverses_line_id=line.id
+     ) reversed ON true
+     WHERE line.consignment_item_id=:itemId AND line.consignment_stage='DISPATCH' AND line.direction='OUT'`,
+    { itemId: consignmentItemId }, transaction,
+  );
+  const [claims] = await query(
+    `SELECT COALESCE(sum(item.quantity_g),0)::NUMERIC(20,6) AS quantity_g
+     FROM consignment_receipt_item item
+     WHERE item.consignment_item_id=:itemId AND item.id IS DISTINCT FROM :supersedesId
+       AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=item.id)`,
+    { itemId: consignmentItemId, supersedesId: supersedesReceiptItemId }, transaction,
+  );
+  if (toMicros(dispatch.quantity_g)<=0n || toMicros(claims.quantity_g)+toMicros(quantityGrams)>toMicros(dispatch.quantity_g)) {
+    throw new AppError(409, 'RECEIPT_CLAIMS_EXCEED_DISPATCH', 'Current receipt claims cannot exceed the accepted dispatched quantity.');
+  }
+}
+
 export async function createStockpile(facilityId, input, auth, mutationId) {
   await assertDoraAccess(auth, facilityId, true);
   return sequelize.transaction(async (transaction) => executeIdempotent({
@@ -125,6 +195,8 @@ export async function receiveDoraResidue(stockpileId, input, auth, mutationId) {
        JOIN material_measurement mm ON mm.measurement_set_id=ms.id
        WHERE eo.id IN (:outputIds) AND pe.processing_facility_id=:facilityId AND peo.output_role='DORA_RETAINED_RESIDUE'
          AND mb.material_kind='RESIDUE' AND mm.id IN (:measurementIds)
+         AND mm.measurement_kind IN ('MEASURED','VERIFIED')
+         AND NOT EXISTS (SELECT 1 FROM material_measurement successor WHERE successor.supersedes_measurement_id=mm.id)
        FOR SHARE OF eo,peo,pe,mb`,
       { outputIds: input.outputs.map((row) => row.outputId), measurementIds: input.outputs.map((row) => row.measurementId), facilityId: stockpile.processing_facility_id }, transaction,
     );
@@ -348,15 +420,27 @@ export async function readConsignment(consignmentId, auth) {
   if (!senderAllowed && !receiverAllowed) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   const items = await query(
     `SELECT ci.id,ci.batch_id,mb.batch_code,ci.source_location_id,ci.line_no,
-       (SELECT COALESCE(sum(ml.posted_quantity_g),0)::NUMERIC(20,6) FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id AND m.current_status='ACCEPTED' WHERE ml.consignment_item_id=ci.id AND ml.consignment_stage='DISPATCH' AND ml.direction='OUT') AS dispatched_quantity_g,
-       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND ri.outcome='ACCEPTED'),0)::NUMERIC(20,6) AS accepted_receipt_quantity_g,
-       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND ri.outcome<>'ACCEPTED'),0)::NUMERIC(20,6) AS disputed_quantity_g
+       (SELECT COALESCE(sum(dispatch.posted_quantity_g-COALESCE(reversed.quantity_g,0)),0)::NUMERIC(20,6)
+        FROM inventory_movement_line dispatch
+        JOIN inventory_movement movement ON movement.id=dispatch.inventory_movement_id AND movement.current_status='ACCEPTED' AND movement.movement_kind='TRANSFER'
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(sum(reverse_line.posted_quantity_g),0)::NUMERIC(20,6) AS quantity_g
+          FROM inventory_movement_line reverse_line
+          JOIN inventory_movement reverse_movement ON reverse_movement.id=reverse_line.inventory_movement_id AND reverse_movement.current_status='ACCEPTED' AND reverse_movement.movement_kind='REVERSAL'
+          WHERE reverse_line.reverses_line_id=dispatch.id
+        ) reversed ON true
+        WHERE dispatch.consignment_item_id=ci.id AND dispatch.consignment_stage='DISPATCH' AND dispatch.direction='OUT') AS dispatched_quantity_g,
+       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=ri.id)),0)::NUMERIC(20,6) AS presented_receipt_quantity_g,
+       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND ri.outcome='ACCEPTED' AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=ri.id)),0)::NUMERIC(20,6) AS accepted_receipt_quantity_g,
+       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND ri.outcome='DISPUTED' AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=ri.id)),0)::NUMERIC(20,6) AS disputed_receipt_quantity_g,
+       COALESCE((SELECT sum(ri.quantity_g) FROM consignment_receipt_item ri WHERE ri.consignment_item_id=ci.id AND ri.outcome='REJECTED' AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=ri.id)),0)::NUMERIC(20,6) AS rejected_receipt_quantity_g
      FROM consignment_item ci JOIN material_batch mb ON mb.id=ci.batch_id WHERE ci.consignment_id=:id ORDER BY ci.line_no`,
     { id: consignmentId },
   );
   const legs = await query(`SELECT * FROM transport_record WHERE consignment_id=:id ORDER BY created_at,id`, { id: consignmentId });
   const receipts = await query(`SELECT * FROM consignment_receipt WHERE consignment_id=:id ORDER BY recorded_at,id`, { id: consignmentId });
-  return { ...parent, items, transportLegs: legs, receipts };
+  const receiptItems = await query(`SELECT * FROM consignment_receipt_item WHERE consignment_id=:id ORDER BY recorded_at,id`, { id: consignmentId });
+  return { ...parent, items, transportLegs: legs, receipts, receiptItems };
 }
 
 export async function createRecoveryInventoryLocation(facilityId, input, auth, mutationId) {
@@ -437,6 +521,7 @@ export async function receiveConsignment(consignmentId, input, auth, mutationId)
       { consignmentId, itemIds: input.items.map((row) => row.consignmentItemId) }, transaction,
     );
     if (itemRows.length !== input.items.length) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+    for (const item of input.items) await assertReceiptClaimWithinDispatch(item.consignmentItemId, item.quantityGrams, transaction);
     const receiptId = randomUUID();
     await sequelize.query(
       `INSERT INTO consignment_receipt(id,consignment_id,received_by_user_id,occurred_at_claimed,evidence_ref,note)
@@ -477,7 +562,14 @@ export async function receiveConsignment(consignmentId, input, auth, mutationId)
        FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id AND m.current_status='ACCEPTED'
        WHERE ml.location_id=:locationId`, { locationId: consignment.transit_location_id }, transaction,
     );
-    const [disputes] = await query(`SELECT EXISTS(SELECT 1 FROM consignment_receipt_item WHERE consignment_id=:id AND outcome<>'ACCEPTED') AS has_dispute`, { id: consignmentId }, transaction);
+    const [disputes] = await query(
+      `SELECT EXISTS(
+         SELECT 1 FROM consignment_receipt_item item
+         WHERE item.consignment_id=:id AND item.outcome IN ('DISPUTED','REJECTED')
+           AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=item.id)
+       ) AS has_dispute`,
+      { id: consignmentId }, transaction,
+    );
     const remains = toMicros(transit.quantity_g) > 0n;
     const nextStatus = remains ? (disputes.has_dispute ? 'DISPUTED' : 'PART_RECEIVED') : 'RECEIVED';
     if (nextStatus !== consignment.status) {
@@ -498,6 +590,146 @@ export async function receiveConsignment(consignmentId, input, auth, mutationId)
       streams: [{ kind: 'consignment', id: consignmentId }, { kind: 'recovery_facility', id: consignment.destination_recovery_facility_id }, { kind: 'inventory_location', id: consignment.transit_location_id }, { kind: 'inventory_location', id: destination.inventory_location_id }, ...results.map((row) => ({ kind: 'material_batch', id: row.batchId }))],
     });
     return { id: receiptId, consignmentId, status: nextStatus, items: results, movement };
+  }));
+}
+
+export async function correctConsignmentReceiptItem(consignmentId, receiptItemId, input, auth, mutationId) {
+  const [parent] = await query(`SELECT destination_recovery_facility_id FROM consignment WHERE id=:id`, { id: consignmentId });
+  if (!parent) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  await assertRecoveryAccess(auth, parent.destination_recovery_facility_id, true);
+  return sequelize.transaction(async (transaction) => executeIdempotent({
+    actorScope: `user:${auth.userId}`, mutationId,
+    payload: { action: 'residue.consignment.receipt.correct', consignmentId, receiptItemId, input }, transaction,
+  }, async () => {
+    const [consignment] = await query(`SELECT * FROM consignment WHERE id=:id FOR UPDATE`, { id: consignmentId }, transaction);
+    if (!['DISPATCHED','PART_RECEIVED','DISPUTED','RECEIVED'].includes(consignment.status)) {
+      throw new AppError(409, 'INVALID_CONSIGNMENT_STATE', 'This consignment does not have a correctable receipt.');
+    }
+    const [prior] = await query(
+      `SELECT item.*,header.received_by_user_id,ci.batch_id,ci.consignment_id
+       FROM consignment_receipt_item item
+       JOIN consignment_receipt header ON header.id=item.receipt_id
+       JOIN consignment_item ci ON ci.id=item.consignment_item_id
+       WHERE item.id=:receiptItemId AND item.consignment_id=:consignmentId FOR UPDATE OF ci,item`,
+      { receiptItemId, consignmentId }, transaction,
+    );
+    if (!prior || await query(`SELECT 1 FROM consignment_receipt_item WHERE supersedes_receipt_item_id=:id`, { id: receiptItemId }, transaction).then((rows) => rows.length > 0)) {
+      throw new AppError(409, 'RECEIPT_OBSERVATION_NOT_CURRENT', 'Only a current receipt observation can be corrected.');
+    }
+    await assertReceiptClaimWithinDispatch(prior.consignment_item_id, input.quantityGrams, transaction, prior.id);
+    const [destination] = await query(
+      `SELECT inventory_location_id FROM recovery_inventory_location WHERE inventory_location_id=:locationId AND recovery_facility_id=:facilityId FOR UPDATE`,
+      { locationId: input.recoveryInventoryLocationId, facilityId: consignment.destination_recovery_facility_id }, transaction,
+    );
+    if (!destination) throw new AppError(400, 'INVALID_RECOVERY_LOCATION', 'The destination location does not belong to this consignment recovery facility.');
+
+    const receiptId = randomUUID();
+    await sequelize.query(
+      `INSERT INTO consignment_receipt(id,consignment_id,received_by_user_id,occurred_at_claimed,evidence_ref,note)
+       VALUES (:id,:consignmentId,:actor,:occurredAt,:evidence,:note)`,
+      { replacements: { id: receiptId, consignmentId, actor: auth.userId, occurredAt: input.occurredAt, evidence: input.evidenceRef ?? null, note: input.note ?? null }, transaction },
+    );
+    const measurementSetId = randomUUID();
+    await sequelize.query(
+      `INSERT INTO material_measurement_set(id,batch_id,consignment_item_id,consignment_stage) VALUES (:id,:batchId,:itemId,'RECEIPT')`,
+      { replacements: { id: measurementSetId, batchId: prior.batch_id, itemId: prior.consignment_item_id }, transaction },
+    );
+    const measurementId = await insertMeasurement({ measurementSetId, quantityGrams: input.quantityGrams, input: input.measurement, auth, occurredAt: input.occurredAt, transaction });
+    const correctedReceiptItemId = randomUUID();
+    await sequelize.query(
+      `INSERT INTO consignment_receipt_item(
+         id,receipt_id,consignment_id,consignment_item_id,batch_id,quantity_g,outcome,measurement_set_id,measurement_id,
+         discrepancy_reason,evidence_ref,supersedes_receipt_item_id,correction_reason
+       ) VALUES (
+         :id,:receiptId,:consignmentId,:itemId,:batchId,:quantity,:outcome,:measurementSetId,:measurementId,
+         :reason,:evidence,:supersedesId,:correctionReason
+       )`,
+      { replacements: {
+        id: correctedReceiptItemId, receiptId, consignmentId, itemId: prior.consignment_item_id, batchId: prior.batch_id,
+        quantity: input.quantityGrams, outcome: input.outcome, measurementSetId, measurementId,
+        reason: input.outcome === 'ACCEPTED' ? null : input.reason, evidence: input.evidenceRef ?? null,
+        supersedesId: prior.id, correctionReason: input.correctionReason,
+      }, transaction },
+    );
+
+    let reversal = null;
+    if (prior.outcome === 'ACCEPTED') {
+      const originalLines = await query(
+        `SELECT line.*,movement.id AS movement_id FROM inventory_movement_line line
+         JOIN inventory_movement movement ON movement.id=line.inventory_movement_id
+           AND movement.current_status='ACCEPTED' AND movement.movement_kind='TRANSFER'
+         WHERE line.consignment_receipt_item_id=:receiptItemId AND line.consignment_stage='RECEIPT'
+         ORDER BY line.line_no FOR UPDATE OF movement`,
+        { receiptItemId: prior.id }, transaction,
+      );
+      if (originalLines.length !== 2 || originalLines.some((line) => line.movement_id !== originalLines[0].movement_id)) {
+        throw new AppError(409, 'RECEIPT_MOVEMENT_NOT_REVERSIBLE', 'The accepted receipt no longer has one complete paired movement to correct.');
+      }
+      reversal = await postMovementInTransaction({
+        movementKind: 'REVERSAL', reversesMovementId: originalLines[0].movement_id,
+        lines: originalLines.map((line) => ({
+          batchId: line.batch_id, locationId: line.location_id, direction: line.direction === 'IN' ? 'OUT' : 'IN',
+          quantityGrams: line.posted_quantity_g, reversesLineId: line.id,
+        })),
+        reason: input.correctionReason, occurredAt: input.occurredAt, auth, transaction, mutationId,
+      });
+    }
+
+    let movement = null;
+    if (input.outcome === 'ACCEPTED') {
+      movement = await postMovementInTransaction({
+        movementKind: 'TRANSFER',
+        lines: [
+          { batchId: prior.batch_id, locationId: consignment.transit_location_id, direction: 'OUT', quantityGrams: input.quantityGrams, measurementSetId, measurementId, consignmentItemId: prior.consignment_item_id, consignmentStage: 'RECEIPT', consignmentReceiptItemId: correctedReceiptItemId },
+          { batchId: prior.batch_id, locationId: destination.inventory_location_id, direction: 'IN', quantityGrams: input.quantityGrams, measurementSetId, measurementId, consignmentItemId: prior.consignment_item_id, consignmentStage: 'RECEIPT', consignmentReceiptItemId: correctedReceiptItemId },
+        ],
+        occurredAt: input.occurredAt, reason: input.evidenceRef ?? null, auth, transaction, mutationId,
+      });
+    }
+
+    const [transit] = await query(
+      `SELECT COALESCE(sum(CASE WHEN line.direction='IN' THEN line.posted_quantity_g ELSE -line.posted_quantity_g END),0)::NUMERIC(20,6) AS quantity_g
+       FROM inventory_movement_line line JOIN inventory_movement movement ON movement.id=line.inventory_movement_id AND movement.current_status='ACCEPTED'
+       WHERE line.location_id=:locationId`,
+      { locationId: consignment.transit_location_id }, transaction,
+    );
+    const [currentDisputes] = await query(
+      `SELECT EXISTS(
+         SELECT 1 FROM consignment_receipt_item item
+         WHERE item.consignment_id=:consignmentId AND item.outcome IN ('DISPUTED','REJECTED')
+           AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item child WHERE child.supersedes_receipt_item_id=item.id)
+       ) AS has_dispute`,
+      { consignmentId }, transaction,
+    );
+    const remains = toMicros(transit.quantity_g) > 0n;
+    const nextStatus = remains ? (currentDisputes.has_dispute ? 'DISPUTED' : 'PART_RECEIVED') : 'RECEIVED';
+    if (nextStatus !== consignment.status) {
+      await sequelize.query(
+        `INSERT INTO consignment_status_event(id,consignment_id,previous_status,next_status,actor_user_id,occurred_at,evidence_ref)
+         VALUES (:id,:consignmentId,:previous,:next,:actor,:occurredAt,:evidence)`,
+        { replacements: { id: randomUUID(), consignmentId, previous: consignment.status, next: nextStatus, actor: auth.userId, occurredAt: input.occurredAt, evidence: input.evidenceRef ?? null }, transaction },
+      );
+      await sequelize.query(
+        `UPDATE consignment SET status=:status,received_at=:receivedAt WHERE id=:id`,
+        { replacements: { id: consignmentId, status: nextStatus, receivedAt: nextStatus === 'RECEIVED' ? input.occurredAt : null }, transaction },
+      );
+    }
+    await appendAuditEvent({
+      transaction, eventType: 'CONSIGNMENT.RECEIPT_CORRECTED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,
+      occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
+      payload: {
+        consignment_id: consignmentId, receipt_id: receiptId, prior_receipt_item_id: prior.id,
+        corrected_receipt_item_id: correctedReceiptItemId, correction_reason: input.correctionReason,
+        prior_outcome: prior.outcome, outcome: input.outcome, quantity_g: input.quantityGrams,
+        reversal_movement_id: reversal?.id ?? null, inventory_movement_id: movement?.id ?? null, status: nextStatus,
+      },
+      streams: [{ kind: 'consignment', id: consignmentId }, { kind: 'recovery_facility', id: consignment.destination_recovery_facility_id }, { kind: 'material_batch', id: prior.batch_id }],
+    });
+    return {
+      id: receiptId, consignmentId, status: nextStatus,
+      item: { id: correctedReceiptItemId, supersedesReceiptItemId: prior.id, consignmentItemId: prior.consignment_item_id, batchId: prior.batch_id, quantityGrams: input.quantityGrams, outcome: input.outcome, correctionReason: input.correctionReason },
+      reversal, movement,
+    };
   }));
 }
 
@@ -636,6 +868,72 @@ export async function createResidueSale(input, auth, mutationId) {
   }));
 }
 
+export async function proposeResidueSaleLineRevision(saleId, lineId, input, auth, mutationId) {
+  const [line] = await query(
+    `SELECT rsl.*,rs.seller_party_id,rs.buyer_party_id,pe.processing_facility_id,rf.id AS recovery_facility_id
+     FROM residue_sale_line rsl JOIN residue_sale rs ON rs.id=rsl.residue_sale_id
+     JOIN material_event_output eo ON eo.batch_id=rsl.batch_id JOIN processing_event_output peo ON peo.material_event_output_id=eo.id
+     JOIN processing_event pe ON pe.event_id=peo.processing_event_id
+     LEFT JOIN recovery_facility rf ON rf.party_id=rs.buyer_party_id
+     WHERE rsl.id=:lineId AND rs.id=:saleId`,
+    { lineId, saleId },
+  );
+  if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  const sellerAllowed = await canAccessProcessingFacility(auth, line.processing_facility_id, { write: true });
+  const buyerAllowed = line.recovery_facility_id && await canAccessRecoveryFacility(auth, line.recovery_facility_id, { write: true });
+  const representedPartyId = auth.personPartyId === line.seller_party_id && sellerAllowed
+    ? line.seller_party_id
+    : buyerAllowed ? line.buyer_party_id : null;
+  if (!representedPartyId) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return sequelize.transaction(async (transaction) => executeIdempotent({
+    actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'residue.sale.line.revision.propose', saleId, lineId, input }, transaction,
+  }, async () => {
+    await query(`SELECT id FROM residue_sale WHERE id=:saleId FOR UPDATE`, { saleId }, transaction);
+    const [prior] = await query(`SELECT * FROM residue_sale_line WHERE id=:lineId AND residue_sale_id=:saleId FOR UPDATE`, { lineId, saleId }, transaction);
+    if (!prior || prior.is_accepted || await query(`SELECT 1 FROM residue_sale_line WHERE supersedes_line_id=:lineId`, { lineId }, transaction).then((rows) => rows.length > 0)) {
+      throw new AppError(409, 'SALE_LINE_NOT_CURRENT', 'Only the current unresolved sale line can be revised.');
+    }
+    const decisions = await query(
+      `SELECT actor_party_id,accepted_quantity_g FROM residue_sale_decision_event
+       WHERE residue_sale_line_id=:lineId AND decision='ACCEPT'`,
+      { lineId }, transaction,
+    );
+    const seller = decisions.find((row) => row.actor_party_id === line.seller_party_id);
+    const buyer = decisions.find((row) => row.actor_party_id === line.buyer_party_id);
+    if (!seller || !buyer || seller.accepted_quantity_g === buyer.accepted_quantity_g) {
+      throw new AppError(409, 'SALE_LINE_DECISION_MISMATCH_REQUIRED', 'A successor proposal is available only after both counterparties accept different quantities.');
+    }
+    const revisionNo = prior.revision_no + 1;
+    const successorId = randomUUID();
+    await sequelize.query(
+      `INSERT INTO residue_sale_line(
+         id,residue_sale_id,batch_id,revision_no,revision_kind,transaction_quantity_g,unit_price,line_amount,
+         supersedes_line_id,correction_reason,resolves_decision_mismatch
+       ) VALUES (:id,:saleId,:batchId,:revision,'CORRECTION',:quantity,:unitPrice,:lineAmount,:prior,:reason,true)`,
+      { replacements: {
+        id: successorId, saleId, batchId: prior.batch_id, revision: revisionNo, quantity: input.quantityGrams,
+        unitPrice: input.unitPrice ?? prior.unit_price, lineAmount: input.lineAmount ?? prior.line_amount,
+        prior: prior.id, reason: input.correctionReason,
+      }, transaction },
+    );
+    await sequelize.query(
+      `INSERT INTO material_measurement_set(id,batch_id,residue_sale_line_id) VALUES (:id,:batchId,:lineId)`,
+      { replacements: { id: randomUUID(), batchId: prior.batch_id, lineId: successorId }, transaction },
+    );
+    await appendAuditEvent({
+      transaction, eventType: 'RESIDUE_SALE.LINE_REVISION_PROPOSED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,
+      occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
+      payload: {
+        residue_sale_id: saleId, prior_line_id: prior.id, successor_line_id: successorId,
+        revision_no: revisionNo, quantity_g: input.quantityGrams, correction_reason: input.correctionReason,
+        seller_prior_quantity_g: seller.accepted_quantity_g, buyer_prior_quantity_g: buyer.accepted_quantity_g,
+      },
+      streams: [{ kind: 'residue_sale', id: saleId }, { kind: 'material_batch', id: prior.batch_id }],
+    });
+    return { id: successorId, saleId, batchId: prior.batch_id, revisionNo, supersedesLineId: prior.id, proposedQuantityGrams: input.quantityGrams, accepted: false };
+  }));
+}
+
 export async function decideResidueSaleLine(saleId, lineId, input, auth, mutationId) {
   const [line] = await query(
     `SELECT rsl.*,rs.seller_party_id,rs.buyer_party_id,rs.currency_code,pe.processing_facility_id,
@@ -663,6 +961,11 @@ export async function decideResidueSaleLine(saleId, lineId, input, auth, mutatio
     if (input.decision === 'ACCEPT' && toMicros(input.acceptedQuantityGrams) > toMicros(locked.transaction_quantity_g)) {
       throw new AppError(400, 'ACCEPTED_QUANTITY_EXCEEDS_PROPOSAL', 'Accepted residue quantity cannot exceed the proposed sale quantity.');
     }
+    const [priorDecision] = await query(
+      `SELECT decision FROM residue_sale_decision_event WHERE residue_sale_line_id=:lineId AND actor_party_id=:partyId`,
+      { lineId, partyId: representedPartyId }, transaction,
+    );
+    if (priorDecision) throw new AppError(409, 'SALE_DECISION_ALREADY_RECORDED', 'This counterparty has already decided this sale-line revision.');
     const decisionId = randomUUID();
     await sequelize.query(
       `INSERT INTO residue_sale_decision_event(id,residue_sale_line_id,actor_user_id,actor_party_id,decision,accepted_quantity_g,occurred_at,reason,evidence_ref)
@@ -675,6 +978,10 @@ export async function decideResidueSaleLine(saleId, lineId, input, auth, mutatio
       const seller = decisions.find((row) => row.actor_party_id === line.seller_party_id);
       const buyer = decisions.find((row) => row.actor_party_id === line.buyer_party_id);
       if (seller && buyer && seller.accepted_quantity_g === buyer.accepted_quantity_g) {
+        const eligible = await lockAndGetEligibleResidueQuantity(locked.batch_id, line.processing_facility_id, transaction);
+        if (toMicros(buyer.accepted_quantity_g) > eligible) {
+          throw new AppError(409, 'INSUFFICIENT_ELIGIBLE_RESIDUE', 'The agreed quantity exceeds residue available after other accepted sale commitments.');
+        }
         acceptedLineId = randomUUID();
         await sequelize.query(
           `INSERT INTO residue_sale_line(id,residue_sale_id,batch_id,revision_no,revision_kind,transaction_quantity_g,accepted_trade_quantity_g,unit_price,line_amount,supersedes_line_id,correction_reason,is_accepted)
@@ -798,7 +1105,9 @@ export async function createRecoveryEvent(facilityId, input, auth, mutationId) {
       const receiptRows = await query(
         `SELECT ri.id,ri.batch_id,ri.consignment_item_id,ri.quantity_g,ri.outcome,c.destination_recovery_facility_id
          FROM consignment_receipt_item ri JOIN consignment_item ci ON ci.id=ri.consignment_item_id
-         JOIN consignment c ON c.id=ci.consignment_id WHERE ri.id IN (:receiptIds) ORDER BY ri.id FOR UPDATE OF ri`,
+         JOIN consignment c ON c.id=ci.consignment_id WHERE ri.id IN (:receiptIds)
+           AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item successor WHERE successor.supersedes_receipt_item_id=ri.id)
+         ORDER BY ri.id FOR UPDATE OF ci`,
         { receiptIds }, transaction,
       );
       if (receiptRows.length !== receiptIds.length || receiptRows.some((row) => row.outcome !== 'ACCEPTED' || row.batch_id !== item.batchId || row.destination_recovery_facility_id !== facilityId)) {

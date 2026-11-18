@@ -20,7 +20,8 @@ import { createBatchQr, rotateBatchQr, lookupQr, canAccessBatch } from './module
 import {
   createStockpile, listStockpiles, receiveDoraResidue, transferBetweenStockpiles, createConsignment,
   dispatchConsignment, addTransportLeg, readConsignment, createRecoveryInventoryLocation, listLocationBalances,
-  receiveConsignment, createCustodyOffer, decideCustodyTransfer, createResidueSale, decideResidueSaleLine,
+  receiveConsignment, correctConsignmentReceiptItem, createCustodyOffer, decideCustodyTransfer,
+  createResidueSale, proposeResidueSaleLineRevision, decideResidueSaleLine,
   readResidueSale, adjustInventory, createRecoveryEvent, readRecoveryEvent,
 } from './modules/residue/residue.service.mjs';
 import { AppError, errorHandler, validateBody } from './utils/errors.mjs';
@@ -206,6 +207,15 @@ const receiptSchema = z.object({
     if (value.outcome !== 'ACCEPTED' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'Disputed and rejected quantities need a reason.' });
   })).min(1).max(40),
 }).strict();
+const receiptCorrectionSchema = z.object({
+  recoveryInventoryLocationId: z.string().uuid(), quantityGrams: positiveGrams,
+  outcome: z.enum(['ACCEPTED', 'DISPUTED', 'REJECTED']), correctionReason: z.string().trim().min(1).max(500),
+  reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+  note: z.string().trim().min(1).max(1000).optional(), occurredAt: dateTime, measurement: measurementEvidenceSchema,
+}).strict().superRefine((value, context) => {
+  if (value.outcome === 'ACCEPTED' && value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'Accepted receipt does not require a discrepancy reason.' });
+  if (value.outcome !== 'ACCEPTED' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'Disputed and rejected quantities need a reason.' });
+});
 const custodyOfferSchema = z.object({ destinationLocationId: z.string().uuid(), occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional() }).strict();
 const custodyDecisionSchema = z.object({
   decision: z.enum(['ACCEPT', 'DISPUTE', 'REJECT', 'WITHDRAW']), occurredAt: dateTime,
@@ -225,6 +235,10 @@ const residueSaleDecisionSchema = z.object({
   if ((value.decision === 'ACCEPT') !== Boolean(value.acceptedQuantityGrams)) context.addIssue({ code: 'custom', path: ['acceptedQuantityGrams'], message: 'Accept requires an agreed quantity; other decisions omit it.' });
   if (value.decision !== 'ACCEPT' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'A dispute or rejection needs a reason.' });
 });
+const residueSaleRevisionSchema = z.object({
+  quantityGrams: positiveGrams, unitPrice: decimal(8).optional(), lineAmount: decimal(8).optional(),
+  correctionReason: z.string().trim().min(1).max(500), occurredAt: dateTime,
+}).strict();
 const adjustmentSchema = z.object({
   batchId: z.string().uuid(), countedQuantityGrams: decimal(6), reason: z.string().trim().min(1).max(500),
   evidenceRef: z.string().trim().min(1).max(255), occurredAt: dateTime, measurement: measurementEvidenceSchema,
@@ -449,6 +463,9 @@ app.post('/api/v1/consignments/:consignmentId/transport-legs', requireUuidParams
 app.post('/api/v1/consignments/:consignmentId/receipts', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(receiptSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await receiveConsignment(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
 }));
+app.post('/api/v1/consignments/:consignmentId/receipt-items/:receiptItemId/corrections', requireUuidParams('consignmentId', 'receiptItemId'), requireIdempotencyKey, validateBody(receiptCorrectionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await correctConsignmentReceiptItem(req.params.consignmentId, req.params.receiptItemId, req.body, req.auth, req.get('idempotency-key')));
+}));
 app.post('/api/v1/consignments/:consignmentId/custody-offers', requireUuidParams('consignmentId'), requireIdempotencyKey, validateBody(custodyOfferSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createCustodyOffer(req.params.consignmentId, req.body, req.auth, req.get('idempotency-key')));
 }));
@@ -461,6 +478,9 @@ app.post('/api/v1/residue-sales', requireIdempotencyKey, validateBody(residueSal
 }));
 app.get('/api/v1/residue-sales/:saleId', requireUuidParams('saleId'), asyncRoute(async (req, res) => {
   return res.json(await readResidueSale(req.params.saleId, req.auth));
+}));
+app.post('/api/v1/residue-sales/:saleId/lines/:lineId/revisions', requireUuidParams('saleId', 'lineId'), requireIdempotencyKey, validateBody(residueSaleRevisionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await proposeResidueSaleLineRevision(req.params.saleId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
 }));
 app.post('/api/v1/residue-sales/:saleId/lines/:lineId/decisions', requireUuidParams('saleId', 'lineId'), requireIdempotencyKey, validateBody(residueSaleDecisionSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await decideResidueSaleLine(req.params.saleId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));

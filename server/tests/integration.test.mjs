@@ -172,6 +172,19 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const phaseThreeTables = await db(`SELECT table_name AS phase_three_table_name FROM information_schema.tables WHERE table_schema='public'
       AND table_name IN ('consignment_receipt','recovery_output_input_link','residue_sale_decision_event','phase_three_migration_marker') ORDER BY table_name`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(phaseThreeTables.map((row) => row.phase_three_table_name), ['consignment_receipt', 'phase_three_migration_marker', 'recovery_output_input_link', 'residue_sale_decision_event']);
+
+    const rollbackFive = await readFile(new URL('../src/database/rollback/005_phase_three_integrity_corrections.sql', import.meta.url), 'utf8');
+    const migrationFive = await readFile(new URL('../src/database/migrations/005_phase_three_integrity_corrections.sql', import.meta.url), 'utf8');
+    const phaseThreeCorrectionsRollbackProbe = new Error('Phase 3 corrections rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackFive, { transaction, raw: true });
+      await sequelize.query(migrationFive, { transaction, raw: true });
+      throw phaseThreeCorrectionsRollbackProbe;
+    }), (error) => error === phaseThreeCorrectionsRollbackProbe);
+    const correctionColumns = await db(`SELECT column_name FROM information_schema.columns WHERE table_schema='public'
+      AND ((table_name='consignment_receipt_item' AND column_name IN ('supersedes_receipt_item_id','correction_reason'))
+        OR (table_name='residue_sale_line' AND column_name='resolves_decision_mismatch')) ORDER BY table_name,column_name`, {}, undefined, QueryTypes.SELECT);
+    assert.equal(correctionColumns.length, 3);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -758,6 +771,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId,
     });
     ids.doraUserId = doraUser.userId;
+    ids.doraPartyId = doraUser.partyId;
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
       id: randomUUID(), userId: doraUser.userId, holeId: ids.holeId,
     });
@@ -973,7 +987,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
         processingFacilityId: ids.doraTwoId, occurredAt: happenedAt,
         inputs: [{ sourceProductionOutputId: ids.phase2Outputs[0].id, measurements: [{ kind: 'MEASURED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] }],
         outputs: [
-          { materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: [{ kind: 'MEASURED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] },
+          { materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', measurements: [{ kind: 'VERIFIED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] },
           { materialKind: 'GOLD_DORE', outputRole: 'MINER_RETAINED_GOLD', measurements: [{ kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] },
         ],
       });
@@ -1047,6 +1061,72 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(total.total, 1);
     });
 
+    await phase.test('Dora intake requires a current measured or verified output observation', async () => {
+      async function createResidueOutput(kind, quantityGrams, code) {
+        const response = await request(app).post(`/api/v1/sites/${ids.siteId}/processing-events`)
+          .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+            processingFacilityId: ids.doraOneId, occurredAt: happenedAt,
+            inputs: [{ sourceProductionOutputId: ids.phase2Outputs[0].id, measurements: [{ kind: 'MEASURED', quantityGrams: '1.000000', sourceValue: '1', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' }] }],
+            outputs: [{ materialKind: 'RESIDUE', outputRole: 'DORA_RETAINED_RESIDUE', outputKind: code, measurements: [{ kind, quantityGrams, sourceValue: quantityGrams, sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt }] }],
+          });
+        assert.equal(response.status, 201, response.text);
+        return { eventId: response.body.id, output: response.body.outputs[0] };
+      }
+
+      const declared = await createResidueOutput('DECLARED', '0.750000', 'DECLARED-RESIDUE');
+      const declaredIntake = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`)
+        .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+          occurredAt: happenedAt, outputs: [{ outputId: declared.output.id, measurementId: declared.output.measurements[0].id }],
+        });
+      assert.equal(declaredIntake.status, 400);
+      assert.equal(declaredIntake.body.error.code, 'INVALID_RESIDUE_SOURCE');
+
+      const measured = await createResidueOutput('MEASURED', '0.600000', 'CORRECTED-RESIDUE');
+      const sibling = await createResidueOutput('MEASURED', '0.250000', 'SIBLING-RESIDUE');
+      const corrected = await request(app).post(`/api/v1/processing-events/${measured.eventId}/outputs/${measured.output.id}/measurements`)
+        .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+          kind: 'MEASURED', quantityGrams: '0.550000', sourceValue: '0.55', sourceUnit: 'g', conversionVersion: 'test-v1',
+          sourceRole: 'RECORDER', occurredAt: happenedAt, supersedesMeasurementId: measured.output.measurements[0].id,
+        });
+      assert.equal(corrected.status, 201, corrected.text);
+      const staleIntake = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`)
+        .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+          occurredAt: happenedAt, outputs: [{ outputId: measured.output.id, measurementId: measured.output.measurements[0].id }],
+        });
+      const crossOutputMeasurement = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`)
+        .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+          occurredAt: happenedAt, outputs: [{ outputId: measured.output.id, measurementId: sibling.output.measurements[0].id }],
+        });
+      assert.equal(staleIntake.status, 400);
+      assert.equal(crossOutputMeasurement.status, 400);
+
+      await assert.rejects(sequelize.transaction(async (transaction) => {
+        const movementId = randomUUID();
+        await db(`INSERT INTO inventory_movement(id,movement_kind,current_status,actor_user_id,occurred_at_claimed)
+          VALUES (:id,'INTAKE','DRAFT',:actor,:at)`, { id: movementId, actor: ids.doraUserId, at: happenedAt }, transaction);
+        await db(`INSERT INTO inventory_movement_line(id,inventory_movement_id,batch_id,location_id,direction,posted_quantity_g,basis_measurement_set_id,basis_measurement_id,source_material_event_output_id,line_no)
+          VALUES (:id,:movementId,:batchId,:locationId,'IN','0.540000',:setId,:measurementId,:outputId,1)`, {
+          id: randomUUID(), movementId, batchId: measured.output.batchId, locationId: ids.phaseThree.stockpileOne,
+          setId: measured.output.measurementSetId, measurementId: corrected.body.id, outputId: measured.output.id,
+        }, transaction);
+        await db(`UPDATE inventory_movement SET current_status='ACCEPTED' WHERE id=:id`, { id: movementId }, transaction);
+      }), sqlError('23514'));
+
+      const validIntake = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/intake`)
+        .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+          occurredAt: happenedAt, outputs: [{ outputId: measured.output.id, measurementId: corrected.body.id }],
+        });
+      assert.equal(validIntake.status, 201, validIntake.text);
+      const history = await db(`SELECT measurement_kind,quantity_g,supersedes_measurement_id FROM material_measurement
+        WHERE id IN (:prior,:current) ORDER BY quantity_g DESC`, { prior: measured.output.measurements[0].id, current: corrected.body.id }, undefined, QueryTypes.SELECT);
+      assert.equal(history.length, 2);
+      assert.equal(history[0].quantity_g, '0.600000');
+      assert.equal(history[1].quantity_g, '0.550000');
+      assert.equal(history[1].supersedes_measurement_id, measured.output.measurements[0].id);
+      const [posted] = await db(`SELECT posted_quantity_g FROM inventory_movement_line WHERE source_material_event_output_id=:outputId`, { outputId: measured.output.id }, undefined, QueryTypes.SELECT);
+      assert.equal(posted.posted_quantity_g, '0.550000');
+    });
+
     await phase.test('a second Dora source batch enters its own stockpile with full origin', async () => {
       const output = ids.phaseThree.secondDoraResidue;
       const response = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOtherDora}/intake`).set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({ occurredAt: happenedAt, outputs: [{ outputId: output.id, measurementId: output.measurements[0].id }] });
@@ -1117,27 +1197,94 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(response.body.lines[0].accepted, false);
     });
 
-    await phase.test('residue sale acceptance requires both counterparties and records an accepted successor', async () => {
-      const body = { decision: 'ACCEPT', acceptedQuantityGrams: '1.500000', occurredAt: happenedAt };
-      const sellerDecision = await request(app).post(`/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/decisions`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send(body);
+    await phase.test('sale decision mismatches resolve through a successor requiring both counterparties', async () => {
+      const sellerBody = { decision: 'ACCEPT', acceptedQuantityGrams: '1.250000', occurredAt: happenedAt };
+      const sellerKey = randomUUID();
+      const sellerPath = `/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/decisions`;
+      const [sellerDecision, sellerRetry] = await Promise.all([
+        request(app).post(sellerPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', sellerKey).send(sellerBody),
+        request(app).post(sellerPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', sellerKey).send(sellerBody),
+      ]);
       assert.equal(sellerDecision.status, 201, sellerDecision.text);
+      assert.equal(sellerRetry.status, 201, sellerRetry.text);
+      assert.equal([sellerDecision, sellerRetry].filter((response) => response.body.replayed).length, 1);
       assert.equal(sellerDecision.body.acceptedLineId, null);
-      const buyerDecision = await request(app).post(`/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body);
+      const buyerBody = { decision: 'ACCEPT', acceptedQuantityGrams: '1.000000', occurredAt: happenedAt };
+      const buyerDecision = await request(app).post(sellerPath).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(buyerBody);
       assert.equal(buyerDecision.status, 201, buyerDecision.text);
-      assert.ok(buyerDecision.body.acceptedLineId);
-      ids.phaseThree.acceptedSaleLineId = buyerDecision.body.acceptedLineId;
+      assert.equal(buyerDecision.body.acceptedLineId, null);
+      const duplicateSeller = await request(app).post(sellerPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send(sellerBody);
+      const unrelatedDecision = await request(app).post(sellerPath).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send(buyerBody);
+      assert.equal(duplicateSeller.status, 409);
+      assert.equal(duplicateSeller.body.error.code, 'SALE_DECISION_ALREADY_RECORDED');
+      assert.equal(unrelatedDecision.status, 404);
+
+      const revisionBody = { quantityGrams: '1.500000', correctionReason: 'Counterparties propose a shared revised quantity.', occurredAt: happenedAt, unitPrice: '100.00000000', lineAmount: '150.00000000' };
+      const revisionKey = randomUUID();
+      const revisionPath = `/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.proposedSaleLineId}/revisions`;
+      const [revision, revisionRetry] = await Promise.all([
+        request(app).post(revisionPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', revisionKey).send(revisionBody),
+        request(app).post(revisionPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', revisionKey).send(revisionBody),
+      ]);
+      assert.equal(revision.status, 201, revision.text);
+      assert.equal(revisionRetry.status, 201, revisionRetry.text);
+      assert.equal([revision, revisionRetry].filter((response) => response.body.replayed).length, 1);
+      ids.phaseThree.successorSaleLineId = revision.body.id;
+      await assert.rejects(sequelize.transaction((transaction) => db(`UPDATE residue_sale_line SET resolves_decision_mismatch=false WHERE id=:id`, { id: revision.body.id }, transaction)), sqlError('55000'));
+      const beforeAgreement = await request(app).get(`/api/v1/residue-sales/${ids.phaseThree.saleId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      const priorLine = beforeAgreement.body.lines.find((row) => row.id === ids.phaseThree.proposedSaleLineId);
+      const priorDecisions = beforeAgreement.body.decisions.filter((row) => row.residue_sale_line_id === ids.phaseThree.proposedSaleLineId);
+      assert.equal(priorLine.is_accepted, false);
+      assert.deepEqual(priorDecisions.map((row) => row.accepted_quantity_g).sort(), ['1.000000', '1.250000']);
+      assert.equal(revision.body.supersedesLineId, priorLine.id);
+      const successorDecisionPath = `/api/v1/residue-sales/${ids.phaseThree.saleId}/lines/${ids.phaseThree.successorSaleLineId}/decisions`;
+      const successorSeller = await request(app).post(successorDecisionPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', acceptedQuantityGrams: '1.500000', occurredAt: happenedAt });
+      assert.equal(successorSeller.status, 201, successorSeller.text);
+      assert.equal(successorSeller.body.acceptedLineId, null);
+      const successorBuyer = await request(app).post(successorDecisionPath).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', acceptedQuantityGrams: '1.500000', occurredAt: happenedAt });
+      assert.equal(successorBuyer.status, 201, successorBuyer.text);
+      assert.ok(successorBuyer.body.acceptedLineId);
+      ids.phaseThree.acceptedSaleLineId = successorBuyer.body.acceptedLineId;
       const [accepted] = await db(`SELECT is_accepted,accepted_trade_quantity_g,supersedes_line_id FROM residue_sale_line WHERE id=:id`, { id: ids.phaseThree.acceptedSaleLineId }, undefined, QueryTypes.SELECT);
       assert.equal(accepted.is_accepted, true);
       assert.equal(accepted.accepted_trade_quantity_g, '1.500000');
-      assert.equal(accepted.supersedes_line_id, ids.phaseThree.proposedSaleLineId);
+      assert.equal(accepted.supersedes_line_id, ids.phaseThree.successorSaleLineId);
+      const afterAgreement = await request(app).get(`/api/v1/residue-sales/${ids.phaseThree.saleId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(afterAgreement.body.decisions.filter((row) => row.residue_sale_line_id === ids.phaseThree.proposedSaleLineId).length, 2);
+      assert.equal(afterAgreement.body.decisions.filter((row) => row.residue_sale_line_id === ids.phaseThree.successorSaleLineId).length, 2);
+      assert.equal((await verifyAuditStream('residue_sale', ids.phaseThree.saleId)).valid, true);
+
       const secondProposal = await request(app).post('/api/v1/residue-sales').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
         processingFacilityId: ids.doraOneId, recoveryFacilityId: ids.phaseThree.recoveryFacilityId, agreedAt: happenedAt, currencyCode: 'USD',
         lines: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.500000' }],
       });
-      const overQuantity = await request(app).post(`/api/v1/residue-sales/${secondProposal.body.id}/lines/${secondProposal.body.lines[0].id}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ ...body, acceptedQuantityGrams: '2.000000' });
+      const overQuantity = await request(app).post(`/api/v1/residue-sales/${secondProposal.body.id}/lines/${secondProposal.body.lines[0].id}/decisions`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ ...buyerBody, acceptedQuantityGrams: '2.000000' });
       assert.equal(secondProposal.status, 201, secondProposal.text);
       assert.equal(overQuantity.status, 400);
       assert.equal((await request(app).get(`/api/v1/residue-sales/${ids.phaseThree.saleId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).status, 200);
+
+      const overInventorySale = await request(app).post('/api/v1/residue-sales').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        processingFacilityId: ids.doraTwoId, recoveryFacilityId: ids.phaseThree.recoveryFacilityId, agreedAt: happenedAt, currencyCode: 'USD',
+        lines: [{ batchId: ids.phaseThree.secondDoraResidue.batchId, quantityGrams: '3.100000' }],
+      });
+      assert.equal(overInventorySale.status, 201, overInventorySale.text);
+      const overInventoryPath = `/api/v1/residue-sales/${overInventorySale.body.id}/lines/${overInventorySale.body.lines[0].id}/decisions`;
+      const overInventorySeller = await request(app).post(overInventoryPath).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', acceptedQuantityGrams: '3.100000', occurredAt: happenedAt });
+      const overInventoryBuyer = await request(app).post(overInventoryPath).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', acceptedQuantityGrams: '3.100000', occurredAt: happenedAt });
+      assert.equal(overInventorySeller.status, 201, overInventorySeller.text);
+      assert.equal(overInventoryBuyer.status, 409);
+      assert.equal(overInventoryBuyer.body.error.code, 'INSUFFICIENT_ELIGIBLE_RESIDUE');
+      await assert.rejects(sequelize.transaction(async (transaction) => {
+        await db(`INSERT INTO residue_sale_decision_event(id,residue_sale_line_id,actor_user_id,actor_party_id,decision,accepted_quantity_g,occurred_at)
+          VALUES (:id,:lineId,:actor,:party,'ACCEPT','3.100000',:at)`, {
+          id: randomUUID(), lineId: overInventorySale.body.lines[0].id, actor: ids.phaseThree.recoveryUserId,
+          party: ids.phaseThree.recoveryPartyId, at: happenedAt,
+        }, transaction);
+        await db(`INSERT INTO residue_sale_line(id,residue_sale_id,batch_id,revision_no,revision_kind,transaction_quantity_g,accepted_trade_quantity_g,supersedes_line_id,correction_reason,is_accepted)
+          VALUES (:id,:saleId,:batchId,2,'CORRECTION','3.100000','3.100000',:prior,'Fictional direct database acceptance',true)`, {
+          id: randomUUID(), saleId: overInventorySale.body.id, batchId: ids.phaseThree.secondDoraResidue.batchId, prior: overInventorySale.body.lines[0].id,
+        }, transaction);
+      }), sqlError('23514'));
     });
 
     await phase.test('itemized consignment can combine residue from separate Doras and map a sale line', async () => {
@@ -1270,6 +1417,82 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(destination.quantity_g, '0.500000');
     });
 
+    await phase.test('receipt corrections supersede evidence and reverse/repost accepted inventory atomically', async () => {
+      const original = ids.phaseThree.partialReceipt.items.find((row) => row.consignmentItemId === ids.phaseThree.consignmentItems[0].id);
+      const correction = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipt-items/${original.id}/corrections`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+          quantityGrams: '0.400000', outcome: 'ACCEPTED', correctionReason: 'Fictional reread corrected the presented quantity.',
+          measurement: { kind: 'MEASURED', sourceValue: '0.4', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt },
+        });
+      assert.equal(correction.status, 201, correction.text);
+      assert.equal(correction.body.item.supersedesReceiptItemId, original.id);
+      assert.ok(correction.body.reversal.id);
+      assert.ok(correction.body.movement.id);
+      ids.phaseThree.correctedPartialReceiptItem = correction.body.item;
+      const history = await db(`SELECT id,quantity_g,outcome,supersedes_receipt_item_id,correction_reason FROM consignment_receipt_item
+        WHERE id IN (:original,:successor) ORDER BY recorded_at,id`, { original: original.id, successor: correction.body.item.id }, undefined, QueryTypes.SELECT);
+      assert.equal(history.length, 2);
+      assert.equal(history.find((row) => row.id === original.id).quantity_g, '0.500000');
+      assert.equal(history.find((row) => row.id === correction.body.item.id).quantity_g, '0.400000');
+      assert.equal(history.find((row) => row.id === correction.body.item.id).supersedes_receipt_item_id, original.id);
+      const read = await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      const item = read.body.items.find((row) => row.id === ids.phaseThree.consignmentItems[0].id);
+      assert.equal(item.presented_receipt_quantity_g, '0.400000');
+      assert.equal(item.accepted_receipt_quantity_g, '0.400000');
+      assert.equal(item.disputed_receipt_quantity_g, '0.000000');
+      assert.equal(item.rejected_receipt_quantity_g, '0.000000');
+    });
+
+    await phase.test('receipt claim limit rejects API and direct database over-receipt', async () => {
+      const item = ids.phaseThree.consignmentItems[0];
+      const excess = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+          items: [{ consignmentItemId: item.id, quantityGrams: '1.100001', outcome: 'DISPUTED', reason: 'Fictional excessive claim.', measurement: { kind: 'MEASURED', sourceValue: '1.100001', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' } }],
+        });
+      assert.equal(excess.status, 409);
+      assert.equal(excess.body.error.code, 'RECEIPT_CLAIMS_EXCEED_DISPATCH');
+
+      await assert.rejects(sequelize.transaction(async (transaction) => {
+        const [itemRow] = await db(`SELECT batch_id FROM consignment_item WHERE id=:id`, { id: item.id }, transaction, QueryTypes.SELECT);
+        const receiptId = randomUUID();
+        const setId = randomUUID();
+        const measurementId = randomUUID();
+        await db(`INSERT INTO consignment_receipt(id,consignment_id,received_by_user_id,occurred_at_claimed)
+          VALUES (:id,:consignmentId,:actor,:at)`, { id: receiptId, consignmentId: ids.phaseThree.consignmentId, actor: ids.phaseThree.recoveryUserId, at: happenedAt }, transaction);
+        await db(`INSERT INTO material_measurement_set(id,batch_id,consignment_item_id,consignment_stage)
+          VALUES (:id,:batchId,:itemId,'RECEIPT')`, { id: setId, batchId: itemRow.batch_id, itemId: item.id }, transaction);
+        await db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
+          VALUES (:id,:setId,'MEASURED','1.100001','1.100001','g','test-v1','RECORDER',:party,:actor,:at)`, {
+          id: measurementId, setId, party: ids.phaseThree.recoveryPartyUserId, actor: ids.phaseThree.recoveryUserId, at: happenedAt,
+        }, transaction);
+        await db(`INSERT INTO consignment_receipt_item(id,receipt_id,consignment_id,consignment_item_id,batch_id,quantity_g,outcome,measurement_set_id,measurement_id,discrepancy_reason)
+          VALUES (:id,:receiptId,:consignmentId,:itemId,:batchId,'1.100001','DISPUTED',:setId,:measurementId,'Fictional excessive database claim')`, {
+          id: randomUUID(), receiptId, consignmentId: ids.phaseThree.consignmentId, itemId: item.id, batchId: itemRow.batch_id, setId, measurementId,
+        }, transaction);
+      }), sqlError('23514'));
+    });
+
+    await phase.test('concurrent partial receipt claims serialize at the remaining dispatched quantity', async () => {
+      const item = ids.phaseThree.consignmentItems[0];
+      const body = {
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+        items: [{ consignmentItemId: item.id, quantityGrams: '0.600000', outcome: 'ACCEPTED', measurement: { kind: 'MEASURED', sourceValue: '0.6', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' } }],
+      };
+      const [first, competing] = await Promise.all([
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body),
+        request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body),
+      ]);
+      assert.deepEqual([first.status, competing.status].sort(), [201, 409]);
+      const accepted = [first, competing].find((response) => response.status === 201);
+      const rejected = [first, competing].find((response) => response.status === 409);
+      assert.equal(rejected.body.error.code, 'RECEIPT_CLAIMS_EXCEED_DISPATCH');
+      ids.phaseThree.concurrentReceiptItem = accepted.body.items[0];
+      const read = await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(read.body.items.find((row) => row.id === item.id).accepted_receipt_quantity_g, '1.000000');
+    });
+
     await phase.test('disputed and rejected receipt claims remain evidence and create no movement', async () => {
       const [before] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
       const response = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
@@ -1281,14 +1504,39 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       const [after] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
       assert.equal(after.total, before.total);
       assert.equal((await db(`SELECT outcome FROM consignment_receipt_item WHERE id=:id`, { id: response.body.items[0].id }, undefined, QueryTypes.SELECT))[0].outcome, 'REJECTED');
+      ids.phaseThree.rejectedReceiptItem = response.body.items[0];
+      ids.phaseThree.disputedReceiptItem = ids.phaseThree.partialReceipt.items.find((row) => row.consignmentItemId === ids.phaseThree.consignmentItems[1].id);
+    });
+
+    await phase.test('disputed and rejected quantities can be corrected without erasing prior evidence', async () => {
+      const disputed = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipt-items/${ids.phaseThree.disputedReceiptItem.id}/corrections`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, quantityGrams: '0.500000', outcome: 'ACCEPTED',
+          correctionReason: 'Fictional follow-up evidence resolves the discrepancy.',
+          measurement: { kind: 'MEASURED', sourceValue: '0.5', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' },
+        });
+      const rejected = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipt-items/${ids.phaseThree.rejectedReceiptItem.id}/corrections`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+          recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, quantityGrams: '0.250000', outcome: 'ACCEPTED',
+          correctionReason: 'Fictional follow-up evidence resolves the rejected observation.',
+          measurement: { kind: 'MEASURED', sourceValue: '0.25', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER' },
+        });
+      assert.equal(disputed.status, 201, disputed.text);
+      assert.equal(rejected.status, 201, rejected.text);
+      ids.phaseThree.correctedDisputedReceiptItem = disputed.body.item;
+      ids.phaseThree.correctedRejectedReceiptItem = rejected.body.item;
+      const [history] = await db(`SELECT count(*)::int AS total FROM consignment_receipt_item WHERE consignment_item_id=:itemId`, { itemId: ids.phaseThree.consignmentItems[1].id }, undefined, QueryTypes.SELECT);
+      assert.equal(history.total, 4);
+      assert.equal((await db(`SELECT outcome FROM consignment_receipt_item WHERE id=:id`, { id: ids.phaseThree.disputedReceiptItem.id }, undefined, QueryTypes.SELECT))[0].outcome, 'DISPUTED');
+      assert.equal((await db(`SELECT outcome FROM consignment_receipt_item WHERE id=:id`, { id: ids.phaseThree.rejectedReceiptItem.id }, undefined, QueryTypes.SELECT))[0].outcome, 'REJECTED');
     });
 
     await phase.test('full receipt reconciles the remaining dispatch and closes transit inventory', async () => {
       const body = {
         recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt, evidenceRef: 'fictional-final-receipt',
         items: [
-          { consignmentItemId: ids.phaseThree.consignmentItems[0].id, quantityGrams: '1.000000', outcome: 'ACCEPTED' },
-          { consignmentItemId: ids.phaseThree.consignmentItems[1].id, quantityGrams: '3.000000', outcome: 'ACCEPTED' },
+          { consignmentItemId: ids.phaseThree.consignmentItems[0].id, quantityGrams: '0.500000', outcome: 'ACCEPTED' },
+          { consignmentItemId: ids.phaseThree.consignmentItems[1].id, quantityGrams: '2.250000', outcome: 'ACCEPTED' },
         ],
       };
       const response = await request(app).post(`/api/v1/consignments/${ids.phaseThree.consignmentId}/receipts`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send(body);
@@ -1297,7 +1545,16 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       const [transit] = await db(`SELECT COALESCE(sum(quantity_g),0)::NUMERIC(20,6) AS quantity_g FROM inventory_balance WHERE location_id=(SELECT transit_location_id FROM consignment WHERE id=:id)`, { id: ids.phaseThree.consignmentId }, undefined, QueryTypes.SELECT);
       assert.equal(transit.quantity_g, '0.000000');
       assert.equal((await db(`SELECT status FROM consignment WHERE id=:id`, { id: ids.phaseThree.consignmentId }, undefined, QueryTypes.SELECT))[0].status, 'RECEIVED');
-      assert.equal((await db(`SELECT sum(posted_quantity_g)::NUMERIC(20,6) AS quantity_g FROM inventory_movement_line WHERE consignment_item_id=:itemId AND consignment_stage='RECEIPT' AND direction='IN'`, { itemId: ids.phaseThree.consignmentItems[0].id }, undefined, QueryTypes.SELECT))[0].quantity_g, '1.500000');
+      assert.equal((await db(`SELECT quantity_g FROM inventory_balance WHERE location_id=:locationId AND batch_id=:batchId`, {
+        locationId: ids.phaseThree.recoveryLocationId, batchId: ids.phaseThree.consignmentItems[0].batchId,
+      }, undefined, QueryTypes.SELECT))[0].quantity_g, '1.500000');
+      const read = await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      const itemStats = read.body.items.find((row) => row.id === ids.phaseThree.consignmentItems[1].id);
+      assert.equal(read.body.items.find((row) => row.id === ids.phaseThree.consignmentItems[0].id).dispatched_quantity_g, '1.500000');
+      assert.equal(itemStats.presented_receipt_quantity_g, '3.000000');
+      assert.equal(itemStats.accepted_receipt_quantity_g, '3.000000');
+      assert.equal(itemStats.disputed_receipt_quantity_g, '0.000000');
+      assert.equal(itemStats.rejected_receipt_quantity_g, '0.000000');
       ids.phaseThree.firstConsignmentFinalReceiptItems = response.body.items;
     });
 
@@ -1322,7 +1579,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
 
     await phase.test('recovery event consumes multiple batches from multiple consignments and preserves output genealogy', async () => {
       const firstItems = ids.phaseThree.firstConsignmentFinalReceiptItems;
-      const firstBatchReceipt = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const firstBatchReceipt = ids.phaseThree.correctedPartialReceiptItem;
       const firstFinalBatchReceipt = firstItems.find((row) => row.batchId === ids.processingOutputs[1].batchId);
       const secondBatchReceipt = firstItems.find((row) => row.batchId === ids.phaseThree.secondDoraResidue.batchId);
       assert.equal(firstBatchReceipt.outcome, 'ACCEPTED');
@@ -1331,11 +1588,16 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
         stages: [{ stageCode: 'LEACHING', occurredAt: happenedAt, note: 'Broad event classification only.' }, { stageCode: 'FINAL_RECOVERY', occurredAt: happenedAt }],
         inputs: [
           { batchId: ids.processingOutputs[1].batchId, quantityGrams: '2.500000', sources: [
-            { receiptItemId: firstBatchReceipt.id, quantityGrams: '0.500000' },
-            { receiptItemId: firstFinalBatchReceipt.id, quantityGrams: '1.000000' },
+            { receiptItemId: firstBatchReceipt.id, quantityGrams: '0.400000' },
+            { receiptItemId: ids.phaseThree.concurrentReceiptItem.id, quantityGrams: '0.600000' },
+            { receiptItemId: firstFinalBatchReceipt.id, quantityGrams: '0.500000' },
             { receiptItemId: ids.phaseThree.secondConsignmentReceiptItem.id, quantityGrams: '1.000000' },
           ] },
-          { batchId: ids.phaseThree.secondDoraResidue.batchId, quantityGrams: '3.000000', sources: [{ receiptItemId: secondBatchReceipt.id, quantityGrams: '3.000000' }] },
+          { batchId: ids.phaseThree.secondDoraResidue.batchId, quantityGrams: '3.000000', sources: [
+            { receiptItemId: ids.phaseThree.correctedDisputedReceiptItem.id, quantityGrams: '0.500000' },
+            { receiptItemId: ids.phaseThree.correctedRejectedReceiptItem.id, quantityGrams: '0.250000' },
+            { receiptItemId: secondBatchReceipt.id, quantityGrams: '2.250000' },
+          ] },
         ],
         outputs: [
           { materialKind: 'RECOVERED_GOLD', outputRole: 'RECOVERED_GOLD', quantityGrams: '0.250000' },
@@ -1362,14 +1624,32 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       const detail = await request(app).get(`/api/v1/recovery-events/${first.body.id}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(detail.status, 200, detail.text);
       assert.equal(detail.body.outputs.every((output) => output.contributing_batch_ids.length === 2), true);
-      assert.equal(detail.body.inputs.reduce((sum, row) => sum + row.sources.length, 0), 4);
+      assert.equal(detail.body.inputs.reduce((sum, row) => sum + row.sources.length, 0), 7);
       assert.equal((await request(app).get(`/api/v1/recovery-events/${first.body.id}`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`)).status, 404);
     });
 
     await phase.test('recovery cannot consume another facility, unsupported material, or already consumed sources', async () => {
       const attempt = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send(validRecoveryEventBody(ids.phaseThree.recoveryLocationId));
       assert.equal(attempt.status, 404);
-      const source = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const supersededSource = ids.phaseThree.partialReceipt.items.find((row) => row.batchId === ids.processingOutputs[1].batchId);
+      const staleSourceAttempt = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
+        inputs: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.100000', sources: [{ receiptItemId: supersededSource.id, quantityGrams: '0.100000' }] }],
+        outputs: [{ materialKind: 'RECOVERED_GOLD', outputRole: 'RECOVERED_GOLD', quantityGrams: '0.010000' }],
+      });
+      assert.equal(staleSourceAttempt.status, 400);
+      assert.equal(staleSourceAttempt.body.error.code, 'INVALID_RECOVERY_SOURCE');
+      await assert.rejects(sequelize.transaction(async (transaction) => {
+        const [inputRow] = await db(`SELECT material_event_input_id FROM recovery_event_input WHERE recovery_event_id=:eventId AND batch_id=:batchId`, {
+          eventId: ids.phaseThree.recoveryEventId, batchId: ids.processingOutputs[1].batchId,
+        }, transaction, QueryTypes.SELECT);
+        await db(`INSERT INTO recovery_event_input_source(id,recovery_event_input_id,recovery_event_id,batch_id,consignment_receipt_item_id,consignment_item_id,source_quantity_g)
+          VALUES (:id,:inputId,:eventId,:batchId,:receiptId,:itemId,'0.100000')`, {
+          id: randomUUID(), inputId: inputRow.material_event_input_id, eventId: ids.phaseThree.recoveryEventId,
+          batchId: ids.processingOutputs[1].batchId, receiptId: supersededSource.id, itemId: supersededSource.consignmentItemId,
+        }, transaction);
+      }), sqlError('23514'));
+      const source = ids.phaseThree.correctedPartialReceiptItem;
       const [before] = await db(`SELECT count(*)::int AS total FROM material_event WHERE event_kind='RECOVERY'`, {}, undefined, QueryTypes.SELECT);
       const overuse = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({
         recoveryInventoryLocationId: ids.phaseThree.recoveryLocationId, occurredAt: happenedAt,
@@ -1395,7 +1675,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       const read = await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`);
       assert.equal(read.status, 200, read.text);
       const eventWrite = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send(validRecoveryEventBody(ids.phaseThree.recoveryLocationId));
-      const adjustment = await request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send({ batchId: ids.phaseThree.recoveryEventId, countedQuantityGrams: '1.000000', reason: 'not permitted', evidenceRef: 'fictional-evidence', occurredAt: happenedAt });
+      const adjustment = await request(app).post(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/adjustments`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`).set('Idempotency-Key', randomUUID()).send({ batchId: ids.phaseThree.secondDoraResidue.batchId, countedQuantityGrams: '1.000000', reason: 'not permitted', evidenceRef: 'fictional-evidence', occurredAt: happenedAt });
       assert.equal(eventWrite.status, 404);
       assert.equal(adjustment.status, 404, adjustment.text);
     });
