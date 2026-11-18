@@ -2,9 +2,9 @@
 
 ## Phase 1 implementation status (2026-11-18)
 
-Phase 1 is underway with a tested backend foundation; Stages 1 and 2 are **partially implemented**, not complete. The PostgreSQL 18 migration and 10 integration checks pass against a dedicated database ending in `_test`.
+Phase 1 is underway with a tested backend foundation; Stages 1 and 2 are **partially implemented**, not complete. The PostgreSQL 18 migration and 10 integration scenarios pass against a dedicated database ending in `_test`.
 
-- Implemented and tested: ES-module Express API; Sequelize access layer and reviewed SQL migration; environment validation; health endpoint; bcrypt accounts and short-lived JWT authentication; audited user/role administration and organisation membership; scoped site reads; site/hole/participant commands; production events, output batches and append-only typed measurement observations; allocation revision constraints; one derived inventory journal with guarded transfer service; and per-aggregate hash-linked audit verification.
+- Implemented and tested: ES-module Express API; Sequelize access layer and reviewed SQL migration; environment validation; health endpoint; bcrypt accounts and short-lived JWT authentication; audited user/role administration and organisation membership; site/hole/resource authorization with cross-hole and cross-site regression coverage; site/hole/participant commands; production events, output batches and append-only typed measurement observations; allocation revision constraints; one derived inventory journal with guarded transfer service; and per-aggregate hash-linked audit verification.
 - Still needed for Stage 1/2: client/PWA, deployment and backup policy, allocation-review API and pilot reviewer role, and complete operational inventory and processing APIs. Commercial correction and partial-reversal integrity rules are enforced and tested in PostgreSQL; a user-facing correction command is not implemented. No offline engine, distributed ledger, or full Dora/merchant/recovery workflow is implemented.
 - Verification commands: `cd server; npm run lint`, `npm run migrate`, then `npm test` with `TEST_DATABASE_URL` set to a dedicated PostgreSQL `_test` database. The suite resets and cleans that database's `public` schema.
 

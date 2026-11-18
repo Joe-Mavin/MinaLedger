@@ -42,33 +42,68 @@ export function requireSystemAdministrator(req, res, next) {
   return next();
 }
 
+const SITE_READ_ROLES = ['FIELD_OFFICER', 'MINING_OPERATOR', 'MINER', 'AUDITOR'];
+const RESOURCE_WRITE_ROLES = ['FIELD_OFFICER', 'MINING_OPERATOR'];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function accessRoleCodes(write) {
+  return write ? RESOURCE_WRITE_ROLES : SITE_READ_ROLES;
+}
+
+async function hasActiveOrganisationMembership(auth, organisationId) {
+  if (!UUID_PATTERN.test(String(organisationId))) return false;
+  const memberships = await sequelize.query(
+    `SELECT 1 FROM organisation_membership om JOIN user_account u ON u.person_party_id=om.person_party_id
+     WHERE u.id=:userId AND om.organisation_party_id=:organisationId AND om.status='ACTIVE'
+       AND om.valid_from<=now() AND (om.valid_to IS NULL OR om.valid_to>now()) LIMIT 1`,
+    { replacements: { userId: auth.userId, organisationId }, type: QueryTypes.SELECT },
+  );
+  return memberships.length > 0;
+}
+
+async function hasActiveSiteOrganisationRelationship(siteId, organisationId) {
+  const relationships = await sequelize.query(
+    `SELECT 1 FROM site_party_role
+     WHERE site_id=:siteId AND party_id=:organisationId AND status='ACTIVE'
+       AND valid_from<=now() AND (valid_to IS NULL OR valid_to>now()) LIMIT 1`,
+    { replacements: { siteId, organisationId }, type: QueryTypes.SELECT },
+  );
+  return relationships.length > 0;
+}
+
 export async function canAccessSite(auth, siteId, { write = false } = {}) {
-  const roleCodes = write ? ['FIELD_OFFICER', 'MINING_OPERATOR'] : ['FIELD_OFFICER', 'MINING_OPERATOR', 'MINER', 'AUDITOR'];
+  const roleCodes = accessRoleCodes(write);
   if (auth.roles.some((role) => role.role_code === 'FIELD_OFFICER' && role.scope_kind === 'PILOT' && role.scope_id === 'default')) return true;
-  const direct = auth.roles.some((role) => roleCodes.includes(role.role_code) && role.scope_kind === 'SITE' && role.scope_id === String(siteId));
-  if (direct) return true;
-  const holeIds = auth.roles.filter((role) => roleCodes.includes(role.role_code) && role.scope_kind === 'HOLE').map((role) => role.scope_id);
-  if (holeIds.length) {
-    const matches = await sequelize.query(
-      `SELECT 1 FROM mining_hole WHERE site_id=:siteId AND id=ANY(CAST(:holeIds AS uuid[])) LIMIT 1`,
-      { replacements: { siteId, holeIds }, type: QueryTypes.SELECT },
-    );
-    if (matches.length) return true;
-  }
+  if (auth.roles.some((role) => roleCodes.includes(role.role_code) && role.scope_kind === 'SITE' && role.scope_id === String(siteId))) return true;
+
   for (const role of auth.roles.filter((item) => roleCodes.includes(item.role_code) && item.scope_kind === 'ORGANISATION')) {
-    const membership = await sequelize.query(
-      `SELECT 1 FROM organisation_membership om JOIN user_account u ON u.person_party_id=om.person_party_id
-       WHERE u.id=:userId AND om.organisation_party_id=CAST(:organisationId AS uuid) AND om.status='ACTIVE'
-         AND om.valid_from<=now() AND (om.valid_to IS NULL OR om.valid_to>now()) LIMIT 1`,
-      { replacements: { userId: auth.userId, organisationId: role.scope_id }, type: QueryTypes.SELECT },
-    );
-    if (!membership.length) continue;
-    const relationship = await sequelize.query(
-      `SELECT 1 FROM site_party_role WHERE site_id=:siteId AND party_id=CAST(:organisationId AS uuid) AND status='ACTIVE'
+    if (!(await hasActiveOrganisationMembership(auth, role.scope_id))) continue;
+    if (await hasActiveSiteOrganisationRelationship(siteId, role.scope_id)) return true;
+  }
+  return false;
+}
+
+export async function canAccessHole(auth, siteId, holeId, { write = false } = {}) {
+  const holes = await sequelize.query(
+    `SELECT 1 FROM mining_hole WHERE id=:holeId AND site_id=:siteId LIMIT 1`,
+    { replacements: { holeId, siteId }, type: QueryTypes.SELECT },
+  );
+  if (!holes.length) return false;
+  if (await canAccessSite(auth, siteId, { write })) return true;
+
+  const roleCodes = accessRoleCodes(write);
+  if (auth.roles.some((role) => roleCodes.includes(role.role_code) && role.scope_kind === 'HOLE' && role.scope_id === String(holeId))) return true;
+
+  for (const role of auth.roles.filter((item) => roleCodes.includes(item.role_code) && item.scope_kind === 'ORGANISATION')) {
+    if (!(await hasActiveOrganisationMembership(auth, role.scope_id))) continue;
+    if (!UUID_PATTERN.test(String(role.scope_id))) continue;
+    const relationships = await sequelize.query(
+      `SELECT 1 FROM hole_party_role
+       WHERE hole_id=:holeId AND party_id=:organisationId AND status='ACTIVE'
          AND valid_from<=now() AND (valid_to IS NULL OR valid_to>now()) LIMIT 1`,
-      { replacements: { siteId, organisationId: role.scope_id }, type: QueryTypes.SELECT },
+      { replacements: { holeId, organisationId: role.scope_id }, type: QueryTypes.SELECT },
     );
-    if (relationship.length) return true;
+    if (relationships.length) return true;
   }
   return false;
 }
@@ -77,6 +112,50 @@ export async function requireSiteAccess(req, res, next) {
   try {
     const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
     if (!(await canAccessSite(req.auth, req.params.siteId, { write }))) return next(new AppError(403, 'FORBIDDEN', 'You do not have access to this mining site.'));
+    return next();
+  } catch (error) { return next(error); }
+}
+
+export async function requireHoleAccess(req, res, next) {
+  try {
+    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    if (!(await canAccessHole(req.auth, req.params.siteId, req.params.holeId, { write }))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+
+export async function requireParticipantWriteAccess(req, res, next) {
+  try {
+    if (await canAccessSite(req.auth, req.params.siteId, { write: true })) return next();
+    if (req.body.holeId && await canAccessHole(req.auth, req.params.siteId, req.body.holeId, { write: true })) return next();
+    return next(new AppError(403, 'FORBIDDEN', 'You do not have access to associate a participant with this resource.'));
+  } catch (error) { return next(error); }
+}
+
+export async function requireProductionHoleAccess(req, res, next) {
+  try {
+    if (await canAccessSite(req.auth, req.params.siteId, { write: true })) return next();
+    if (!(await canAccessHole(req.auth, req.params.siteId, req.body.holeId, { write: true }))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+
+export async function requireProductionEventAccess(req, res, next) {
+  try {
+    const write = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    const [event] = await sequelize.query(
+      `SELECT pe.hole_id FROM production_event pe JOIN mining_hole h ON h.id=pe.hole_id
+       WHERE pe.event_id=:eventId AND h.site_id=:siteId LIMIT 1`,
+      { replacements: { eventId: req.params.eventId, siteId: req.params.siteId }, type: QueryTypes.SELECT },
+    );
+    if (!event || !(await canAccessHole(req.auth, req.params.siteId, event.hole_id, { write }))) {
+      return next(new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.'));
+    }
+    req.authorizedHoleId = event.hole_id;
     return next();
   } catch (error) { return next(error); }
 }

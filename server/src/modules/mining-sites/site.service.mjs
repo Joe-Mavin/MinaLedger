@@ -3,7 +3,7 @@ import { QueryTypes } from 'sequelize';
 import { sequelize } from '../../database/connection.mjs';
 import { MiningHole, MiningSite } from '../../database/models.mjs';
 import { AppError } from '../../utils/errors.mjs';
-import { canAccessSite } from '../../middleware/auth.mjs';
+import { canAccessHole, canAccessSite } from '../../middleware/auth.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
 
@@ -61,8 +61,33 @@ export async function createHole(siteId, input, auth, mutationId) {
   }));
 }
 
-export async function listHoles(siteId) {
-  return MiningHole.findAll({ where: { siteId }, order: [['createdAt', 'ASC']], attributes: ['id', 'siteId', 'holeCode', 'name', 'status', 'createdAt'] });
+export async function listHoles(siteId, auth) {
+  const holes = await MiningHole.findAll({ where: { siteId }, order: [['createdAt', 'ASC']], attributes: ['id', 'siteId', 'holeCode', 'name', 'status', 'createdAt'] });
+  const visible = [];
+  for (const hole of holes) if (await canAccessHole(auth, siteId, hole.id)) visible.push(hole);
+  if (!visible.length && !(await canAccessSite(auth, siteId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return visible;
+}
+
+export async function getHole(siteId, holeId, auth) {
+  if (!(await canAccessHole(auth, siteId, holeId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  const hole = await MiningHole.findOne({ where: { id: holeId, siteId }, attributes: ['id', 'siteId', 'holeCode', 'name', 'status', 'createdAt'] });
+  if (!hole) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return hole;
+}
+
+export async function listHoleParticipants(siteId, holeId, auth) {
+  if (!(await canAccessHole(auth, siteId, holeId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return sequelize.query(
+    `SELECT p.id AS party_id, p.party_kind, COALESCE(pp.display_name, op.display_name) AS display_name,
+       hp.role_code, hp.valid_from, hp.valid_to, h.id AS hole_id
+     FROM hole_party_role hp JOIN mining_hole h ON h.id=hp.hole_id JOIN party p ON p.id=hp.party_id
+       LEFT JOIN person_profile pp ON pp.party_id=p.id LEFT JOIN organisation_profile op ON op.party_id=p.id
+     WHERE h.id=:holeId AND h.site_id=:siteId AND hp.status='ACTIVE'
+       AND hp.valid_from<=now() AND (hp.valid_to IS NULL OR hp.valid_to>now())
+     ORDER BY display_name`,
+    { replacements: { siteId, holeId }, type: QueryTypes.SELECT },
+  );
 }
 
 export async function createParticipant(siteId, input, auth, mutationId) {

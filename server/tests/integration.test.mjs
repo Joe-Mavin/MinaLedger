@@ -256,6 +256,127 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal((await db(`SELECT quantity_g FROM material_measurement WHERE id=:id`, { id: ids.measurementId }, undefined, QueryTypes.SELECT))[0].quantity_g, '10.000000');
   });
 
+  await t.test('hole-scoped access stays within assigned holes across nested endpoints', async () => {
+    ids.holeB1Id = randomUUID();
+    await db(`INSERT INTO mining_hole(id,site_id,hole_code,name) VALUES (:id,:siteId,'HOLE-B1','Third fictional hole')`, { id: ids.holeB1Id, siteId: ids.siteBId });
+
+    const holeA2Participant = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'PERSON', displayName: 'Fictional Hole A2 Miner', participantKind: 'MINER', roleCode: 'MINER', holeId: ids.secondHoleId });
+    assert.equal(holeA2Participant.status, 201, holeA2Participant.text);
+
+    const holeA2EventResponse = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
+      .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
+      .send({
+        holeId: ids.secondHoleId, occurredAt: happenedAt, shiftOrPeriodRef: 'FICTIONAL-A2-PERIOD',
+        outputs: [{ materialKind: 'RESIDUE', outputKind: 'HOLE-A2-OUTPUT', measurements: [{ kind: 'MEASURED', quantityGrams: '3.000000', sourceValue: '3', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt }] }],
+      });
+    assert.equal(holeA2EventResponse.status, 201, holeA2EventResponse.text);
+    const holeA2Event = holeA2EventResponse.body;
+    const holeA2Output = holeA2Event.outputs[0];
+
+    const holeA1User = await seedUser('hole-a1-recorder@example.test', 'Fictional Hole A1 Recorder', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeId,
+    });
+    ids.holeA1RoleId = holeA1User.roleAssignmentId;
+    const holeA1Token = await signIn('hole-a1-recorder@example.test');
+    const holeB1User = await seedUser('hole-b1-recorder@example.test', 'Fictional Hole B1 Recorder', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeB1Id,
+    });
+    const holeB1Token = await signIn('hole-b1-recorder@example.test');
+
+    const a1 = await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(a1.status, 200, a1.text);
+    const a1Holes = await request(app).get(`/api/v1/sites/${ids.siteId}/holes`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.deepEqual(a1Holes.body.map((hole) => hole.id), [ids.holeId]);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.secondHoleId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/holes/${ids.holeB1Id}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/holes`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 403);
+
+    const a1Participants = await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}/participants`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(a1Participants.status, 200, a1Participants.text);
+    assert.ok(a1Participants.body.some((participant) => participant.party_id === ids.minerPartyId));
+    const a2Participants = await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.secondHoleId}/participants`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(a2Participants.status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/participants`).set('Authorization', `Bearer ${holeA1Token}`)).status, 403);
+
+    const holeA1Association = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'PERSON', displayName: 'Fictional A1 Witness', participantKind: 'FIELD_OFFICER', roleCode: 'FIELD_RECORDER', holeId: ids.holeId });
+    assert.equal(holeA1Association.status, 201, holeA1Association.text);
+    const holeA2Association = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID())
+      .send({ partyKind: 'PERSON', displayName: 'Fictional Unauthorized Witness', participantKind: 'FIELD_OFFICER', roleCode: 'FIELD_RECORDER', holeId: ids.secondHoleId });
+    assert.equal(holeA2Association.status, 403);
+
+    const siteWideEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(siteWideEvents.status, 403);
+    const a1Event = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(a1Event.status, 200, a1Event.text);
+    assert.equal(a1Event.body.outputs[0].batch_id, ids.outputs[0].batchId);
+    const a2Event = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${holeA1Token}`);
+    assert.equal(a2Event.status, 404);
+    assert.doesNotMatch(JSON.stringify(a2Event.body), new RegExp(holeA2Event.eventCode));
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/production-events/${ids.productionEventId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+
+    const measurementInput = { kind: 'MEASURED', quantityGrams: '9.800000', sourceValue: '9.8', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'WEIGHER', occurredAt: happenedAt };
+    const a1Measurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${ids.outputs[0].id}/measurements`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
+    assert.equal(a1Measurement.status, 201, a1Measurement.text);
+    const a2Measurement = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}/outputs/${holeA2Output.id}/measurements`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
+    assert.equal(a2Measurement.status, 404);
+    const crossOutput = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${holeA2Output.id}/measurements`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
+    assert.equal(crossOutput.status, 404);
+    const siteAuditor = await seedUser('site-auditor@example.test', 'Fictional Site Auditor', {
+      roleCode: 'AUDITOR', scopeKind: 'SITE', scopeId: ids.siteId,
+    });
+    const siteAuditorToken = await signIn('site-auditor@example.test');
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${siteAuditorToken}`)).status, 200);
+    const auditorWrite = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}/outputs/${holeA2Output.id}/measurements`)
+      .set('Authorization', `Bearer ${siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
+    assert.equal(auditorWrite.status, 404);
+    const unauthorizedProduction = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
+      .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID())
+      .send({ holeId: ids.secondHoleId, occurredAt: happenedAt, outputs: [{ materialKind: 'RESIDUE' }] });
+    assert.equal(unauthorizedProduction.status, 404);
+
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.secondHoleId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/participants`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
+    const siteEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(siteEvents.status, 200, siteEvents.text);
+    assert.ok(siteEvents.body.some((event) => event.id === holeA2Event.id));
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
+
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}/holes/${ids.holeB1Id}`).set('Authorization', `Bearer ${holeB1Token}`)).status, 200);
+    assert.deepEqual((await request(app).get(`/api/v1/sites/${ids.siteBId}/holes`).set('Authorization', `Bearer ${holeB1Token}`)).body.map((hole) => hole.id), [ids.holeB1Id]);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeB1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${holeB1Token}`)).status, 403);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 403);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 200);
+
+    const adminAction = await request(app).post('/api/v1/admin/organisations').set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({ displayName: 'Fictional Authorization Test Group', organisationKind: 'TEST_ORGANISATION' });
+    assert.equal(adminAction.status, 201, adminAction.text);
+
+    const addedSiteRole = await request(app).post(`/api/v1/admin/users/${holeA1User.userId}/roles`)
+      .set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID())
+      .send({ roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId });
+    assert.equal(addedSiteRole.status, 201, addedSiteRole.text);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 200);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 200);
+
+    const revokeHoleRole = await request(app).post(`/api/v1/admin/role-assignments/${ids.holeA1RoleId}/revoke`)
+      .set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(revokeHoleRole.status, 200, revokeHoleRole.text);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/holes/${ids.holeId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 404);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}`).set('Authorization', `Bearer ${holeA1Token}`)).status, 200);
+  });
+
   await t.test('allocation basis, revisions, homogeneous rows, approval totals, and current pointer', async () => {
     const beneficiary = await seedParty('PERSON', 'Fictional Allocation Beneficiary');
     const chainId = randomUUID();

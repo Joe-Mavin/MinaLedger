@@ -82,6 +82,8 @@ All write commands require an `Idempotency-Key` UUID. Sign in at `POST /api/v1/a
 | `GET/POST /api/v1/sites` | List authorized sites or create within pilot scope |
 | `GET/PATCH /api/v1/sites/{siteId}` | Read or update permitted site metadata |
 | `GET/POST /api/v1/sites/{siteId}/holes` | Read or add site holes |
+| `GET /api/v1/sites/{siteId}/holes/{holeId}` | Read one hole when authorized for that hole or site |
+| `GET /api/v1/sites/{siteId}/holes/{holeId}/participants` | Read only the selected hole's participants |
 | `GET/POST /api/v1/sites/{siteId}/participants` | Read or associate a party and its site/hole role |
 | `GET/POST /api/v1/sites/{siteId}/production-events` | List or record production events with output batches and optional observations |
 | `GET /api/v1/sites/{siteId}/production-events/{eventId}` | Read event and output measurement history |
@@ -94,6 +96,7 @@ Production measurement quantities are JSON decimal strings, such as `"10.250000"
 - Sequelize provides the application data layer. Reviewed SQL files under `server/src/database/migrations/` define composite foreign keys, append-only triggers, allocation checks, the inventory journal and database transaction protections.
 - `inventory_balance` is derived from accepted lines in `inventory_movement_line`; there is no second stockpile journal or writable balance table.
 - Passwords are bcrypt hashes. Tokens are short-lived signed bearer tokens; account and role status is rechecked on every authenticated request. Access is filtered by site, hole or active organisation relationship.
+- Hole-scoped grants apply only to the assigned hole. Site details and site-wide participant/production listings require a site-level grant; nested production and measurement requests verify the event's actual site and hole.
 - Site and production writes, user/role changes, measurements and inventory transfers append redacted business audit events in the same transaction. Audit streams are per aggregate and are not a distributed blockchain.
 - `.env`, credentials, and local database files are excluded from Git.
 

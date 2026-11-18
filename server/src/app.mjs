@@ -8,9 +8,9 @@ import { z } from 'zod';
 import { env } from './config/env.mjs';
 import { logger } from './config/logger.mjs';
 import { sequelize } from './database/connection.mjs';
-import { authenticate, canAccessSite, hasRole, requirePilotFieldOfficer, requireSiteAccess, requireSystemAdministrator } from './middleware/auth.mjs';
+import { authenticate, canAccessSite, hasRole, requireHoleAccess, requirePilotFieldOfficer, requireParticipantWriteAccess, requireProductionEventAccess, requireProductionHoleAccess, requireSiteAccess, requireSystemAdministrator } from './middleware/auth.mjs';
 import { login, getProfile, createAccount, createOrganisation, addRoleAssignment, revokeRoleAssignment } from './modules/identity/identity.service.mjs';
-import { createSite, listSites, getSite, updateSite, createHole, listHoles, createParticipant, listParticipants } from './modules/mining-sites/site.service.mjs';
+import { createSite, listSites, getSite, updateSite, createHole, getHole, listHoles, createParticipant, listParticipants, listHoleParticipants } from './modules/mining-sites/site.service.mjs';
 import { createProductionEvent, addOutputMeasurement, listProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
 import { AppError, errorHandler, validateBody } from './utils/errors.mjs';
 
@@ -133,20 +133,22 @@ app.get('/api/v1/sites/:siteId', requireUuidParams('siteId'), asyncRoute(async (
 app.patch('/api/v1/sites/:siteId', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(sitePatchSchema), asyncRoute(async (req, res) => {
   return res.json(await updateSite(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
-app.get('/api/v1/sites/:siteId/holes', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listHoles(req.params.siteId))));
+app.get('/api/v1/sites/:siteId/holes', requireUuidParams('siteId'), asyncRoute(async (req, res) => res.json(await listHoles(req.params.siteId, req.auth))));
 app.post('/api/v1/sites/:siteId/holes', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(holeSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createHole(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
+app.get('/api/v1/sites/:siteId/holes/:holeId', requireUuidParams('siteId', 'holeId'), requireHoleAccess, asyncRoute(async (req, res) => res.json(await getHole(req.params.siteId, req.params.holeId, req.auth))));
+app.get('/api/v1/sites/:siteId/holes/:holeId/participants', requireUuidParams('siteId', 'holeId'), requireHoleAccess, asyncRoute(async (req, res) => res.json(await listHoleParticipants(req.params.siteId, req.params.holeId, req.auth))));
 app.get('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listParticipants(req.params.siteId))));
-app.post('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(participantSchema), asyncRoute(async (req, res) => {
+app.post('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(participantSchema), requireParticipantWriteAccess, asyncRoute(async (req, res) => {
   return res.status(201).json(await createParticipant(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
 app.get('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listProductionEvents(req.params.siteId))));
-app.get('/api/v1/sites/:siteId/production-events/:eventId', requireUuidParams('siteId', 'eventId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await getProductionEvent(req.params.siteId, req.params.eventId))));
-app.post('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(productionSchema), asyncRoute(async (req, res) => {
+app.get('/api/v1/sites/:siteId/production-events/:eventId', requireUuidParams('siteId', 'eventId'), requireProductionEventAccess, asyncRoute(async (req, res) => res.json(await getProductionEvent(req.params.siteId, req.params.eventId))));
+app.post('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(productionSchema), requireProductionHoleAccess, asyncRoute(async (req, res) => {
   return res.status(201).json(await createProductionEvent(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
-app.post('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/measurements', requireUuidParams('siteId', 'eventId', 'outputId'), requireSiteAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
+app.post('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/measurements', requireUuidParams('siteId', 'eventId', 'outputId'), requireProductionEventAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
   const input = { ...req.body, occurredAt: req.body.occurredAt ?? new Date().toISOString() };
   return res.status(201).json(await addOutputMeasurement(req.params.siteId, req.params.eventId, req.params.outputId, input, req.auth, req.get('idempotency-key')));
 }));
