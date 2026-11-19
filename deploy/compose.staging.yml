@@ -1,0 +1,175 @@
+name: minaledger-staging
+
+services:
+  db:
+    image: postgres:18.7-alpine3.24
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in deploy/.env.staging}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/.env.staging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate POSTGRES_PASSWORD in deploy/.env.staging}
+      APP_DATABASE_USER: ${APP_DATABASE_USER:?Set APP_DATABASE_USER in deploy/.env.staging}
+      APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:?Generate APP_DATABASE_PASSWORD in deploy/.env.staging}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ../ops/init-runtime-role.sh:/docker-entrypoint-initdb.d/010-runtime-role.sh:ro
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 1m
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    environment:
+      NODE_ENV: production
+      APP_ENV: staging
+      PORT: 3001
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${APP_DATABASE_USER}:${APP_DATABASE_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_SSL: disable
+      JWT_SECRET: ${JWT_SECRET:?Generate JWT_SECRET in deploy/.env.staging}
+      CORS_ORIGIN: ${CORS_ORIGIN:?Set CORS_ORIGIN to the staging HTTPS origin}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-10}
+      AUTH_RATE_LIMIT_WINDOW_MS: ${AUTH_RATE_LIMIT_WINDOW_MS:-900000}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-15000}
+    expose:
+      - "3001"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app
+      - database
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/readyz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  checkpoint-worker:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    command: ["npm", "run", "audit:checkpoint-worker"]
+    environment:
+      NODE_ENV: production
+      APP_ENV: staging
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${APP_DATABASE_USER}:${APP_DATABASE_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_SSL: disable
+      CORS_ORIGIN: ${CORS_ORIGIN:?Set CORS_ORIGIN to the staging HTTPS origin}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - app
+    restart: unless-stopped
+
+  migrate:
+    profiles: [manual]
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    command: ["sh", "-c", "npm run migrate && npm run grant-runtime"]
+    environment:
+      NODE_ENV: production
+      APP_ENV: staging
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_SSL: disable
+      RUNTIME_DATABASE_USER: ${APP_DATABASE_USER:?Set APP_DATABASE_USER in deploy/.env.staging}
+      CORS_ORIGIN: ${CORS_ORIGIN:?Set CORS_ORIGIN to the staging HTTPS origin}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+    restart: "no"
+
+  backup:
+    profiles: [maintenance]
+    image: postgres:18.7-alpine3.24
+    entrypoint: ["sh", "/ops/backup-postgres.sh"]
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/.env.staging}
+      PGDATABASE: ${POSTGRES_DB:?Set POSTGRES_DB in deploy/.env.staging}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Generate POSTGRES_PASSWORD in deploy/.env.staging}
+      PGSSLMODE: disable
+      BACKUP_ROOT: /backups
+      BACKUP_FILE: ${BACKUP_FILE:-}
+    volumes:
+      - "${BACKUP_DIR:?Set BACKUP_DIR to a protected host directory outside this checkout}:/backups"
+      - ../ops:/ops:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+    restart: "no"
+
+  restore-test:
+    profiles: [maintenance]
+    image: postgres:18.7-alpine3.24
+    entrypoint: ["sh", "/ops/restore-test-postgres.sh"]
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/.env.staging}
+      PGDATABASE: ${POSTGRES_DB:?Set POSTGRES_DB in deploy/.env.staging}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Generate POSTGRES_PASSWORD in deploy/.env.staging}
+      PGSSLMODE: disable
+      BACKUP_ROOT: /backups
+      APP_DATABASE_USER: ${APP_DATABASE_USER:?Set APP_DATABASE_USER in deploy/.env.staging}
+      APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:?Generate APP_DATABASE_PASSWORD in deploy/.env.staging}
+      RESTORE_BACKUP_FILE: ${RESTORE_BACKUP_FILE:-}
+      RESTORE_TARGET_DATABASE: ${RESTORE_TARGET_DATABASE:-}
+      RESTORE_CONFIRM_TARGET_DATABASE: ${RESTORE_CONFIRM_TARGET_DATABASE:-}
+    volumes:
+      - "${BACKUP_DIR:?Set BACKUP_DIR to a protected host directory outside this checkout}:/backups:ro"
+      - ../ops:/ops:ro
+      - ../server/src/database/migrations:/migrations:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+    restart: "no"
+
+networks:
+  app:
+    driver: bridge
+  database:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:

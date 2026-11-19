@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { apiRequest, getHoleParticipants, getHoles, getProductionEvent, getSites, type HoleParticipantReference, type HoleReference, type ProductionEventReference, type SiteReference } from './api';
+import { API_BASE_URL } from './apiBase';
 import { applyReceipt, clearReferenceCache, getReferenceCache, listCommands, saveReferenceCache, updateCommand } from './offline/database';
 import { createEnvelope, createLinkedRevision, queueCommand, recoverInterruptedUploads, saveDraft } from './offline/commands';
 import { synchronizeCommands } from './offline/sync';
@@ -68,7 +69,7 @@ function occurrenceIso(value: string): string {
 }
 
 async function loginRequest(email: string, password: string): Promise<{ token: string; user: Omit<Recorder, 'roles'>; roles: Array<Record<string, string>> }> {
-  const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001'}/api/v1/auth/login`, {
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
     method: 'POST', cache: 'no-store', credentials: 'omit',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }),
   });

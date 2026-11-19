@@ -10,6 +10,7 @@
     "start": "node --preserve-symlinks --preserve-symlinks-main src/server.mjs",
     "dev": "node --preserve-symlinks --preserve-symlinks-main --watch src/server.mjs",
     "migrate": "node --preserve-symlinks --preserve-symlinks-main src/database/migrate.mjs",
+    "grant-runtime": "node --preserve-symlinks --preserve-symlinks-main src/database/grant-runtime.mjs",
     "bootstrap-admin": "node --preserve-symlinks --preserve-symlinks-main src/scripts/bootstrap-admin.mjs",
     "audit:checkpoint-worker": "node --preserve-symlinks --preserve-symlinks-main src/scripts/audit-checkpoint-worker.mjs",
     "lint": "node --preserve-symlinks --preserve-symlinks-main scripts/check-syntax.mjs",

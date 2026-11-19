@@ -4,7 +4,7 @@ MinaLedger is a gold-only production accountability and traceability platform fo
 
 ## Current implementation status
 
-**Phases 1-6 have implemented, automated-test-verified slices; the product remains partial and is not deployed or field-accepted.** The Node.js ES-module, Express, Sequelize and PostgreSQL backend includes scoped accounts and roles, effective-dated site and hole participants, production outputs and capture provenance, typed append-only measurement observations, allocation proposals and revisions, independently authorized Dora facilities, processing inputs and outputs, protected opaque QR lookup, a single inventory movement journal, residue stockpiles and pooling, residue sales, consignments, custody decisions, dispatch/receipt and recovery events with output genealogy, bilateral gold-trade terms, assay and measurement records, gold custody and payment reconciliation, per-aggregate hash-linked audit streams, and a Phase 5 offline command synchronization boundary. A React/TypeScript PWA provides a versioned local queue, scoped reference cache, app-shell caching and visible synchronization states.
+**Phases 1-6 have implemented, automated-test-verified slices. Stage 7 Part 1 adds deployment and operations artifacts; nothing is deployed or field-accepted.** The Node.js ES-module, Express, Sequelize and PostgreSQL backend includes scoped accounts and roles, effective-dated site and hole participants, production outputs and capture provenance, typed append-only measurement observations, allocation proposals and revisions, independently authorized Dora facilities, processing inputs and outputs, protected opaque QR lookup, a single inventory movement journal, residue stockpiles and pooling, residue sales, consignments, custody decisions, dispatch/receipt and recovery events with output genealogy, bilateral gold-trade terms, assay and measurement records, gold custody and payment reconciliation, per-aggregate hash-linked audit streams, and a Phase 5 offline command synchronization boundary. A React/TypeScript PWA provides a versioned local queue, scoped reference cache, app-shell caching and visible synchronization states.
 
 Allocation proposals start as `PENDING` and require an active, effective site or hole `BENEFICIARY` relationship for every named party; the model supports miners and recorded non-miner beneficiaries without treating land access as entitlement. The API does not expose allocation review commands while reviewer authority, eligible measurement kinds, review evidence and dispute rules remain unresolved. Production and processing measurements validate source parties against effective participant or facility relationships; only an explicit `RECORDER` observation defaults to the authenticated recorder. Phase 3 records Dora residue output intake and pooling through the existing journal, commercial sale decisions without payment, itemized consignment, separate custody offers and decisions, transport legs, paired dispatch/receipt movements, count-backed adjustments, and recovery transformations with all source links. Phase 4 adds gold-trade proposals, matching bilateral terms decisions, assay/measurement history, separately accepted custody handovers posted through the same inventory journal, payment reporting/decisions, and trade reconciliation. Recovery output remains aggregate and is not apportioned to individual miners. Phase 5 supports offline production creation, measurement and acknowledgement; allocation proposals; stockpile transfers and inventory adjustments; consignment dispatch, receipt and receipt correction; consignment custody offers/decisions; and gold-trade assay, measurement and custody offers. These commands use existing domain services, live authorization, expected resource versions and durable receipts. The PWA has not been deployed or field-accepted, and the current payment API covers gold trades, not residue-sale settlement. Phase 6 adds database-backed immutable audit checkpoints, live verification, and retryable outbox processing. Checkpoints remain in the same PostgreSQL trust boundary and have no external signature, independent holder, or blockchain commitment.
 
@@ -12,7 +12,7 @@ The two approved routes remain in scope: direct gold sales through local and lar
 
 ## Field client setup
 
-The client requires Node.js 18 or newer. The Vite development server defaults to `http://localhost:5173` and the API defaults to `http://localhost:3001`. Set `VITE_API_BASE_URL` at build time when the API is hosted elsewhere; configure the API's `CORS_ORIGIN` to include the client origin. A production PWA must be served over HTTPS (except localhost); hosting and deployment are not configured by this repository.
+The client development setup uses Node.js 24 LTS. The Vite development server defaults to `http://localhost:5173` and the API defaults to `http://localhost:3001`. Set `VITE_API_BASE_URL` at build time when the API is hosted on another origin; configure the API's `CORS_ORIGIN` to include the client origin. Production builds default to same-origin API requests. A provider-neutral Compose staging configuration is documented below, but has not been deployed. A production PWA must be served over HTTPS (except localhost).
 
 ```powershell
 Set-Location client
@@ -24,7 +24,7 @@ Client verification commands are `npm run lint`, `npm run build`, `npm run test:
 
 ## Backend setup
 
-Prerequisites: Node.js 18 or newer and PostgreSQL 14 or newer. Run the commands below from PowerShell.
+Prerequisites: Node.js 24 LTS for a current development setup and PostgreSQL 14 or newer. Run the commands below from PowerShell.
 
 1. Create an application database role and separate application and test databases using a PostgreSQL administrator account. Choose a password locally; do not commit it.
 
@@ -57,14 +57,20 @@ Prerequisites: Node.js 18 or newer and PostgreSQL 14 or newer. Run the commands 
 
    Bootstrap succeeds only while the database has no user accounts. A global `SYSTEM_ADMIN` grant permits account and role management; it does not grant automatic access to site, production, measurement, inventory or commercial records.
 
-5. Start the API and check the database-backed health endpoint.
+5. Start the API and check liveness and database-backed readiness endpoints.
 
    ```powershell
    npm start
+   Invoke-RestMethod http://127.0.0.1:3001/livez
+   Invoke-RestMethod http://127.0.0.1:3001/readyz
    Invoke-RestMethod http://127.0.0.1:3001/healthz
    ```
 
-The health response is `{"status":"ok","database":"connected",...}`. The API listens on port 3001 by default. Set `PORT` to change it.
+The liveness response is `{"status":"ok"}`. Readiness and its compatibility alias `healthz` return `{"status":"ok","database":"connected",...}`. The API listens on port 3001 by default. Set `PORT` to change it.
+
+## Staging deployment and operations
+
+See [deployment and operations](docs/DEPLOYMENT_OPERATIONS.md) for the Compose staging setup, private PostgreSQL network and volume, restricted runtime database role, explicit migration and administrator bootstrap commands, HTTPS proxy boundary, health checks, logs, backup and separate-database restore verification, update/rollback limits, incident response and unresolved pilot decisions. Local verification passed backend lint and PostgreSQL integration (**55/55**), client lint/build, unit tests (**3/3**) and Chromium E2E (**2/2**); the backup script archive passed `pg_restore --list`. Docker/Compose and a separate-database restore were not verified in this environment. The staging files prepare a deployment; they do not provision a provider or establish a complete field demonstration.
 
 ## PostgreSQL integration tests
 
@@ -77,9 +83,9 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt, recovery genealogy, gold-trade settlement and Phase 5 sync. They use synthetic fictional records only. The current verified suite reports **54 tests, 54 passed, 0 failed**, including rollback/reapply coverage for migrations 003–010.
+Tests run against PostgreSQL, apply SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt, recovery genealogy, gold-trade settlement, Phase 5 sync and Phase 6 checkpoints. They use synthetic fictional records only. The current verified suite reports **55 tests, 55 passed, 0 failed**, including rollback/reapply coverage for migrations 003–011.
 
-Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Phase 5 correction verification on 2026-11-19 passed: backend lint checked **27 ES modules**; the PostgreSQL suite reported **54 tests, 54 passed, 0 failed** against the dedicated `_test` database, including rollback/reapply coverage for migrations 003–010; client ESLint passed; its TypeScript production build passed; IndexedDB unit tests reported **3 passed, 0 failed**; and the Chromium browser test reported **1 passed, 0 failed**. Browser coverage includes creating and queueing a measurement for the participant actually identified on the selected production event; the database suite includes stale/concurrent inventory and allocation conflicts, custody and receipt conflicts, live role revocation, linked corrections and Phase 1–4 regression scenarios. Phase 4 tests include measurement and assay rejection on closed trades and superseded lines, plus concurrent closure/revision races with persisted-state checks.
+Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Phase 6 verification on 2026-11-19 passed: backend lint checked **30 ES modules**; the PostgreSQL suite reported **55 tests, 55 passed, 0 failed** against the dedicated `_test` database, including rollback/reapply coverage for migrations 003–011; client lint passed; its TypeScript production build passed; client unit tests reported **3 passed, 0 failed**; and Chromium browser tests reported **2 passed, 0 failed**. Browser coverage includes participant-context measurement capture and offline reload, synchronization, and receipt recovery; database regression coverage spans Phase 1–5 integrity and checkpoint scenarios. Stage 7 Part 1 verification results are recorded in [the implementation plan](docs/IMPLEMENTATION_PLAN.md); container builds and health checks require Docker.
 
 ## Available API routes
 
@@ -87,7 +93,8 @@ All write commands require an `Idempotency-Key` UUID. Sign in at `POST /api/v1/a
 
 | Method and path | Purpose |
 |---|---|
-| `GET /healthz` | Database-backed service health |
+| `GET /livez` | Process liveness |
+| `GET /readyz`, `GET /healthz` | Database-backed readiness (`healthz` is a compatibility alias) |
 | `POST /api/v1/auth/login`, `GET /api/v1/me` | Sign-in and current account/role view |
 | `POST /api/v1/admin/users`, `POST /api/v1/admin/organisations` | Scoped identity and organisation administration |
 | `POST /api/v1/admin/users/{userId}/roles`, `POST /api/v1/admin/role-assignments/{id}/revoke` | Audited role grant and revocation |
@@ -157,5 +164,6 @@ Production measurement quantities are JSON decimal strings, such as `"10.250000"
 - [Prototype acceptance criteria](docs/ACCEPTANCE_CRITERIA.md)
 - [Decision log and open questions](docs/DECISION_LOG.md)
 - [Project continuity](PROJECT_CONTINUITY.md)
+- [Deployment and operations](docs/DEPLOYMENT_OPERATIONS.md)
 
 The documents distinguish confirmed requirements, field observations, proposed technical decisions, unresolved business questions, and assumptions requiring pilot validation. A hash chain does not prove the physical truth of a recorded measurement or event.

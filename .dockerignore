@@ -1,0 +1,13 @@
+.git
+.github
+**/node_modules
+**/dist
+**/build
+**/coverage
+**/.env
+**/.env.*
+**/playwright-report
+**/test-results
+backups
+Microsoft
+*.log

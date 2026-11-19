@@ -293,6 +293,13 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
+    const live = await request(app).get('/livez');
+    assert.equal(live.status, 200);
+    assert.equal(live.body.status, 'ok');
+    assert.equal(Object.hasOwn(live.body, 'database'), false);
+    const ready = await request(app).get('/readyz');
+    assert.equal(ready.status, 200);
+    assert.equal(ready.body.database, 'connected');
     const health = await request(app).get('/healthz');
     assert.equal(health.status, 200);
     assert.equal(health.body.database, 'connected');

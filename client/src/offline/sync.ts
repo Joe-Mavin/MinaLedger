@@ -1,7 +1,7 @@
 import { applyReceipt, getCommand, listCommands, updateCommand } from './database';
 import type { QueuedCommand, ServerReceipt, SyncState } from './types';
+import { API_BASE_URL } from '../apiBase';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 const FINAL_STATES = new Set<SyncState>(['needs_review', 'server_accepted', 'conflict', 'rejected']);
 
 function retryDelay(retryCount: number): number {

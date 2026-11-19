@@ -357,21 +357,34 @@ async function requireProcessingEventAccess(req, res, next) {
 export const app = express();
 const allowedOrigins = env.CORS_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean);
 app.disable('x-powered-by');
+if (env.TRUST_PROXY_HOPS > 0) app.set('trust proxy', env.TRUST_PROXY_HOPS);
 app.use(helmet());
 app.use(cors({ origin: allowedOrigins, credentials: false }));
 app.use(express.json({ limit: '100kb', strict: true }));
-app.use(pinoHttp({ logger, genReqId: (req) => req.get('x-request-id')?.slice(0, 100) || randomUUID(), autoLogging: { ignore: (req) => req.url === '/healthz' }, serializers: { req: (req) => ({ id: req.id, method: req.method, url: req.url }) } }));
+const safeRequestPath = (url = '/') => {
+  const pathname = new URL(url, 'http://localhost').pathname;
+  return pathname.replace(/^\/api\/v1\/qr\/[^/]+(?=\/|$)/, '/api/v1/qr/[REDACTED]');
+};
+app.use(pinoHttp({
+  logger,
+  genReqId: (req) => req.get('x-request-id')?.slice(0, 100) || randomUUID(),
+  autoLogging: { ignore: (req) => ['/healthz', '/readyz', '/livez'].includes(safeRequestPath(req.url)) },
+  serializers: { req: (req) => ({ id: req.id, method: req.method, url: safeRequestPath(req.url) }) },
+}));
 
-app.get('/healthz', asyncRoute(async (req, res) => {
+app.get('/livez', (req, res) => res.status(200).json({ status: 'ok' }));
+const readinessCheck = asyncRoute(async (req, res) => {
   await sequelize.query('SELECT 1');
   return res.status(200).json({ status: 'ok', database: 'connected', time: new Date().toISOString() });
-}));
+});
+app.get('/readyz', readinessCheck);
+app.get('/healthz', readinessCheck);
 app.get('/api/v1/health', asyncRoute(async (req, res) => {
   await sequelize.query('SELECT 1');
   return res.status(200).json({ status: 'ok', database: 'connected' });
 }));
 
-app.post('/api/v1/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false, handler: (req, res) => res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'Too many sign-in attempts. Try again later.', requestId: req.id } }) }), validateBody(loginSchema), asyncRoute(async (req, res) => {
+app.post('/api/v1/auth/login', rateLimit({ windowMs: env.AUTH_RATE_LIMIT_WINDOW_MS, limit: env.AUTH_RATE_LIMIT_MAX, standardHeaders: 'draft-7', legacyHeaders: false, handler: (req, res) => res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'Too many sign-in attempts. Try again later.', requestId: req.id } }) }), validateBody(loginSchema), asyncRoute(async (req, res) => {
   const result = await login(req.body.email, req.body.password);
   return res.status(200).json(result);
 }));

@@ -8,6 +8,7 @@ process.once('SIGINT', () => { stopping = true; });
 process.once('SIGTERM', () => { stopping = true; });
 
 try {
+  await sequelize.authenticate();
   logger.info({}, 'audit checkpoint worker started');
   while (!stopping) {
     const result = await processAuditCheckpoint();
