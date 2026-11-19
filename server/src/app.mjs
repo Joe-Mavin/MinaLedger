@@ -16,6 +16,8 @@ import { createProductionEvent, addOutputMeasurement, listProductionEvents, getP
 import { measurementSchema, newMeasurementSchema, productionSchema } from './modules/production/production.schemas.mjs';
 import { syncEnvelopeSchema } from './modules/sync/sync.schemas.mjs';
 import { getSyncCommandVersion, getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
+import { createAuditCheckpointSchema } from './modules/audit/checkpoint.schemas.mjs';
+import { createAuditCheckpoint, getAuditCheckpoint } from './modules/audit/checkpoint.service.mjs';
 import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
 import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
@@ -387,6 +389,13 @@ app.post('/api/v1/sync/versions', validateBody(syncEnvelopeSchema), asyncRoute(a
 }));
 app.get('/api/v1/sync/receipts/:clientMutationId', requireUuidParams('clientMutationId'), asyncRoute(async (req, res) => {
   return res.json({ receipt: await getSyncReceipt(req.auth.userId, req.params.clientMutationId) });
+}));
+app.post('/api/v1/audit/checkpoints', requireIdempotencyKey, validateBody(createAuditCheckpointSchema), asyncRoute(async (req, res) => {
+  const checkpoint = await createAuditCheckpoint(req.body, req.auth, req.id, req.get('idempotency-key'));
+  return res.status(202).json(checkpoint);
+}));
+app.get('/api/v1/audit/checkpoints/:checkpointId', requireUuidParams('checkpointId'), asyncRoute(async (req, res) => {
+  return res.json(await getAuditCheckpoint(req.params.checkpointId, req.auth));
 }));
 
 app.post('/api/v1/admin/users', requireSystemAdministrator, requireIdempotencyKey, validateBody(accountSchema), asyncRoute(async (req, res) => {

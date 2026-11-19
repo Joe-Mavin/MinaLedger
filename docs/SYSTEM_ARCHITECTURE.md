@@ -1,8 +1,14 @@
 # System architecture and API proposal
 
+## Phase 6 audit checkpoint architecture (verified 2026-11-19)
+
+Migration 011 adds an immutable selected-stream checkpoint manifest and a transactional verification outbox. `POST /api/v1/audit/checkpoints` creates both atomically; the authenticated `GET /api/v1/audit/checkpoints/{checkpointId}` rechecks current access and returns saved worker state plus a fresh database verification. The `audit:checkpoint-worker` uses leased claims, retry/backoff and append-only attempts. The verifier checks the covered prefix and reports the current tail independently from that prefix. No audit payload or salt is returned by these endpoints.
+
+The checkpoint and audit history share one PostgreSQL trust boundary. This feature does not provide a signature, independently held copy, external verifier or network commitment. The client labels that limit and displays the covered sequence and any unanchored tail. Phase 7 deployment and pilot work are not started.
+
 ## Phase 5 implemented architecture (verified 2026-11-19)
 
-The implemented technical slice is a React 19/TypeScript/Vite PWA, the existing Node.js/Express modular monolith, and PostgreSQL. The browser stores immutable versioned commands and scoped references in IndexedDB. Its service worker caches only the application shell; synchronization runs on online/foreground opportunities. The Express authentication middleware protects both sync routes, the sync service rechecks current access, and accepted commands run through the existing production domain services. Migration 009 stores durable receipts and append-only receipt history. There is no ledger adapter, outbox worker, or production hosting configuration.
+The implemented technical slice is a React 19/TypeScript/Vite PWA, the existing Node.js/Express modular monolith, and PostgreSQL. The browser stores immutable versioned commands and scoped references in IndexedDB. Its service worker caches only the application shell; synchronization runs on online/foreground opportunities. The Express authentication middleware protects both sync routes, the sync service rechecks current access, and accepted commands run through the existing production domain services. Migration 009 stores durable receipts and append-only receipt history. Phase 6 adds an audit-checkpoint outbox worker that verifies PostgreSQL history; no external ledger adapter or production hosting configuration exists.
 
 ```mermaid
 flowchart LR
@@ -26,7 +32,7 @@ flowchart LR
   UI <-->|HTTP in local development; HTTPS required for production PWA| API
 ```
 
-The client does not cache API responses or hold long-lived credentials. Current sync commands are production creation, production measurement addition, and separate capture acknowledgement. This software has passed its local automated checks but has not been deployed or field-accepted.
+The client does not cache API responses or hold long-lived credentials. Current sync commands are the 14 command types documented in the Phase 5 implementation status. This software has passed its local automated checks but has not been deployed or field-accepted.
 
 ## Proposed architecture
 
@@ -99,8 +105,8 @@ The diagram is conceptual. It does not assert that a permissioned network exists
 | Custody and entitlement | `POST /custody-transfers`, `POST /custody-transfers/{id}/accept`, `POST /entitlement-events` | Offer/accept custody; record entitlement claims independently. |
 | Assisted capture | `POST /events/{id}/capture-provenance`, `/capture-acknowledgements` | Record participant, recorder, information source, acknowledgement and evidence without implying consent. |
 | Traceability and QR | `GET /batches/{id}/genealogy`, `POST /qr-records`, `GET /q/{opaqueToken}` | Authorized provenance view and opaque QR lookup. |
-| Offline synchronization | `POST /api/v1/sync/commands`, `GET /api/v1/sync/receipts/{clientMutationId}` | Implemented idempotent upload and durable-receipt recovery for production creation, production measurement addition and separate capture acknowledgement. |
-| Audit and ledger | `GET /audit/{aggregate}`, `GET /ledger-submissions/{eventId}` | Scoped history, commitment and network receipt status. |
+| Offline synchronization | `POST /api/v1/sync/commands`, `GET /api/v1/sync/receipts/{clientMutationId}` | Idempotent upload and durable receipt recovery for the 14 allowlisted Phase 5 commands listed in the implementation plan. |
+| Audit and checkpoints | `POST /api/v1/audit/checkpoints`, `GET /api/v1/audit/checkpoints/{checkpointId}` | Authenticated selected-stream checkpoints and saved/live verification within the same database trust boundary. |
 
 Other representative endpoint names are proposals, not a final OpenAPI contract. Do not create a generic endpoint that permits clients to write arbitrary event rows or bypass domain services. The measurement API resolves one explicit owner type to a typed relational FK and verifies its batch; clients cannot reassign an existing measurement set.
 
@@ -112,7 +118,7 @@ Payment creation under either a gold trade or residue sale creates an append-onl
 2. Validate the versioned command against the explicit allowlist, dependencies, expected audit sequence and immutable envelope hash. An identical mutation ID and payload returns its durable receipt; changed content under that ID is rejected.
 3. Persist `server_received`, then dispatch ready work through the existing production domain service. Domain state, audit append and accepted receipt transition commit atomically. Deterministic domain conflicts/rejections are retained as receipt outcomes.
 4. Return the durable receipt and persist it in IndexedDB before the client updates the local state. After an unknown network outcome, the client queries the receipt route and retries with the original mutation ID when needed.
-5. Ledger commitment, an outbox worker and network receipts are future work; they are not implied by server acceptance.
+5. Checkpoint verification runs through the retryable database outbox worker. No external ledger submission or network receipt is implemented or implied by server acceptance.
 
 For inventory movements, the server locks per-batch/location guard rows in stable order, derives balances from accepted journal lines, rejects any negative post-command balance, and writes the complete movement, accepted state and audit entries in one database transaction. Deferred database constraints validate balanced transfer legs; transformation inputs/outputs link to event genealogy and may carry a reasoned mass variance. Failure rolls back every leg. Accepted corrections append reversal/adjustment postings. Audit event ordering is per aggregate stream, with affected stream heads locked in stable sorted order, as detailed in [Blockchain design](BLOCKCHAIN_DESIGN.md). Payments and allocation reviews use the same append-only command/audit path.
 

@@ -6,6 +6,12 @@
 
 **Pilot assumption:** independent participants have a reason and capacity to host or independently verify ledger state, and can agree who governs membership, endorsement, upgrades and disputes. If that is false, use the database audit log with signed exports and independent checkpoints; do not claim distributed trust.
 
+## Phase 6 database checkpoint prototype (verified 2026-11-19)
+
+Migration 011 adds immutable checkpoint headers and selected stream-head rows, a transactional verification outbox, and append-only verification attempts. Authenticated creation uses an idempotency key; an authenticated status read checks current stream access and returns the outbox result plus a live verification. The worker uses expiring leases, bounded retries and idempotent terminal states. The UI distinguishes database acceptance, worker verification, covered sequence, the unanchored tail and the unimplemented external commitment.
+
+The verifier checks the manifest, replays the covered stream prefix, compares its sequence and head, and reports the current stream tail separately. Tests show that rewriting an uncovered tail consistently can remain undetected by an older checkpoint. Checkpoint data and audit history live in the same PostgreSQL database; an operator able to rewrite that database can rewrite both. This prototype has no signature, independent holder, external verifier, permissioned network or blockchain commitment, and cannot establish physical truth. Do not describe it as independently anchored.
+
 ## Keep the use case narrow
 
 A ledger is useful only for selected cross-organisation facts for which participants need shared ordering and independent validation. It is not needed for every profile edit, inventory query, offline draft, payment note or internal correction. It cannot prove that a weight, assay or handover description was physically truthful. Measurement evidence, counterpart acknowledgement and governance are still required.
@@ -48,9 +54,9 @@ The API claims the unique actor-scoped idempotency key and request hash at the s
 
 ### Independent checkpoints and verifier limits
 
-At a pilot-agreed interval, create a signed manifest of stream key, last sequence, head hash, checkpoint time and signer. Copy it to a separately administered append-only store or anchor its digest with an independently operated network. Keep key validity/rotation information and the receipt.
+For a future, separately approved step, create a signed manifest of stream key, last sequence, head hash, checkpoint time and signer. Copy it to a separately administered append-only store or anchor its digest with an independently operated network. Keep key validity/rotation information and the receipt.
 
-A verifier recomputes the event commitment from the permitted payload and salt, replays per-aggregate entries, checks sequence continuity and previous hashes, then compares the resulting tip with a checkpoint obtained independently. Altering, deleting or reordering events at or before that checkpoint changes the verified chain/tip. An uncheckpointed tail can be rewritten by the database operator without an independently held later receipt; do not claim detection beyond the latest trusted checkpoint. A checkpoint also cannot establish that the physical weight, assay or participant statement was true.
+An independent verifier should recompute the event commitment from the permitted payload and salt, replay per-aggregate entries, check sequence continuity and previous hashes, then compare the resulting tip with a checkpoint obtained independently. Altering, deleting or reordering events at or before that checkpoint changes the verified chain/tip. An uncheckpointed tail can be rewritten by the database operator without an independently held later receipt; do not claim detection beyond the latest trusted checkpoint. A checkpoint also cannot establish that the physical weight, assay or participant statement was true.
 
 ## Corrections and disputes
 

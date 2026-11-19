@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import bcrypt from 'bcryptjs';
@@ -16,7 +16,8 @@ const { QueryTypes } = await import('sequelize');
 const { sequelize } = await import('../src/database/connection.mjs');
 const { runMigrations } = await import('../src/database/migrate.mjs');
 const { app } = await import('../src/app.mjs');
-const { appendAuditEvent, readAuditStream, verifyAuditEntries, verifyAuditStream } = await import('../src/modules/audit/audit.service.mjs');
+const { appendAuditEvent, hashPayload, hashStreamEntry, readAuditStream, verifyAuditEntries, verifyAuditStream } = await import('../src/modules/audit/audit.service.mjs');
+const { checkpointManifestHash, claimAuditCheckpoint, processAuditCheckpoint, verifyCheckpointSnapshot } = await import('../src/modules/audit/checkpoint.service.mjs');
 const { postTransfer } = await import('../src/modules/inventory/inventory.service.mjs');
 const request = (await import('supertest')).default;
 
@@ -276,6 +277,19 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.match(constraint[0].definition, /production\.allocation\.propose/);
       throw phaseFiveWorkflowRollbackProbe;
     }), (error) => error === phaseFiveWorkflowRollbackProbe);
+
+    const rollbackEleven = await readFile(new URL('../src/database/rollback/011_audit_checkpoints.sql', import.meta.url), 'utf8');
+    const migrationEleven = await readFile(new URL('../src/database/migrations/011_audit_checkpoints.sql', import.meta.url), 'utf8');
+    const phaseSixRollbackProbe = new Error('Phase 6 checkpoint migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackEleven, { transaction, raw: true });
+      const absent = await sequelize.query(`SELECT to_regclass('public.audit_checkpoint') AS table_name`, { type: QueryTypes.SELECT, transaction });
+      assert.equal(absent[0].table_name, null);
+      await sequelize.query(migrationEleven, { transaction, raw: true });
+      const present = await sequelize.query(`SELECT to_regclass('public.audit_checkpoint') AS table_name`, { type: QueryTypes.SELECT, transaction });
+      assert.equal(present[0].table_name, 'audit_checkpoint');
+      throw phaseSixRollbackProbe;
+    }), (error) => error === phaseSixRollbackProbe);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -2955,6 +2969,171 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const [entry] = await db(`SELECT audit_event_id FROM audit_stream_entry WHERE stream_kind='synthetic_test_stream' AND stream_id=:streamId LIMIT 1`, { streamId }, undefined, QueryTypes.SELECT);
     await assert.rejects(db(`UPDATE audit_event SET event_type='CHANGED' WHERE id=:id`, { id: entry.audit_event_id }), sqlError('55000'));
     await assert.rejects(db(`DELETE FROM audit_stream_entry WHERE audit_event_id=:id`, { id: entry.audit_event_id }), sqlError('55000'));
+  });
+
+  await t.test('database checkpoints are scoped, immutable, retryable, and distinguish covered history from the unanchored tail', async () => {
+    const postCheckpoint = (streams, clientMutationId = randomUUID(), token = ids.siteToken) => request(app)
+      .post('/api/v1/audit/checkpoints').set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', clientMutationId).send({ clientMutationId, streams });
+    const siteStream = { streamKind: 'mining_site', streamId: ids.siteId };
+    const holeStream = { streamKind: 'mining_hole', streamId: ids.holeId };
+
+    const denied = await postCheckpoint([siteStream], randomUUID(), ids.phaseThree.recoveryToken);
+    assert.equal(denied.status, 404, denied.text);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
+    const [authorizedSiteHead] = await db(`SELECT last_sequence FROM audit_stream_head WHERE stream_kind='mining_site' AND stream_id=:id`, { id: ids.siteId }, undefined, QueryTypes.SELECT);
+    assert.ok(authorizedSiteHead?.last_sequence, 'the authorized site must have an existing audit stream head');
+
+    const oneKey = randomUUID();
+    const created = await postCheckpoint([siteStream], oneKey);
+    assert.equal(created.status, 202, created.text);
+    assert.equal(created.body.databaseState, 'ACCEPTED');
+    assert.equal(created.body.processing.status, 'PENDING');
+    assert.equal(created.body.externalCommitment, 'NOT_IMPLEMENTED');
+    assert.equal(created.body.checkpoint.streams.length, 1);
+    const duplicate = await postCheckpoint([siteStream], oneKey);
+    assert.equal(duplicate.status, 202, duplicate.text);
+    assert.equal(duplicate.body.checkpoint.id, created.body.checkpoint.id);
+    const collision = await postCheckpoint([siteStream, holeStream], oneKey);
+    assert.equal(collision.status, 409, collision.text);
+    assert.equal(collision.body.error.code, 'IDEMPOTENCY_KEY_REUSED');
+
+    const multi = await postCheckpoint([holeStream, siteStream]);
+    assert.equal(multi.status, 202, multi.text);
+    assert.equal(multi.body.checkpoint.streams.length, 2);
+    assert.deepEqual(multi.body.checkpoint.streams.map((row) => row.streamKind), ['mining_hole', 'mining_site']);
+
+    const concurrentStreams = [siteStream, holeStream];
+    const concurrentAppend = sequelize.transaction(async (transaction) => appendAuditEvent({
+      transaction, eventType: 'TEST.CHECKPOINT_CONCURRENT_APPEND', actorUserId: ids.siteUserId,
+      actorPartyId: ids.siteUserPartyId, occurredAt: new Date(happenedAt), payload: { synthetic: true },
+      streams: [{ kind: 'mining_site', id: ids.siteId }],
+    }));
+    const [racingCheckpoint, appendResult] = await Promise.all([postCheckpoint(concurrentStreams), concurrentAppend]);
+    assert.equal(racingCheckpoint.status, 202, racingCheckpoint.text);
+    assert.ok(appendResult.id);
+
+    const checkpointId = created.body.checkpoint.id;
+    await assert.rejects(db(`UPDATE audit_checkpoint SET provenance='{}'::jsonb WHERE id=:id`, { id: checkpointId }), sqlError('55000'));
+    await assert.rejects(db(`DELETE FROM audit_checkpoint WHERE id=:id`, { id: checkpointId }), sqlError('55000'));
+    await assert.rejects(db(`UPDATE audit_checkpoint_stream SET sequence=sequence+1 WHERE checkpoint_id=:id`, { id: checkpointId }), sqlError('55000'));
+    await assert.rejects(db(`DELETE FROM audit_checkpoint_stream WHERE checkpoint_id=:id`, { id: checkpointId }), sqlError('55000'));
+    await assert.rejects(db(`DELETE FROM audit_checkpoint_outbox WHERE checkpoint_id=:id`, { id: checkpointId }), sqlError('55000'));
+
+    const abandonedClaim = await claimAuditCheckpoint(multi.body.checkpoint.id, { leaseMs: 1 });
+    assert.ok(abandonedClaim);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const recovered = await processAuditCheckpoint(multi.body.checkpoint.id);
+    assert.deepEqual(recovered, { processed: true, checkpointId: multi.body.checkpoint.id, outcome: 'VERIFIED' });
+    const duplicateExecution = await processAuditCheckpoint(multi.body.checkpoint.id);
+    assert.deepEqual(duplicateExecution, { processed: false });
+    const multiState = await request(app).get(`/api/v1/audit/checkpoints/${multi.body.checkpoint.id}`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(multiState.status, 200, multiState.text);
+    assert.equal(multiState.body.processing.status, 'VERIFIED');
+    assert.equal(multiState.body.processing.attemptCount, 2);
+    assert.equal(multiState.body.processing.verification.checkpointStatus, 'VERIFIED');
+    assert.equal(JSON.stringify(multiState.body).includes('canonical_payload'), false);
+    assert.equal(JSON.stringify(multiState.body).includes('payload_salt'), false);
+
+    const retryFailed = await processAuditCheckpoint(racingCheckpoint.body.checkpoint.id, {
+      verifier: async () => { const error = new Error('simulated temporary storage interruption'); error.code = 'TEMPORARY_FAILURE'; throw error; },
+    });
+    assert.equal(retryFailed.outcome, 'RETRY');
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const retrySucceeded = await processAuditCheckpoint(racingCheckpoint.body.checkpoint.id);
+    assert.equal(retrySucceeded.outcome, 'VERIFIED');
+    const [retryHistory] = await db(`SELECT array_agg(outcome ORDER BY attempt_number) AS outcomes FROM audit_checkpoint_verification WHERE checkpoint_id=:id`, { id: racingCheckpoint.body.checkpoint.id }, undefined, QueryTypes.SELECT);
+    assert.deepEqual(retryHistory.outcomes, ['RETRYABLE_FAILURE', 'VERIFIED']);
+
+    const invalidCheckpoint = await postCheckpoint([holeStream]);
+    assert.equal(invalidCheckpoint.status, 202, invalidCheckpoint.text);
+    const rejectedVerification = await processAuditCheckpoint(invalidCheckpoint.body.checkpoint.id, {
+      verifier: async () => ({ checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{
+        streamKind: 'mining_hole', streamId: ids.holeId, currentHeadStatus: 'MISMATCH', tailStatus: 'INVALID',
+      }], externalCommitment: 'NOT_IMPLEMENTED' }),
+    });
+    assert.equal(rejectedVerification.outcome, 'INVALID');
+    const invalidState = await request(app).get(`/api/v1/audit/checkpoints/${invalidCheckpoint.body.checkpoint.id}`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(invalidState.body.processing.status, 'INVALID');
+
+    const checkpointRow = (await db(`SELECT id,created_by_user_id,created_at,provenance,manifest_version,manifest_hash FROM audit_checkpoint WHERE id=:id`, { id: checkpointId }, undefined, QueryTypes.SELECT))[0];
+    const checkpointStreams = await db(`SELECT stream_kind,stream_id,sequence,encode(head_hash,'hex') AS head_hash FROM audit_checkpoint_stream WHERE checkpoint_id=:id ORDER BY stream_kind,stream_id`, { id: checkpointId }, undefined, QueryTypes.SELECT);
+    await sequelize.transaction(async (transaction) => appendAuditEvent({
+      transaction, eventType: 'TEST.CHECKPOINT_UNANCHORED_TAIL', actorUserId: ids.siteUserId,
+      actorPartyId: ids.siteUserPartyId, occurredAt: new Date(happenedAt), payload: { tail: 'original' },
+      streams: [{ kind: 'mining_site', id: ids.siteId }],
+    }));
+    const siteRows = await readAuditStream('mining_site', ids.siteId);
+    const [siteHead] = await db(`SELECT last_sequence,encode(head_hash,'hex') AS head_hash FROM audit_stream_head WHERE stream_kind='mining_site' AND stream_id=:id`, { id: ids.siteId }, undefined, QueryTypes.SELECT);
+    const originalSnapshot = { streamKind: 'mining_site', streamId: ids.siteId, rows: siteRows, head: { last_sequence: Number(siteHead.last_sequence), head_hash: siteHead.head_hash } };
+    const baseline = verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [originalSnapshot] });
+    assert.equal(baseline.checkpointStatus, 'VERIFIED');
+    assert.equal(baseline.streams[0].tailStatus, 'UNANCHORED');
+    assert.ok(baseline.streams[0].tailEntries >= 1);
+
+    const changedPayloadRows = siteRows.map((row) => ({ ...row }));
+    changedPayloadRows[0].canonical_payload = '{"tampered":true}';
+    assert.equal(verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [{ ...originalSnapshot, rows: changedPayloadRows }] }).checkpointStatus, 'INVALID');
+    const deletedRows = siteRows.filter((row) => Number(row.sequence) !== 1);
+    assert.equal(verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [{ ...originalSnapshot, rows: deletedRows }] }).checkpointStatus, 'INVALID');
+    const reorderedRows = [...siteRows].reverse();
+    assert.equal(verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [{ ...originalSnapshot, rows: reorderedRows }] }).checkpointStatus, 'INVALID');
+
+    const badManifest = { ...checkpointRow, manifest_hash: Buffer.alloc(32, 7) };
+    assert.equal(verifyCheckpointSnapshot({ checkpoint: badManifest, checkpointStreams, snapshots: [originalSnapshot] }).manifestStatus, 'INVALID');
+    const wrongCoveredHead = checkpointStreams.map((stream) => ({ ...stream, head_hash: 'ff'.repeat(32) }));
+    const forgedCoveredCheckpoint = { ...checkpointRow, manifest_hash: checkpointManifestHash(checkpointRow, wrongCoveredHead) };
+    assert.equal(verifyCheckpointSnapshot({ checkpoint: forgedCoveredCheckpoint, checkpointStreams: wrongCoveredHead, snapshots: [originalSnapshot] }).checkpointStatus, 'INVALID');
+    const wrongCurrentHead = { ...originalSnapshot, head: { ...originalSnapshot.head, head_hash: 'ee'.repeat(32) } };
+    const headResult = verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [wrongCurrentHead] });
+    assert.equal(headResult.checkpointStatus, 'VERIFIED');
+    assert.equal(headResult.streams[0].currentHeadStatus, 'MISMATCH');
+    assert.equal(headResult.streams[0].tailStatus, 'INVALID');
+
+    const rewrittenTailRows = siteRows.map((row) => ({ ...row }));
+    const checkpointSequence = Number(checkpointStreams[0].sequence);
+    let rewrittenTailHash = checkpointStreams[0].head_hash;
+    const tailEntries = rewrittenTailRows.filter((row) => Number(row.sequence) > checkpointSequence);
+    assert.ok(tailEntries.length >= 1, 'the added event should be beyond the checkpoint sequence');
+    for (const [index, rewrittenTail] of tailEntries.entries()) {
+      rewrittenTail.canonical_payload = JSON.stringify({ tail: `rewritten by database operator ${index + 1}` });
+      rewrittenTail.payload_salt = randomBytes(32).toString('hex');
+      rewrittenTail.payload_commitment = hashPayload(rewrittenTail.canonical_payload, Buffer.from(rewrittenTail.payload_salt, 'hex')).toString('hex');
+      rewrittenTail.previous_hash = rewrittenTailHash;
+      rewrittenTail.entry_hash = hashStreamEntry({
+        stream_kind: rewrittenTail.stream_kind, stream_id: rewrittenTail.stream_id, sequence: Number(rewrittenTail.sequence),
+        previous_hash: rewrittenTailHash, payload_commitment: rewrittenTail.payload_commitment,
+      }).toString('hex');
+      rewrittenTailHash = rewrittenTail.entry_hash;
+    }
+    const rewrittenHead = { ...originalSnapshot, rows: rewrittenTailRows, head: { last_sequence: Number(siteHead.last_sequence), head_hash: rewrittenTailHash } };
+    const rewrittenTailResult = verifyCheckpointSnapshot({ checkpoint: checkpointRow, checkpointStreams, snapshots: [rewrittenHead] });
+    assert.equal(rewrittenTailResult.checkpointStatus, 'VERIFIED');
+    assert.equal(rewrittenTailResult.streams[0].tailStatus, 'UNANCHORED');
+
+    const oneState = await request(app).get(`/api/v1/audit/checkpoints/${checkpointId}`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(oneState.status, 200, oneState.text);
+    assert.equal(oneState.body.liveVerification.streams[0].tailStatus, 'UNANCHORED');
+    assert.equal(oneState.body.liveVerification.streams[0].coveredSequence, Number(checkpointStreams[0].sequence));
+    assert.equal(oneState.body.liveVerification.streams[0].tailEntries, 2);
+    const unauthorizedRead = await request(app).get(`/api/v1/audit/checkpoints/${checkpointId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+    assert.equal(unauthorizedRead.status, 404, unauthorizedRead.text);
+
+    const temporaryReader = await seedUser(`checkpoint-reader-${randomUUID()}@example.test`, 'Checkpoint Reader', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteId,
+    });
+    const temporaryToken = testToken(temporaryReader.userId);
+    const temporaryCheckpoint = await postCheckpoint([siteStream], randomUUID(), temporaryToken);
+    assert.equal(temporaryCheckpoint.status, 202, temporaryCheckpoint.text);
+    const revokedReaderRole = await request(app).post(`/api/v1/admin/role-assignments/${temporaryReader.roleAssignmentId}/revoke`)
+      .set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({});
+    assert.equal(revokedReaderRole.status, 200, revokedReaderRole.text);
+    const revokedReaderRead = await request(app).get(`/api/v1/audit/checkpoints/${temporaryCheckpoint.body.checkpoint.id}`)
+      .set('Authorization', `Bearer ${temporaryToken}`);
+    assert.equal(revokedReaderRead.status, 404, revokedReaderRead.text);
+
+    const rollbackEleven = await readFile(new URL('../src/database/rollback/011_audit_checkpoints.sql', import.meta.url), 'utf8');
+    await assert.rejects(sequelize.transaction(async (transaction) => sequelize.query(rollbackEleven, { transaction, raw: true })), /cannot roll back audit checkpoints/);
   });
 
   await t.test('role revocation takes effect immediately and event writes roll back together', async () => {

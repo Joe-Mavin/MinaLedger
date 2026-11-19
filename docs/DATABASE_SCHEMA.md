@@ -1,5 +1,13 @@
 # Proposed database schema
 
+## Phase 6 checkpoint overlay (verified 2026-11-19)
+
+Additive migration `011_audit_checkpoints.sql` preserves migrations 001–010. `audit_checkpoint` stores an immutable checkpoint ID, creator, database timestamp, authenticated request provenance, manifest version/hash, actor-scoped mutation ID and request hash. `audit_checkpoint_stream` stores each explicitly selected `(stream_kind, stream_id, sequence, head_hash)` covered by that manifest. Update/delete triggers protect checkpoint headers, selected heads and verification-attempt history.
+
+`audit_checkpoint_outbox` is created atomically with its checkpoint. It records pending/processing/retry/verified/invalid/failed state, attempt count, next retry, expiring worker lease and sanitized result/error metadata. A guarded transition trigger enforces new attempts on claims, valid lease completion and immutable terminal status; deletion is blocked. `audit_checkpoint_verification` appends one result per attempt. The worker claims ready or expired work with `FOR UPDATE SKIP LOCKED`, verifies selected histories and retries recoverable failures with bounded backoff.
+
+`POST /api/v1/audit/checkpoints` requires authenticated stream access, schema-valid selected streams and matching `Idempotency-Key`/`clientMutationId`. `GET /api/v1/audit/checkpoints/{checkpointId}` rechecks live stream access and returns saved processing history plus live verification. Responses omit canonical audit payloads and salts. Rollback `011_audit_checkpoints.sql` refuses removal once checkpoint data exists. The verifier establishes consistency against rows in this same database; separate signatures, external custody, independent verification and blockchain anchoring are not implemented.
+
 ## Phase 4 implementation overlay (verified 2026-11-19)
 
 Additive migration `006_phase_four_gold_trades.sql` extends the existing gold trade, line, measurement, assay, custody, payment, party and inventory records; migration `007_phase_four_integrity_corrections.sql` adds current-line projection/uniqueness, assay-to-line and assay-to-batch links, a composite line-assay batch FK, and database-side assay/measurement source attribution. Migrations 001-006 are unchanged. Migration 006 adds trade proposal status and append-only status/evidence history, counterparty-accepted terms and deductions, assay correction metadata, exact measurement links for gold custody, payment actor/dispute safeguards and eligible-batch/availability constraints. Rollback scripts for migrations 006 and 007 are checked by the integration suite, which applies the schema from empty and probes rollback/reapplication before fixture records are inserted.

@@ -155,3 +155,54 @@ test('session token stays tab-scoped and offline commands survive reload with th
   expect(localState.command).toMatchObject({ envelope: { clientMutationId: offlineCommand.mutationId }, state: 'server_accepted' });
   expect(localState.receipt).toMatchObject({ clientMutationId: offlineCommand.mutationId, status: 'server_accepted' });
 });
+
+test('audit checkpoint UI distinguishes database acceptance from a live unanchored-tail verification', async ({ page }) => {
+  const checkpointId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  let getCount = 0;
+  await page.route('**/api/v1/auth/login', (route) => route.fulfill({ json: {
+    token: validToken,
+    user: { id: userId, personPartyId: partyId, displayName: 'Fictional Recorder' },
+    roles: [{ role_code: 'FIELD_OFFICER', scope_kind: 'SITE', scope_id: siteId }],
+  } }));
+  await page.route('**/api/v1/me', (route) => route.fulfill({ json: {
+    id: userId, person_party_id: partyId, display_name: 'Fictional Recorder',
+    roles: [{ role_code: 'FIELD_OFFICER', scope_kind: 'SITE', scope_id: siteId }],
+  } }));
+  await page.route('**/api/v1/sites', (route) => route.fulfill({ json: [{ id: siteId, siteCode: 'TEST-01', name: 'Fictional Site' }] }));
+  await page.route(`**/api/v1/sites/${siteId}/holes`, (route) => route.fulfill({ json: [{ id: holeId, siteId, holeCode: 'H-01' }] }));
+  await page.route('**/api/v1/audit/checkpoints', async (route) => {
+    const body = route.request().postDataJSON() as { clientMutationId: string; streams: Array<{ streamKind: string; streamId: string }> };
+    expect(route.request().headers()['idempotency-key']).toBe(body.clientMutationId);
+    expect(body.streams).toEqual([{ streamKind: 'mining_site', streamId: siteId }]);
+    await route.fulfill({ status: 202, json: {
+      checkpoint: { id: checkpointId, createdAt: new Date().toISOString(), createdByUserId: userId, manifestHash: 'ab'.repeat(32), streams: [{ streamKind: 'mining_site', streamId: siteId, sequence: 7, headHash: 'cd'.repeat(32) }] },
+      databaseState: 'ACCEPTED',
+      processing: { status: 'PENDING', attemptCount: 0, verification: null },
+      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 7, currentHeadStatus: 'CONSISTENT', tailStatus: 'NONE', tailEntries: 0 }] },
+      externalCommitment: 'NOT_IMPLEMENTED',
+    } });
+  });
+  await page.route(`**/api/v1/audit/checkpoints/${checkpointId}`, async (route) => {
+    getCount += 1;
+    await route.fulfill({ status: 200, json: {
+      checkpoint: { id: checkpointId, createdAt: new Date().toISOString(), createdByUserId: userId, manifestHash: 'ab'.repeat(32), streams: [{ streamKind: 'mining_site', streamId: siteId, sequence: 7, headHash: 'cd'.repeat(32) }] },
+      databaseState: 'ACCEPTED',
+      processing: { status: 'VERIFIED', attemptCount: 1, verification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', tailStatus: 'UNANCHORED', tailEntries: 1 }] } },
+      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', tailStatus: 'UNANCHORED', tailEntries: 1 }] },
+      externalCommitment: 'NOT_IMPLEMENTED',
+    } });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Email').fill('recorder@example.test');
+  await page.getByLabel('Password').fill('test-password');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByLabel('Checkpoint stream ID').fill(siteId);
+  await page.getByRole('button', { name: 'Add stream' }).click();
+  await page.getByRole('button', { name: 'Create checkpoint' }).click();
+  await expect(page.getByText('Database state: ACCEPTED. External commitment: NOT_IMPLEMENTED.')).toBeVisible();
+  await expect(page.getByText(/Live database verification: VERIFIED; manifest: VALID\./)).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh verification' }).click();
+  await expect(page.getByText(/tail unanchored \(1 entry\)/i)).toBeVisible();
+  expect(getCount).toBeGreaterThan(0);
+});

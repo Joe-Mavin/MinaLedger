@@ -74,29 +74,29 @@ export async function appendAuditEvent({ transaction, eventType, actorUserId, ac
   return { id: auditEventId, payloadCommitment: payloadCommitment.toString('hex') };
 }
 
-export async function readAuditStream(streamKind, streamId) {
+export async function readAuditStream(streamKind, streamId, transaction = undefined) {
   const rows = await sequelize.query(
     `SELECT e.stream_kind, e.stream_id, e.sequence, e.previous_hash, e.entry_hash, a.canonical_payload, a.payload_salt, a.payload_commitment, a.event_type, a.recorded_at
      FROM audit_stream_entry e JOIN audit_event a ON a.id = e.audit_event_id
      WHERE e.stream_kind = :streamKind AND e.stream_id = :streamId ORDER BY e.sequence`,
-    { replacements: { streamKind, streamId }, type: QueryTypes.SELECT },
+    { replacements: { streamKind, streamId }, type: QueryTypes.SELECT, ...(transaction ? { transaction } : {}) },
   );
   return rows.map((row) => ({ ...row, previous_hash: Buffer.from(row.previous_hash).toString('hex'), entry_hash: Buffer.from(row.entry_hash).toString('hex'), payload_salt: Buffer.from(row.payload_salt).toString('hex'), payload_commitment: Buffer.from(row.payload_commitment).toString('hex') }));
 }
 
-export function verifyAuditEntries(rows) {
-  let previousHash = ZERO_HASH;
+export function verifyAuditEntries(rows, { startingSequence = 0, startingHash = ZERO_HASH } = {}) {
+  let previousHash = startingHash;
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
     const sequence = Number(row.sequence);
-    if (sequence !== index + 1 || row.previous_hash !== previousHash) return { valid: false, failedSequence: sequence, reason: 'sequence_or_previous_hash' };
+    if (sequence !== startingSequence + index + 1 || row.previous_hash !== previousHash) return { valid: false, failedSequence: sequence, reason: 'sequence_or_previous_hash' };
     const commitment = hashPayload(row.canonical_payload, Buffer.from(row.payload_salt, 'hex')).toString('hex');
     if (commitment !== row.payload_commitment) return { valid: false, failedSequence: sequence, reason: 'payload_commitment' };
     const entryHash = hashStreamEntry({ stream_kind: row.stream_kind, stream_id: row.stream_id, sequence, previous_hash: previousHash, payload_commitment: commitment }).toString('hex');
     if (entryHash !== row.entry_hash) return { valid: false, failedSequence: sequence, reason: 'entry_hash' };
     previousHash = entryHash;
   }
-  return { valid: true, verifiedEntries: rows.length, headHash: previousHash };
+  return { valid: true, verifiedEntries: rows.length, lastSequence: startingSequence + rows.length, headHash: previousHash };
 }
 
 export async function verifyAuditStream(streamKind, streamId) {

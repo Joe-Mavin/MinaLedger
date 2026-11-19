@@ -9,7 +9,7 @@
 - IndexedDB is not encrypted or a secure vault; a person with device access may inspect queued commands and local references, and the browser may evict them. Deployment, device controls, backup, retention and lost-device procedures still need pilot/operations decisions.
 - Participant acknowledgement is a separate command attributed to the authenticated participant and is restricted by the backend to an identified participant relationship. Recorder entry does not imply acknowledgement, consent, approval or verified truth. Paper transcription remains visibly marked and can be routed to review.
 
-These controls have automated local coverage only: backend lint and 51 PostgreSQL integration tests passed; client lint/build, 2 IndexedDB unit tests and 1 Chromium browser test passed. The PWA is not deployed or field-accepted. Phase 6 ledger controls are not implemented.
+These controls have automated local coverage only: backend lint passed for 30 ES modules and the dedicated PostgreSQL suite passed 55/55, including Phase 1–5 regressions; client lint and production build passed, unit tests passed 3/3, and Chromium browser tests passed 2/2. The PWA is not deployed or field-accepted. Phase 6 checkpoints are database-only; external checkpoint custody and blockchain anchoring are not implemented.
 
 ## Phase 3 authorization status (verified 2026-11-19)
 
