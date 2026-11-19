@@ -24,6 +24,11 @@ import {
   createResidueSale, proposeResidueSaleLineRevision, decideResidueSaleLine,
   readResidueSale, adjustInventory, createRecoveryEvent, readRecoveryEvent,
 } from './modules/residue/residue.service.mjs';
+import {
+  createGoldTrade, addGoldTradeLine, readGoldTrade, recordGoldTradeMeasurement, recordGoldTradeAssay,
+  proposeGoldTradeRevision, decideGoldTradeLine, createGoldCustodyOffer, decideGoldCustodyTransfer,
+  recordGoldTradePayment, decideGoldTradePayment,
+} from './modules/gold-trades/gold-trade.service.mjs';
 import { AppError, errorHandler, validateBody } from './utils/errors.mjs';
 
 const decimal = (places) => z.string().regex(new RegExp(`^(0|[1-9][0-9]*)(\\.[0-9]{1,${places}})?$`));
@@ -265,6 +270,72 @@ const recoveryEventSchema = z.object({
   });
 });
 
+const goldTradeLineSchema = z.object({
+  batchId: z.string().uuid(), quantityGrams: positiveGrams, unitPrice: decimal(8).refine((value) => Number(value)>0, 'Unit price must be greater than zero.'),
+  deductionAmount: decimal(8).optional(), deductionReason: z.string().trim().min(1).max(500).optional(), assayRecordId: z.string().uuid().optional(),
+}).strict().superRefine((value, context) => {
+  if (value.deductionAmount && Number(value.deductionAmount)>0 && !value.deductionReason) context.addIssue({ code: 'custom', path: ['deductionReason'], message: 'A deduction requires a reason.' });
+  if ((!value.deductionAmount || Number(value.deductionAmount)===0) && value.deductionReason) context.addIssue({ code: 'custom', path: ['deductionReason'], message: 'Deduction reason requires a non-zero deduction.' });
+});
+const goldTradeSchema = z.object({
+  tradeCode: z.string().trim().min(1).max(100).optional(), tradeKind: z.enum(['PURCHASE','RESALE']),
+  sellerPartyId: z.string().uuid(), buyerPartyId: z.string().uuid(), tradeDate: dateTime,
+  currencyCode: z.string().regex(/^[A-Z]{3}$/), termsRef: z.string().trim().min(1).max(255).optional(),
+  evidence: z.object({ kind: z.enum(['TERMS','WEIGHT','ASSAY','CUSTODY','PAYMENT','OTHER']), reference: z.string().trim().min(1).max(255), note: z.string().trim().min(1).max(1000).optional(), occurredAt: dateTime }).strict().optional(),
+  lines: z.array(goldTradeLineSchema).min(1).max(40),
+}).strict();
+const goldTradeMeasurementSchema = z.object({
+  kind: z.enum(['DECLARED','MEASURED']), quantityGrams: positiveGrams, sourceValue: decimal(12), sourceUnit: z.enum(['g','kg','mg']),
+  conversionVersion: z.literal('canonical-mass-v1'), sourceRole: z.enum(['SELLER','BUYER','RECORDER','WITNESS','WEIGHER','OTHER']),
+  sourcePartyId: z.string().uuid().optional(), methodCode: z.string().trim().min(1).max(80).optional(),
+  instrumentRef: z.string().trim().min(1).max(160).optional(), occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional(),
+  supersedesMeasurementId: z.string().uuid().optional(), correctionReason: z.string().trim().min(1).max(500).optional(),
+}).strict().superRefine((value, context) => {
+  if (Boolean(value.supersedesMeasurementId)!==Boolean(value.correctionReason)) context.addIssue({ code: 'custom', path: ['correctionReason'], message: 'A measurement correction needs both a predecessor and a reason.' });
+});
+const goldTradeAssaySchema = z.object({
+  assayerPartyId: z.string().uuid().optional(), sampleRef: z.string().trim().min(1).max(160).optional(), methodRef: z.string().trim().min(1).max(160).optional(),
+  resultValue: decimal(8), resultUnit: z.string().trim().min(1).max(40), observedAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional(),
+  correctionOfId: z.string().uuid().optional(), correctionReason: z.string().trim().min(1).max(500).optional(),
+}).strict().superRefine((value, context) => {
+  if (Boolean(value.correctionOfId)!==Boolean(value.correctionReason)) context.addIssue({ code: 'custom', path: ['correctionReason'], message: 'An assay correction needs both a predecessor and a reason.' });
+});
+const goldTradeRevisionSchema = z.object({
+  quantityGrams: positiveGrams, unitPrice: decimal(8).refine((value) => Number(value)>0, 'Unit price must be greater than zero.'),
+  deductionAmount: decimal(8).optional(), deductionReason: z.string().trim().min(1).max(500).optional(),
+  correctionReason: z.string().trim().min(1).max(500), occurredAt: dateTime, assayRecordId: z.string().uuid().optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.deductionAmount && Number(value.deductionAmount)>0 && !value.deductionReason) context.addIssue({ code: 'custom', path: ['deductionReason'], message: 'A deduction requires a reason.' });
+});
+const goldTradeDecisionSchema = z.object({
+  decision: z.enum(['ACCEPT','DISPUTE','REJECT']), quantityGrams: positiveGrams.optional(), unitPrice: decimal(8).optional(),
+  deductionAmount: decimal(8).optional(), deductionReason: z.string().trim().min(1).max(500).optional(), occurredAt: dateTime,
+  reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.decision==='ACCEPT' && (!value.quantityGrams || !value.unitPrice)) context.addIssue({ code: 'custom', path: ['quantityGrams'], message: 'Acceptance requires a quantity and unit price.' });
+  if (value.decision!=='ACCEPT' && (value.quantityGrams || value.unitPrice || value.deductionAmount)) context.addIssue({ code: 'custom', path: ['decision'], message: 'A dispute or rejection does not include accepted terms.' });
+  if (value.decision!=='ACCEPT' && !value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'A dispute or rejection needs a reason.' });
+  if (value.deductionAmount && Number(value.deductionAmount)>0 && !value.deductionReason) context.addIssue({ code: 'custom', path: ['deductionReason'], message: 'An agreed deduction needs a reason.' });
+});
+const goldCustodyOfferSchema = z.object({
+  sourceLocationId: z.string().uuid(), destinationLocationId: z.string().uuid(), measurementSetId: z.string().uuid(), measurementId: z.string().uuid(),
+  quantityGrams: positiveGrams, occurredAt: dateTime, evidenceRef: z.string().trim().min(1).max(255).optional(),
+}).strict();
+const goldPaymentSchema = z.object({
+  amount: decimal(8).refine((value) => Number(value)>0, 'Payment amount must be greater than zero.'),
+  methodCode: z.string().trim().min(1).max(40), reference: z.string().trim().min(1).max(160).optional(),
+  evidenceRef: z.string().trim().min(1).max(255).optional(), occurredAt: dateTime,
+}).strict();
+const goldPaymentDecisionSchema = z.object({
+  decision: z.enum(['CONFIRM','DISPUTE','FAIL','REVERSE']), amount: decimal(8).optional(),
+  methodCode: z.string().trim().min(1).max(40).optional(), reference: z.string().trim().min(1).max(160).optional(),
+  reason: z.string().trim().min(1).max(500).optional(), evidenceRef: z.string().trim().min(1).max(255).optional(), occurredAt: dateTime,
+}).strict().superRefine((value, context) => {
+  if (value.decision==='REVERSE' && (!value.amount || !value.reason)) context.addIssue({ code: 'custom', path: ['amount'], message: 'A reversal needs an amount and reason.' });
+  if (value.decision!=='REVERSE' && value.amount) context.addIssue({ code: 'custom', path: ['amount'], message: 'Amount is supplied only for a reversal.' });
+  if (value.decision==='DISPUTE' || value.decision==='FAIL') if (!value.reason) context.addIssue({ code: 'custom', path: ['reason'], message: 'A disputed or failed payment needs a reason.' });
+});
+
 function requireIdempotencyKey(req, res, next) {
   const key = req.get('idempotency-key');
   if (!key) return next(new AppError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'Provide an Idempotency-Key UUID for this command.'));
@@ -446,6 +517,40 @@ app.get('/api/v1/inventory/locations/:locationId/balances', requireUuidParams('l
 }));
 app.post('/api/v1/inventory/locations/:locationId/adjustments', requireUuidParams('locationId'), requireIdempotencyKey, validateBody(adjustmentSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await adjustInventory(req.params.locationId, req.body, req.auth, req.get('idempotency-key')));
+}));
+
+app.post('/api/v1/gold-trades', requireIdempotencyKey, validateBody(goldTradeSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createGoldTrade(req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/gold-trades/:tradeId', requireUuidParams('tradeId'), asyncRoute(async (req, res) => {
+  return res.json(await readGoldTrade(req.params.tradeId, req.auth));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines', requireUuidParams('tradeId'), requireIdempotencyKey, validateBody(goldTradeLineSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await addGoldTradeLine(req.params.tradeId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines/:lineId/measurements', requireUuidParams('tradeId','lineId'), requireIdempotencyKey, validateBody(goldTradeMeasurementSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await recordGoldTradeMeasurement(req.params.tradeId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines/:lineId/assays', requireUuidParams('tradeId','lineId'), requireIdempotencyKey, validateBody(goldTradeAssaySchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await recordGoldTradeAssay(req.params.tradeId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines/:lineId/revisions', requireUuidParams('tradeId','lineId'), requireIdempotencyKey, validateBody(goldTradeRevisionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await proposeGoldTradeRevision(req.params.tradeId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines/:lineId/decisions', requireUuidParams('tradeId','lineId'), requireIdempotencyKey, validateBody(goldTradeDecisionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await decideGoldTradeLine(req.params.tradeId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/lines/:lineId/custody-offers', requireUuidParams('tradeId','lineId'), requireIdempotencyKey, validateBody(goldCustodyOfferSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await createGoldCustodyOffer(req.params.tradeId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/custody-transfers/:transferId/decisions', requireUuidParams('tradeId','transferId'), requireIdempotencyKey, validateBody(custodyDecisionSchema), asyncRoute(async (req, res) => {
+  return res.status(200).json(await decideGoldCustodyTransfer(req.params.tradeId, req.params.transferId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/payments', requireUuidParams('tradeId'), requireIdempotencyKey, validateBody(goldPaymentSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await recordGoldTradePayment(req.params.tradeId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.post('/api/v1/gold-trades/:tradeId/payments/:paymentId/decisions', requireUuidParams('tradeId','paymentId'), requireIdempotencyKey, validateBody(goldPaymentDecisionSchema), asyncRoute(async (req, res) => {
+  return res.status(201).json(await decideGoldTradePayment(req.params.tradeId, req.params.paymentId, req.body, req.auth, req.get('idempotency-key')));
 }));
 
 app.post('/api/v1/consignments', requireIdempotencyKey, validateBody(consignmentSchema), asyncRoute(async (req, res) => {

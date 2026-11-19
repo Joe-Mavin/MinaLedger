@@ -147,7 +147,7 @@ after(async () => {
 });
 
 test('PostgreSQL foundation integrity and API integration', async (t) => {
-  await t.test('Phase 2 and Phase 3 integrity migrations roll back and reapply before use', async () => {
+  await t.test('Phase 2, Phase 3 and Phase 4 integrity migrations roll back and reapply before use', async () => {
     const rollbackSql = await readFile(new URL('../src/database/rollback/003_phase_two_integrity.sql', import.meta.url), 'utf8');
     const migrationSql = await readFile(new URL('../src/database/migrations/003_phase_two_integrity.sql', import.meta.url), 'utf8');
     const rollbackProbe = new Error('migration rollback probe');
@@ -185,6 +185,21 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       AND ((table_name='consignment_receipt_item' AND column_name IN ('supersedes_receipt_item_id','correction_reason'))
         OR (table_name='residue_sale_line' AND column_name='resolves_decision_mismatch')) ORDER BY table_name,column_name`, {}, undefined, QueryTypes.SELECT);
     assert.equal(correctionColumns.length, 3);
+
+    const rollbackSix = await readFile(new URL('../src/database/rollback/006_phase_four_gold_trades.sql', import.meta.url), 'utf8');
+    const migrationSix = await readFile(new URL('../src/database/migrations/006_phase_four_gold_trades.sql', import.meta.url), 'utf8');
+    const phaseFourRollbackProbe = new Error('Phase 4 migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackSix, { transaction, raw: true });
+      await sequelize.query(migrationSix, { transaction, raw: true });
+      throw phaseFourRollbackProbe;
+    }), (error) => error === phaseFourRollbackProbe);
+    const phaseFourColumns = await db(`SELECT column_name FROM information_schema.columns WHERE table_schema='public'
+      AND table_name='gold_trade' AND column_name IN ('trade_date','created_by_user_id','status') ORDER BY column_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseFourColumns.map((row) => row.column_name), ['created_by_user_id','status','trade_date']);
+    const phaseFourCustodyColumns = await db(`SELECT column_name FROM information_schema.columns WHERE table_schema='public'
+      AND table_name='custody_transfer' AND column_name IN ('gold_trade_line_id','quantity_g','measurement_set_id','measurement_id') ORDER BY column_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseFourCustodyColumns.map((row) => row.column_name), ['gold_trade_line_id','measurement_id','measurement_set_id','quantity_g']);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -248,6 +263,8 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'MINING_OPERATOR','ORGANISATION',:orgId)`, { id: randomUUID(), userId: orgUser.userId, orgId: ids.organisationId });
     await db(`INSERT INTO site_party_role(id,site_id,party_id,role_code,asserted_by_user_id) VALUES (:id,:siteId,:partyId,'SITE_OPERATOR',:actor)`, { id: randomUUID(), siteId: ids.siteBId, partyId: ids.organisationId, actor: ids.adminUserId });
     ids.orgToken = testToken(orgUser.userId);
+    ids.orgUserId = orgUser.userId;
+    ids.orgUserPartyId = orgUser.partyId;
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteBId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 200);
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.orgToken}`)).status, 403);
     const orgSites = await request(app).get('/api/v1/sites').set('Authorization', `Bearer ${ids.orgToken}`);
@@ -1787,27 +1804,38 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(auditAfter.total, auditBefore.total);
 
     const commercialLocation = await createLocation('FICTIONAL-COMMERCIAL-SOURCE');
-    await createOpeningBalance(ids.batchId, commercialLocation, '10.000000');
+    const [tradeBatch] = await db(`SELECT batch_id FROM recovery_event_output WHERE recovery_event_id=:eventId AND output_role='RECOVERED_GOLD' LIMIT 1`, { eventId: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+    const tradeBatchId = tradeBatch.batch_id;
+    await createOpeningBalance(tradeBatchId, commercialLocation, '10.000000');
     const buyerPartyId = ids.organisationId;
-    const sellerPartyId = ids.minerPartyId;
-    const tradeId = randomUUID();
-    const tradeLineId = randomUUID();
-    const tradeMeasurementSetId = randomUUID();
-    const tradeMeasurementId = randomUUID();
-    await sequelize.transaction(async (transaction) => {
-      await db(`INSERT INTO gold_trade(id,trade_code,trade_kind,buyer_party_id,seller_party_id,agreed_at,currency_code) VALUES (:id,'FICTIONAL-TRADE','PURCHASE',:buyer,:seller,:at,'USD')`, { id: tradeId, buyer: buyerPartyId, seller: sellerPartyId, at: happenedAt }, transaction);
-      await db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,accepted_trade_quantity_g,is_accepted) VALUES (:id,:tradeId,:batchId,1,'ORIGINAL','2.000000','2.000000',true)`, { id: tradeLineId, tradeId, batchId: ids.batchId }, transaction);
-      await db(`INSERT INTO material_measurement_set(id,batch_id,gold_trade_line_id) VALUES (:id,:batchId,:lineId)`, { id: tradeMeasurementSetId, batchId: ids.batchId, lineId: tradeLineId }, transaction);
-      await db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed) VALUES (:id,:setId,'MEASURED','2.000000','2','g','test-v1','SELLER',:partyId,:userId,:at)`, { id: tradeMeasurementId, setId: tradeMeasurementSetId, partyId: sellerPartyId, userId: ids.siteUserId, at: happenedAt }, transaction);
+    const sellerPartyId = ids.adminPartyId;
+    await db(`INSERT INTO party_participation(id,party_id,participant_kind) VALUES (:id,:partyId,'LOCAL_MERCHANT')`, { id: randomUUID(), partyId: buyerPartyId });
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'LOCAL_MERCHANT','ORGANISATION',:scopeId)`, { id: randomUUID(), userId: ids.orgUserId, scopeId: buyerPartyId });
+    const tradeDate = new Date(Date.now() + 60_000).toISOString();
+    const createdTrade = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({
+      tradeKind: 'PURCHASE', sellerPartyId, buyerPartyId, tradeDate, currencyCode: 'USD',
+      lines: [{ batchId: tradeBatchId, quantityGrams: '2.000000', unitPrice: '1.00000000' }],
     });
-    const overCap = await createMeasuredConsignment(ids.batchId, '3.000000', 'TRADE-OVER-CAP');
+    assert.equal(createdTrade.status, 201, createdTrade.text);
+    const tradeId = createdTrade.body.id;
+    const proposalLineId = createdTrade.body.lines[0].id;
+    const measured = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${proposalLineId}/measurements`).set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'MEASURED', quantityGrams: '2.000000', sourceValue: '2', sourceUnit: 'g', conversionVersion: 'canonical-mass-v1', sourceRole: 'SELLER', occurredAt: tradeDate,
+    });
+    assert.equal(measured.status, 201, measured.text);
+    const firstAcceptance = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${proposalLineId}/decisions`).set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', quantityGrams: '2.000000', unitPrice: '1.00000000', occurredAt: tradeDate });
+    assert.equal(firstAcceptance.status, 201, firstAcceptance.text);
+    const secondAcceptance = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${proposalLineId}/decisions`).set('Authorization', `Bearer ${ids.orgToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', quantityGrams: '2.000000', unitPrice: '1.00000000', occurredAt: tradeDate });
+    assert.equal(secondAcceptance.status, 201, secondAcceptance.text);
+    const tradeLineId = secondAcceptance.body.acceptedLineId;
+    const overCap = await createMeasuredConsignment(tradeBatchId, '3.000000', 'TRADE-OVER-CAP');
     await assert.rejects(postTransfer({ lines: [
       { ...overCap.out, locationId: commercialLocation, goldTradeLineId: tradeLineId }, overCap.in,
     ], occurredAt: happenedAt }, { userId: ids.siteUserId, personPartyId: ids.siteUserPartyId }, randomUUID()));
     const [netOut] = await db(`SELECT COALESCE(sum(posted_quantity_g),0)::NUMERIC(20,6) AS quantity_g FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id WHERE m.current_status='ACCEPTED' AND ml.gold_trade_line_id=:lineId`, { lineId: tradeLineId }, undefined, QueryTypes.SELECT);
     assert.equal(netOut.quantity_g, '0.000000');
 
-    const acceptedConsignment = await createMeasuredConsignment(ids.batchId, '2.000000', 'TRADE-ACCEPTED');
+    const acceptedConsignment = await createMeasuredConsignment(tradeBatchId, '2.000000', 'TRADE-ACCEPTED');
     const acceptedTransfer = await postTransfer({ lines: [
       { ...acceptedConsignment.out, locationId: commercialLocation, goldTradeLineId: tradeLineId }, acceptedConsignment.in,
     ], occurredAt: happenedAt }, { userId: ids.siteUserId, personPartyId: ids.siteUserPartyId }, randomUUID());
@@ -1822,7 +1850,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       await db(`INSERT INTO inventory_movement_line(id,inventory_movement_id,batch_id,location_id,direction,posted_quantity_g,reverses_line_id,line_no)
         VALUES (:outId,:movementId,:batchId,:sourceId,'IN','1.000000',:originalOut,1),
                (:inId,:movementId,:batchId,:destinationId,'OUT','1.000000',:originalIn,2)`, {
-        outId: randomUUID(), inId: randomUUID(), movementId: reversalId, batchId: ids.batchId,
+        outId: randomUUID(), inId: randomUUID(), movementId: reversalId, batchId: tradeBatchId,
         sourceId: originalOut.location_id, destinationId: originalIn.location_id,
         originalOut: originalOut.id, originalIn: originalIn.id,
       }, transaction);
@@ -1830,39 +1858,233 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       await db('SET CONSTRAINTS ALL IMMEDIATE', {}, transaction);
     });
 
-    const correctionId = randomUUID();
-    await db(`UPDATE gold_trade_line SET is_accepted=false WHERE id=:id`, { id: tradeLineId });
     await assert.rejects(sequelize.transaction(async (transaction) => {
       await db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,accepted_trade_quantity_g,is_accepted,supersedes_line_id,correction_reason)
-        VALUES (:id,:tradeId,:batchId,2,'CORRECTION','0.500000','0.500000',true,:previousId,'Lowered acceptance test')`, {
-        id: randomUUID(), tradeId, batchId: ids.batchId, previousId: tradeLineId,
+        VALUES (:id,:tradeId,:batchId,4,'CORRECTION','0.500000','0.500000',true,:previousId,'Lowered acceptance test')`, {
+        id: randomUUID(), tradeId, batchId: tradeBatchId, previousId: tradeLineId,
       }, transaction);
     }), sqlError('23514'));
-    const correctionMeasurementSetId = randomUUID();
-    await sequelize.transaction(async (transaction) => {
-      await db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,accepted_trade_quantity_g,is_accepted,supersedes_line_id,correction_reason)
-        VALUES (:id,:tradeId,:batchId,2,'CORRECTION','1.000000','1.000000',true,:previousId,'Accepted quantity corrected after partial reversal')`, {
-        id: correctionId, tradeId, batchId: ids.batchId, previousId: tradeLineId,
-      }, transaction);
-      await db(`INSERT INTO material_measurement_set(id,batch_id,gold_trade_line_id) VALUES (:id,:batchId,:lineId)`, { id: correctionMeasurementSetId, batchId: ids.batchId, lineId: correctionId }, transaction);
-      await db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
-        VALUES (:id,:setId,'MEASURED','1.000000','1','g','test-v1','SELLER',:partyId,:userId,:at)`, {
-        id: randomUUID(), setId: correctionMeasurementSetId, partyId: sellerPartyId, userId: ids.siteUserId, at: happenedAt,
-      }, transaction);
-    });
-    const postCorrectionOverCap = await createMeasuredConsignment(ids.batchId, '1.500000', 'TRADE-CORRECTION-OVER-CAP');
+    const postCorrectionOverCap = await createMeasuredConsignment(tradeBatchId, '1.500000', 'TRADE-CORRECTION-OVER-CAP');
     await assert.rejects(postTransfer({ lines: [
-      { ...postCorrectionOverCap.out, locationId: commercialLocation, goldTradeLineId: correctionId }, postCorrectionOverCap.in,
+      { ...postCorrectionOverCap.out, locationId: commercialLocation, goldTradeLineId: tradeLineId }, postCorrectionOverCap.in,
     ], occurredAt: happenedAt }, { userId: ids.siteUserId, personPartyId: ids.siteUserPartyId }, randomUUID()), sqlError('23514'));
 
     const commercialBalances = await db(`SELECT location_id,quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id IN (:sourceId,:destinationId) ORDER BY location_id`, {
-      batchId: ids.batchId, sourceId: commercialLocation, destinationId: acceptedConsignment.transitLocationId,
+      batchId: tradeBatchId, sourceId: commercialLocation, destinationId: acceptedConsignment.transitLocationId,
     }, undefined, QueryTypes.SELECT);
     assert.equal(commercialBalances.find((row) => row.location_id === commercialLocation).quantity_g, '9.000000');
     assert.equal(commercialBalances.find((row) => row.location_id === acceptedConsignment.transitLocationId).quantity_g, '1.000000');
     await assert.rejects(db(`UPDATE gold_trade SET currency_code='KES' WHERE id=:id`, { id: tradeId }), sqlError('55000'));
     await assert.rejects(db(`INSERT INTO payment(id,gold_trade_id,currency_code,payer_party_id,payee_party_id) VALUES (:id,:tradeId,'KES',:buyer,:seller)`, { id: randomUUID(), tradeId, buyer: buyerPartyId, seller: sellerPartyId }), sqlError('23503'));
     await assert.rejects(db(`INSERT INTO payment(id,gold_trade_id,currency_code,payer_party_id,payee_party_id) VALUES (:id,:tradeId,'USD',:unrelated,:seller)`, { id: randomUUID(), tradeId, unrelated: ids.adminPartyId, seller: sellerPartyId }), sqlError('23514'));
+  });
+
+  await t.test('Phase 4 recovered-gold trade, bilateral terms, custody journal, payment reconciliation and authorization', async () => {
+    const [recovered] = await db(`SELECT ro.batch_id,location.custodian_party_id AS seller_party_id,ril.inventory_location_id AS source_location_id
+      FROM recovery_event_output ro JOIN recovery_event re ON re.event_id=ro.recovery_event_id
+      JOIN recovery_inventory_location ril ON ril.recovery_facility_id=re.recovery_facility_id
+      JOIN inventory_location location ON location.id=ril.inventory_location_id
+      JOIN inventory_balance b ON b.location_id=ril.inventory_location_id AND b.batch_id=ro.batch_id AND b.quantity_g>0
+      WHERE ro.recovery_event_id=:eventId AND ro.output_role='RECOVERED_GOLD' LIMIT 1`, { eventId: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+    assert.ok(recovered, 'the recovery output is available at the recovery facility inventory location');
+    const sellerPartyId = recovered.seller_party_id;
+    const sellerToken = ids.phaseThree.recoveryToken;
+    const buyerPartyId = await seedParty('ORGANISATION', 'Fictional Gold Merchant', 'LOCAL_MERCHANT');
+    await db(`INSERT INTO party_participation(id,party_id,participant_kind) VALUES (:id,:partyId,'LOCAL_MERCHANT')`, { id: randomUUID(), partyId: buyerPartyId });
+    const buyer = await seedUser('gold-buyer@example.test', 'Fictional Gold Buyer', { roleCode: 'LOCAL_MERCHANT', scopeKind: 'ORGANISATION', scopeId: buyerPartyId });
+    await db(`INSERT INTO organisation_membership(id,person_party_id,organisation_party_id,membership_type) VALUES (:id,:person,:org,'MEMBER')`, { id: randomUUID(), person: buyer.partyId, org: buyerPartyId });
+    const buyerToken = testToken(buyer.userId);
+    const buyerLocationId = randomUUID();
+    await sequelize.transaction(async (transaction) => {
+      await db(`INSERT INTO inventory_location(id,location_code,location_kind,custodian_party_id) VALUES (:id,'FICTIONAL-GOLD-MERCHANT-LOCATION','MERCHANT',:partyId)`, { id: buyerLocationId, partyId: buyerPartyId }, transaction);
+      await db(`INSERT INTO merchant_inventory_location(inventory_location_id,merchant_party_id) VALUES (:id,:partyId)`, { id: buyerLocationId, partyId: buyerPartyId }, transaction);
+    });
+    const tradeDate = new Date(Date.now() + 60_000).toISOString();
+    const proposalBody = {
+      tradeCode: 'FICTIONAL-RECOVERED-GOLD-TRADE', tradeKind: 'PURCHASE', sellerPartyId, buyerPartyId, tradeDate,
+      currencyCode: 'KES', termsRef: 'FICTIONAL-TERMS-01',
+      evidence: { kind: 'TERMS', reference: 'FICTIONAL-TERMS-EVIDENCE', occurredAt: tradeDate },
+      lines: [{ batchId: recovered.batch_id, quantityGrams: '0.055000', unitPrice: '2400.00000000' }],
+    };
+    const unauthorized = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send(proposalBody);
+    assert.equal(unauthorized.status, 404, unauthorized.text);
+    const invalidMaterial = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({ ...proposalBody, tradeCode: 'FICTIONAL-NON-GOLD-TRADE', lines: [{ batchId: ids.batchId, quantityGrams: '0.001000', unitPrice: '1.00000000' }] });
+    assert.equal(invalidMaterial.status, 400, invalidMaterial.text);
+    const insufficient = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({ ...proposalBody, tradeCode: 'FICTIONAL-INSUFFICIENT-TRADE', lines: [{ batchId: recovered.batch_id, quantityGrams: '1.000000', unitPrice: '1.00000000' }] });
+    assert.equal(insufficient.status, 409, insufficient.text);
+    const tradeMutationId = randomUUID();
+    const created = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', tradeMutationId).send(proposalBody);
+    assert.equal(created.status, 201, created.text);
+    const tradeId = created.body.id;
+    const replay = await request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', tradeMutationId).send(proposalBody);
+    assert.equal(replay.status, 201, replay.text);
+    assert.equal(replay.body.id, tradeId);
+    assert.equal(replay.body.replayed, true);
+    const initialLineId = created.body.lines[0].id;
+
+    const sellerDeclared = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/measurements`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'DECLARED', quantityGrams: '0.055000', sourceValue: '55.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'SELLER', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-SELLER-WEIGHT',
+    });
+    assert.equal(sellerDeclared.status, 201, sellerDeclared.text);
+    const sellerCorrection = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/measurements`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'DECLARED', quantityGrams: '0.054000', sourceValue: '54.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'SELLER', occurredAt: tradeDate,
+      supersedesMeasurementId: sellerDeclared.body.id, correctionReason: 'Fictional scale transcription corrected against the original ticket.',
+    });
+    assert.equal(sellerCorrection.status, 201, sellerCorrection.text);
+    const buyerDeclared = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/measurements`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'DECLARED', quantityGrams: '0.052000', sourceValue: '52.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'BUYER', occurredAt: tradeDate,
+    });
+    assert.equal(buyerDeclared.status, 201, buyerDeclared.text);
+    const buyerMeasured = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/measurements`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'MEASURED', quantityGrams: '0.050000', sourceValue: '50.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'BUYER', methodCode: 'FICTIONAL-SCALE', instrumentRef: 'SCALE-TEST-01', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-BUYER-WEIGHT',
+    });
+    assert.equal(buyerMeasured.status, 201, buyerMeasured.text);
+    const invalidConversion = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/measurements`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'MEASURED', quantityGrams: '0.050000', sourceValue: '51.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'BUYER', occurredAt: tradeDate,
+    });
+    assert.equal(invalidConversion.status, 400);
+    const assay = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/assays`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      assayerPartyId: sellerPartyId, sampleRef: 'SAMPLE-01', methodRef: 'RECORDED-FIRE-ASSAY', resultValue: '92.50000000', resultUnit: 'PERCENT', observedAt: tradeDate, evidenceRef: 'FICTIONAL-ASSAY-REPORT',
+    });
+    assert.equal(assay.status, 201, assay.text);
+    assert.equal(assay.body.status, 'RECORDED');
+    assert.notEqual(assay.body.status, 'VERIFIED');
+    const assayCorrection = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/assays`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      assayerPartyId: sellerPartyId, sampleRef: 'SAMPLE-01-CORRECTED', methodRef: 'RECORDED-FIRE-ASSAY', resultValue: '93.00000000', resultUnit: 'PERCENT', observedAt: tradeDate,
+      correctionOfId: assay.body.id, correctionReason: 'Fictional transcription correction; prior result remains visible.', evidenceRef: 'FICTIONAL-ASSAY-CORRECTION',
+    });
+    assert.equal(assayCorrection.status, 201, assayCorrection.text);
+
+    const sellerAccept = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      decision: 'ACCEPT', quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
+    });
+    assert.equal(sellerAccept.status, 201, sellerAccept.text);
+    const duplicateDecision = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      decision: 'ACCEPT', quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
+    });
+    assert.equal(duplicateDecision.status, 409, duplicateDecision.text);
+    const mismatchedBuyerAccept = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      decision: 'ACCEPT', quantityGrams: '0.049000', unitPrice: '2600.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
+    });
+    assert.equal(mismatchedBuyerAccept.status, 201, mismatchedBuyerAccept.text);
+    assert.equal(mismatchedBuyerAccept.body.status, 'DISPUTED');
+    assert.equal((await db(`SELECT count(*)::int AS total FROM gold_trade_line WHERE trade_id=:tradeId AND is_accepted`, { tradeId }, undefined, QueryTypes.SELECT))[0].total, 0);
+    const revision = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/revisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction',
+      correctionReason: 'Counterparties submit a fresh shared price proposal.', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-REVISED-TERMS',
+    });
+    assert.equal(revision.status, 201, revision.text);
+    const sellerFreshAccept = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${revision.body.id}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      decision: 'ACCEPT', quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
+    });
+    assert.equal(sellerFreshAccept.status, 201, sellerFreshAccept.text);
+    assert.equal((await db(`SELECT status FROM gold_trade WHERE id=:id`, { id: tradeId }, undefined, QueryTypes.SELECT))[0].status, 'PROPOSED');
+    assert.equal((await db(`SELECT is_accepted FROM gold_trade_line WHERE id=:id`, { id: revision.body.id }, undefined, QueryTypes.SELECT))[0].is_accepted, false);
+    const buyerFreshAccept = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${revision.body.id}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      decision: 'ACCEPT', quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
+    });
+    assert.equal(buyerFreshAccept.status, 201, buyerFreshAccept.text);
+    assert.equal(buyerFreshAccept.body.status, 'AGREED');
+    const acceptedLineId = buyerFreshAccept.body.acceptedLineId;
+    const acceptedMeasurement = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/measurements`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({
+      kind: 'MEASURED', quantityGrams: '0.050000', sourceValue: '50.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'BUYER', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-AGREED-WEIGHT',
+    });
+    assert.equal(acceptedMeasurement.status, 201, acceptedMeasurement.text);
+    const [acceptedMeasurementSet] = await db(`SELECT id FROM material_measurement_set WHERE gold_trade_line_id=:lineId`, { lineId: acceptedLineId }, undefined, QueryTypes.SELECT);
+    const recordCustodyMeasurement = async (quantityGrams, sourceValue, evidenceRef) => {
+      const observation = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/measurements`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+        kind: 'MEASURED', quantityGrams, sourceValue, sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1', sourceRole: 'SELLER', methodCode: 'CUSTODY_HANDOVER', occurredAt: tradeDate, evidenceRef,
+      });
+      assert.equal(observation.status, 201, observation.text);
+      return observation.body.id;
+    };
+    const inexactHandover = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: acceptedMeasurement.body.id,
+      quantityGrams: '0.020000', occurredAt: tradeDate,
+    });
+    assert.equal(inexactHandover.status, 400, inexactHandover.text);
+    assert.equal(inexactHandover.body.error.code, 'CUSTODY_MEASUREMENT_MISMATCH');
+    const firstHandoverMeasurementId = await recordCustodyMeasurement('0.020000', '20.000', 'FICTIONAL-HANDOVER-WEIGHT');
+
+    const offered = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: firstHandoverMeasurementId,
+      quantityGrams: '0.020000', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-HANDOVER-OFFER',
+    });
+    assert.equal(offered.status, 201, offered.text);
+    const custodyDecisionKey = randomUUID();
+    const acceptedHandover = await request(app).post(`/api/v1/gold-trades/${tradeId}/custody-transfers/${offered.body.id}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', custodyDecisionKey).send({ decision: 'ACCEPT', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-HANDOVER-ACK' });
+    assert.equal(acceptedHandover.status, 200, acceptedHandover.text);
+    assert.ok(acceptedHandover.body.inventoryMovementId);
+    const custodyRetry = await request(app).post(`/api/v1/gold-trades/${tradeId}/custody-transfers/${offered.body.id}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', custodyDecisionKey).send({ decision: 'ACCEPT', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-HANDOVER-ACK' });
+    assert.equal(custodyRetry.status, 200, custodyRetry.text);
+    assert.equal(custodyRetry.body.inventoryMovementId, acceptedHandover.body.inventoryMovementId);
+    const [transferLines] = await db(`SELECT count(*)::int AS total FROM inventory_movement_line WHERE inventory_movement_id=:movementId`, { movementId: acceptedHandover.body.inventoryMovementId }, undefined, QueryTypes.SELECT);
+    assert.equal(transferLines.total, 2);
+    const [handoverMeasurement] = await db(`SELECT mm.quantity_g FROM inventory_movement_line ml JOIN material_measurement mm ON mm.id=ml.basis_measurement_id WHERE ml.inventory_movement_id=:movementId AND ml.direction='OUT'`, { movementId: acceptedHandover.body.inventoryMovementId }, undefined, QueryTypes.SELECT);
+    assert.equal(handoverMeasurement.quantity_g, '0.020000');
+    const [inventoryBalance] = await db(`SELECT quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id=:locationId`, { batchId: recovered.batch_id, locationId: buyerLocationId }, undefined, QueryTypes.SELECT);
+    assert.equal(inventoryBalance.quantity_g, '0.020000');
+    const disputedMeasurementId = await recordCustodyMeasurement('0.010000', '10.000', 'FICTIONAL-DISPUTED-HANDOVER-WEIGHT');
+    const disputedOffer = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: disputedMeasurementId,
+      quantityGrams: '0.010000', occurredAt: tradeDate,
+    });
+    assert.equal(disputedOffer.status, 201, disputedOffer.text);
+    const disputedHandover = await request(app).post(`/api/v1/gold-trades/${tradeId}/custody-transfers/${disputedOffer.body.id}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'DISPUTE', occurredAt: tradeDate, reason: 'Fictional scale readings differ.' });
+    assert.equal(disputedHandover.status, 200, disputedHandover.text);
+    assert.equal(disputedHandover.body.status, 'DISPUTED');
+    const raceMeasurementIds = await Promise.all(['RACE-A','RACE-B'].map((suffix) => recordCustodyMeasurement('0.020000', '20.000', `FICTIONAL-CUSTODY-WEIGHT-${suffix}`)));
+    const raceOffers = await Promise.all(['RACE-A','RACE-B'].map((suffix, index) => request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: raceMeasurementIds[index],
+      quantityGrams: '0.020000', occurredAt: tradeDate, evidenceRef: `FICTIONAL-CUSTODY-${suffix}`,
+    })));
+    assert.deepEqual(raceOffers.map((response) => response.status), [201,201]);
+    const raceDecisions = await Promise.all(raceOffers.map((response) => request(app).post(`/api/v1/gold-trades/${tradeId}/custody-transfers/${response.body.id}/decisions`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'ACCEPT', occurredAt: tradeDate })));
+    assert.equal(raceDecisions.filter((response) => response.status === 200).length, 1);
+    assert.equal(raceDecisions.filter((response) => response.status !== 200).length, 1);
+    const [merchantBalanceAfterRace] = await db(`SELECT quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id=:locationId`, { batchId: recovered.batch_id, locationId: buyerLocationId }, undefined, QueryTypes.SELECT);
+    assert.equal(merchantBalanceAfterRace.quantity_g, '0.040000');
+    const insufficientMeasurementId = await recordCustodyMeasurement('0.190000', '190.000', 'FICTIONAL-INVENTORY-OVERDRAW-WEIGHT');
+    const insufficientHandover = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+      sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: insufficientMeasurementId,
+      quantityGrams: '0.190000', occurredAt: tradeDate,
+    });
+    assert.equal(insufficientHandover.status, 409, insufficientHandover.text);
+
+    const unauthorizedPayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments`).set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({ amount: '1.00000000', methodCode: 'CASH_RECORDED', occurredAt: tradeDate });
+    assert.equal(unauthorizedPayment.status, 404);
+    const paymentMutationKey = randomUUID();
+    const firstPayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', paymentMutationKey).send({ amount: '20.00000000', methodCode: 'CASH_RECORDED', reference: 'FICTIONAL-CASH-01', occurredAt: tradeDate });
+    assert.equal(firstPayment.status, 201, firstPayment.text);
+    const duplicatePayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', paymentMutationKey).send({ amount: '20.00000000', methodCode: 'CASH_RECORDED', reference: 'FICTIONAL-CASH-01', occurredAt: tradeDate });
+    assert.equal(duplicatePayment.status, 201, duplicatePayment.text);
+    assert.equal(duplicatePayment.body.id, firstPayment.body.id);
+    assert.equal(duplicatePayment.body.replayed, true);
+    const disputedPayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments/${firstPayment.body.id}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'DISPUTE', occurredAt: tradeDate, reason: 'Fictional receipt confirmation is pending.' });
+    assert.equal(disputedPayment.status, 201, disputedPayment.text);
+    const confirmedPayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments/${firstPayment.body.id}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'CONFIRM', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-RECEIPT-01' });
+    assert.equal(confirmedPayment.status, 201, confirmedPayment.text);
+    for (const [amount, reference] of [['50.00000000','FICTIONAL-CASH-02'],['50.00000000','FICTIONAL-CASH-03']]) {
+      const payment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({ amount, methodCode: 'BANK_TRANSFER_RECORDED', reference, occurredAt: tradeDate });
+      assert.equal(payment.status, 201, payment.text);
+      const confirmation = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments/${payment.body.id}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({ decision: 'CONFIRM', occurredAt: tradeDate });
+      assert.equal(confirmation.status, 201, confirmation.text);
+    }
+    const overpayment = await request(app).post(`/api/v1/gold-trades/${tradeId}/payments`).set('Authorization', `Bearer ${buyerToken}`).set('Idempotency-Key', randomUUID()).send({ amount: '0.01000000', methodCode: 'CASH_RECORDED', occurredAt: tradeDate });
+    assert.equal(overpayment.status, 409, overpayment.text);
+    const reconciliation = await request(app).get(`/api/v1/gold-trades/${tradeId}`).set('Authorization', `Bearer ${buyerToken}`);
+    assert.equal(reconciliation.status, 200, reconciliation.text);
+    assert.equal(reconciliation.body.status, 'AGREED');
+    assert.equal(reconciliation.body.reconciliation.amountAgreed, '120.00000000');
+    assert.equal(reconciliation.body.reconciliation.amountSettled, '120.00000000');
+    assert.equal(reconciliation.body.reconciliation.amountOutstanding, '0.00000000');
+    assert.deepEqual(reconciliation.body.reconciliation.unresolvedPaymentReports, []);
+    assert.ok(reconciliation.body.assays.some((item) => item.id === assay.body.id));
+    assert.ok(reconciliation.body.assays.some((item) => item.correction_of_id === assay.body.id));
+    assert.ok(reconciliation.body.lines.find((line) => line.id === initialLineId).measurements.some((item) => item.id === sellerDeclared.body.id));
+    assert.ok(reconciliation.body.lines.find((line) => line.id === initialLineId).measurements.some((item) => item.supersedes_measurement_id === sellerDeclared.body.id));
+    assert.equal((await request(app).get(`/api/v1/gold-trades/${tradeId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 404);
+    assert.equal((await verifyAuditStream('gold_trade', tradeId)).valid, true);
   });
 
   await t.test('append-only per-aggregate audit chains verify sequence, payload, and concurrent appends', async () => {

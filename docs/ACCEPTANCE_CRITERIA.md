@@ -2,7 +2,7 @@
 
 ## Current status
 
-The PostgreSQL backend currently passes `npm run lint` for 23 ES modules and the complete integration suite with 47 tests, 47 passed and 0 failed. Phase 3 covers 31 nested scenarios for stockpiling/pooling, sale decisions, consignment, transport, custody, dispatch/receipt, recovery inventory and genealogy; the combined suite also covers Phase 1/2 integrity and regression cases. Migrations 003, 004 and 005 rollback/reapplication is verified. Criteria below that concern payments, merchant gold trading, frontend/offline workflows, production rollout, broad pilot acceptance or blockchain remain future work unless the implementation status above explicitly says otherwise.
+The PostgreSQL backend currently passes `npm run lint` for 24 ES modules and the complete integration suite with **48 tests, 48 passed and 0 failed** (verified 2026-11-19 on the dedicated `_test` database). The suite covers 31 nested Phase 3 scenarios, Phase 4 recovered-gold trade and settlement behavior, and Phase 1/2 integrity/regression cases. Migrations 003, 004, 005 and 006 rollback/reapplication is verified. Phase 4 backend criteria for gold trades are implemented and tested; residue-sale payment endpoints, full gold aggregation workflows, frontend/offline workflows, production rollout, broad pilot acceptance and blockchain remain incomplete.
 
 ## Domain coverage
 
@@ -25,6 +25,8 @@ The PostgreSQL backend currently passes `npm run lint` for 23 ES modules and the
 - **AC-08b — Payment currency integrity:** each parent transaction has one currency; a PostgreSQL `BEFORE UPDATE OF currency_code` trigger and application-role column permissions reject changing it after insertion, even before a payment exists. A wrong-currency parent is corrected through a reasoned successor transaction. Composite database foreign keys reject a payment currency different from its parent and an event currency different from its payment. No KES default or currency conversion is assumed in the MVP. If conversion is later approved, original and converted values, both currency codes, rate and conversion time remain explicit.
 - **AC-08c — Trade-linked inventory cap:** both `gold_trade_line` and `residue_sale_line` may be referenced only by accepted physical OUT postings for the current accepted line revision; the paired IN has no commercial-line reference. Database deferred checks, serialized on the parent/line chain before inventory guards, require cumulative OUT less valid linked reversals across the correction chain to be no greater than the current accepted quantity. A correction lowering accepted quantity cannot be accepted while net movement exceeds it. Adjustments cannot bypass the cap; accepted quantity, physical movement, payment and custody remain independent facts.
 - **AC-09 — Gold-only scope:** user-visible choices, documentation and reports do not claim gemstone or other-mineral support.
+
+**Phase 4 custody verification:** every tested gold handover offer cites a current measured/verified observation on the trade line whose quantity exactly matches the transfer. Recipient acceptance records the custody decision and posts balanced source OUT/destination IN lines atomically in the existing journal. Disputes and idempotent retries do not post duplicate inventory, and concurrent offers cannot make the source balance negative.
 
 ## Access and audit
 
