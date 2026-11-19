@@ -200,6 +200,21 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const phaseFourCustodyColumns = await db(`SELECT column_name FROM information_schema.columns WHERE table_schema='public'
       AND table_name='custody_transfer' AND column_name IN ('gold_trade_line_id','quantity_g','measurement_set_id','measurement_id') ORDER BY column_name`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(phaseFourCustodyColumns.map((row) => row.column_name), ['gold_trade_line_id','measurement_id','measurement_set_id','quantity_g']);
+
+    const rollbackSeven = await readFile(new URL('../src/database/rollback/007_phase_four_integrity_corrections.sql', import.meta.url), 'utf8');
+    const migrationSeven = await readFile(new URL('../src/database/migrations/007_phase_four_integrity_corrections.sql', import.meta.url), 'utf8');
+    const phaseFourCorrectionsRollbackProbe = new Error('Phase 4 correction migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackSeven, { transaction, raw: true });
+      await sequelize.query(migrationSeven, { transaction, raw: true });
+      throw phaseFourCorrectionsRollbackProbe;
+    }), (error) => error === phaseFourCorrectionsRollbackProbe);
+    const phaseFourCorrectionColumns = await db(`SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public'
+      AND ((table_name='gold_trade_line' AND column_name='is_current')
+        OR (table_name='assay_record' AND column_name='gold_trade_line_id')) ORDER BY table_name,column_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseFourCorrectionColumns.map((row) => `${row.table_name}.${row.column_name}`), ['assay_record.gold_trade_line_id','gold_trade_line.is_current']);
+    const phaseFourCorrectionIndex = await db(`SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname='gold_trade_line_one_current_batch_idx'`, {}, undefined, QueryTypes.SELECT);
+    assert.equal(phaseFourCorrectionIndex.length, 1);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -2085,6 +2100,182 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.ok(reconciliation.body.lines.find((line) => line.id === initialLineId).measurements.some((item) => item.supersedes_measurement_id === sellerDeclared.body.id));
     assert.equal((await request(app).get(`/api/v1/gold-trades/${tradeId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 404);
     assert.equal((await verifyAuditStream('gold_trade', tradeId)).valid, true);
+  });
+
+  await t.test('Phase 4 assay and measurement attribution, assay lineage, and current batch-line integrity', async () => {
+    const [recovered] = await db(`SELECT ro.batch_id,location.custodian_party_id AS seller_party_id,ril.inventory_location_id AS source_location_id
+      FROM recovery_event_output ro JOIN recovery_event re ON re.event_id=ro.recovery_event_id
+      JOIN recovery_inventory_location ril ON ril.recovery_facility_id=re.recovery_facility_id
+      JOIN inventory_location location ON location.id=ril.inventory_location_id
+      WHERE ro.recovery_event_id=:eventId AND ro.output_role='RECOVERED_GOLD' LIMIT 1`, { eventId: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+    assert.ok(recovered);
+    const sellerPartyId = recovered.seller_party_id;
+    const sellerToken = ids.phaseThree.recoveryToken;
+    const sellerPerson = ids.phaseThree.recoveryPartyUserId;
+    const buyerPartyId = await seedParty('ORGANISATION', 'Fictional Integrity Test Merchant', 'LOCAL_MERCHANT');
+    await db(`INSERT INTO party_participation(id,party_id,participant_kind) VALUES (:id,:partyId,'LOCAL_MERCHANT')`, { id: randomUUID(), partyId: buyerPartyId });
+    const buyer = await seedUser('gold-integrity-buyer@example.test', 'Fictional Integrity Test Buyer', { roleCode: 'LOCAL_MERCHANT', scopeKind: 'ORGANISATION', scopeId: buyerPartyId });
+    await db(`INSERT INTO organisation_membership(id,person_party_id,organisation_party_id,membership_type) VALUES (:id,:person,:org,'MEMBER')`, { id: randomUUID(), person: buyer.partyId, org: buyerPartyId });
+    const buyerToken = testToken(buyer.userId);
+    const labPartyId = await seedParty('ORGANISATION', 'Fictional Assay and Weighing Group');
+    const labMembershipId = randomUUID();
+    await db(`INSERT INTO organisation_membership(id,person_party_id,organisation_party_id,membership_type) VALUES (:id,:person,:org,'MEMBER')`, { id: labMembershipId, person: buyer.partyId, org: labPartyId });
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','ORGANISATION',:org)`, { id: randomUUID(), userId: buyer.userId, org: labPartyId });
+    const unrelatedPartyId = await seedParty('ORGANISATION', 'Fictional Unrelated Measurement Source');
+    const tradeDate = new Date(Date.now() + 60_000).toISOString();
+    const batchA = recovered.batch_id;
+    const batchB = ids.processingOutputs[0].batchId;
+    assert.notEqual(batchA, batchB);
+    const batchBLocationId = randomUUID();
+    await db(`INSERT INTO inventory_location(id,location_code,location_kind,custodian_party_id)
+      VALUES (:id,:code,'OTHER',:seller)`, { id: batchBLocationId, code: `GOLD-INTEGRITY-${randomUUID()}`, seller: sellerPartyId });
+    await createOpeningBalance(batchB, batchBLocationId, '2.000000');
+
+    const proposal = (batchId, assayRecordId = undefined) => ({
+      tradeKind: 'PURCHASE', sellerPartyId, buyerPartyId, tradeDate, currencyCode: 'KES',
+      lines: [{ batchId, quantityGrams: '0.010000', unitPrice: '2400.00000000', ...(assayRecordId ? { assayRecordId } : {}) }],
+    });
+    const createTrade = async (body) => request(app).post('/api/v1/gold-trades').set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send(body);
+    const duplicateProposal = await createTrade({ ...proposal(batchA), lines: [proposal(batchA).lines[0], proposal(batchA).lines[0]] });
+    assert.equal(duplicateProposal.status, 400, duplicateProposal.text);
+    assert.equal(duplicateProposal.body.error.code, 'DUPLICATE_BATCH');
+
+    const tradeAResponse = await createTrade(proposal(batchA));
+    assert.equal(tradeAResponse.status, 201, tradeAResponse.text);
+    const tradeA = tradeAResponse.body.id;
+    const lineA = tradeAResponse.body.lines[0].id;
+    await assert.rejects(db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,unit_price,line_amount,is_current)
+      VALUES (:id,:tradeId,:batchId,1,'ORIGINAL','0.010000','2400.00000000','24.00000000',true)`, {
+      id: randomUUID(), tradeId: tradeA, batchId: batchA,
+    }), sqlError('23505'));
+    const measurement = (sourceRole, sourcePartyId = undefined) => ({
+      kind: 'DECLARED', quantityGrams: '0.010000', sourceValue: '10.000', sourceUnit: 'mg',
+      conversionVersion: 'canonical-mass-v1', sourceRole, occurredAt: tradeDate,
+      ...(sourcePartyId ? { sourcePartyId } : {}),
+    });
+    const recordMeasurement = (tradeId, lineId, sourceRole, token, sourcePartyId = undefined) => request(app)
+      .post(`/api/v1/gold-trades/${tradeId}/lines/${lineId}/measurements`).set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', randomUUID()).send(measurement(sourceRole, sourcePartyId));
+    for (const [role, token, source] of [
+      ['SELLER', sellerToken, undefined], ['BUYER', buyerToken, undefined], ['RECORDER', sellerToken, undefined],
+      ['WITNESS', sellerToken, sellerPerson], ['WEIGHER', sellerToken, sellerPerson], ['OTHER', sellerToken, sellerPerson],
+      ['WITNESS', buyerToken, labPartyId],
+    ]) {
+      const response = await recordMeasurement(tradeA, lineA, role, token, source);
+      assert.equal(response.status, 201, `${role} source: ${response.text}`);
+    }
+    for (const [role, token, source] of [
+      ['SELLER', buyerToken, undefined], ['BUYER', sellerToken, undefined], ['RECORDER', sellerToken, buyerPartyId],
+      ['WITNESS', sellerToken, undefined], ['WEIGHER', sellerToken, undefined], ['OTHER', sellerToken, undefined],
+      ['WITNESS', sellerToken, unrelatedPartyId], ['WEIGHER', sellerToken, unrelatedPartyId], ['OTHER', sellerToken, unrelatedPartyId],
+    ]) {
+      const response = await recordMeasurement(tradeA, lineA, role, token, source);
+      assert.equal(response.status, 400, `${role} source: ${response.text}`);
+    }
+    const [lineMeasurementSet] = await db(`SELECT id FROM material_measurement_set WHERE gold_trade_line_id=:lineId`, { lineId: lineA }, undefined, QueryTypes.SELECT);
+    await assert.rejects(db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
+      VALUES (:id,:setId,'DECLARED','0.010000','10.000','mg','canonical-mass-v1','OTHER',:sourceParty,:actor,:occurredAt)`, {
+      id: randomUUID(), setId: lineMeasurementSet.id, sourceParty: unrelatedPartyId,
+      actor: ids.phaseThree.recoveryUserId, occurredAt: tradeDate,
+    }), sqlError('23514'));
+    const assayBody = (assayerPartyId) => ({ assayerPartyId, sampleRef: 'FICTIONAL-SAMPLE', methodRef: 'RECORDED-ASSAY', resultValue: '92.50000000', resultUnit: 'PERCENT', observedAt: tradeDate, evidenceRef: 'FICTIONAL-ASSAY-EVIDENCE' });
+    const recordAssay = (tradeId, lineId, token, body) => request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${lineId}/assays`)
+      .set('Authorization', `Bearer ${token}`).set('Idempotency-Key', randomUUID()).send(body);
+    const assayAResponse = await recordAssay(tradeA, lineA, sellerToken, assayBody(sellerPartyId));
+    assert.equal(assayAResponse.status, 201, assayAResponse.text);
+    assert.equal(assayAResponse.body.status, 'RECORDED');
+    await assert.rejects(db(`INSERT INTO assay_record(id,batch_id,assayer_party_id,result_value,result_unit,observed_at,recorded_by_user_id,gold_trade_line_id)
+      VALUES (:id,:batchId,:assayer,'90.00000000','PERCENT',:observedAt,:actor,:lineId)`, {
+      id: randomUUID(), batchId: batchA, assayer: unrelatedPartyId, observedAt: tradeDate,
+      actor: ids.phaseThree.recoveryUserId, lineId: lineA,
+    }), sqlError('23514'));
+    const unauthorizedAssayer = await recordAssay(tradeA, lineA, sellerToken, assayBody(unrelatedPartyId));
+    assert.equal(unauthorizedAssayer.status, 400, unauthorizedAssayer.text);
+    const representedOrgAssayer = await recordAssay(tradeA, lineA, buyerToken, assayBody(labPartyId));
+    assert.equal(representedOrgAssayer.status, 201, representedOrgAssayer.text);
+    await db(`UPDATE organisation_membership SET status='REVOKED' WHERE id=:id`, { id: labMembershipId });
+    const revokedMeasurement = await recordMeasurement(tradeA, lineA, 'WEIGHER', buyerToken, labPartyId);
+    assert.equal(revokedMeasurement.status, 400, revokedMeasurement.text);
+    const revokedAssayer = await recordAssay(tradeA, lineA, buyerToken, assayBody(labPartyId));
+    assert.equal(revokedAssayer.status, 400, revokedAssayer.text);
+    const assayCorrection = await recordAssay(tradeA, lineA, sellerToken, {
+      ...assayBody(sellerPartyId), correctionOfId: assayAResponse.body.id,
+      correctionReason: 'Fictional transcription correction retained with its original record.',
+    });
+    assert.equal(assayCorrection.status, 201, assayCorrection.text);
+    const staleAssayCorrection = await recordAssay(tradeA, lineA, sellerToken, {
+      ...assayBody(sellerPartyId), correctionOfId: assayAResponse.body.id, correctionReason: 'A second correction cannot supersede the already corrected record.',
+    });
+    assert.equal(staleAssayCorrection.status, 400, staleAssayCorrection.text);
+    const missingAssayCorrection = await recordAssay(tradeA, lineA, sellerToken, {
+      ...assayBody(sellerPartyId), correctionOfId: randomUUID(), correctionReason: 'The referenced record does not exist.',
+    });
+    assert.equal(missingAssayCorrection.status, 400, missingAssayCorrection.text);
+    await assert.rejects(db(`UPDATE assay_record SET result_value='99.00000000' WHERE id=:id`, { id: assayCorrection.body.id }), sqlError('55000'));
+    await assert.rejects(db(`DELETE FROM assay_record WHERE id=:id`, { id: assayCorrection.body.id }), sqlError('55000'));
+
+    const tradeBResponse = await createTrade(proposal(batchB));
+    assert.equal(tradeBResponse.status, 201, tradeBResponse.text);
+    const tradeB = tradeBResponse.body.id;
+    const lineB = tradeBResponse.body.lines[0].id;
+    const assayBResponse = await recordAssay(tradeB, lineB, sellerToken, assayBody(sellerPartyId));
+    assert.equal(assayBResponse.status, 201, assayBResponse.text);
+    const wrongBatchCorrection = await recordAssay(tradeB, lineB, sellerToken, {
+      ...assayBody(sellerPartyId), correctionOfId: assayCorrection.body.id,
+      correctionReason: 'A correction cannot cross gold batch lineage.',
+    });
+    assert.equal(wrongBatchCorrection.status, 400, wrongBatchCorrection.text);
+    const wrongInitialAssay = await createTrade(proposal(batchB, assayCorrection.body.id));
+    assert.equal(wrongInitialAssay.status, 400, wrongInitialAssay.text);
+    assert.equal(wrongInitialAssay.body.error.code, 'INVALID_ASSAY');
+    const wrongAddedAssay = await request(app).post(`/api/v1/gold-trades/${tradeA}/lines`).set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send({ ...proposal(batchB).lines[0], assayRecordId: assayCorrection.body.id });
+    assert.equal(wrongAddedAssay.status, 400, wrongAddedAssay.text);
+    const wrongRevisionAssay = await request(app).post(`/api/v1/gold-trades/${tradeB}/lines/${lineB}/revisions`).set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send({ quantityGrams: '0.010000', unitPrice: '2400.00000000', correctionReason: 'Fictional price proposal revision.', occurredAt: tradeDate, assayRecordId: assayCorrection.body.id });
+    assert.equal(wrongRevisionAssay.status, 400, wrongRevisionAssay.text);
+
+    const directBadLineId = randomUUID();
+    await assert.rejects(db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,unit_price,line_amount,assay_record_id,is_current)
+      VALUES (:id,:tradeId,:batchId,1,'ORIGINAL','0.010000','2400.00000000','24.00000000',:assayId,true)`, {
+      id: directBadLineId, tradeId: tradeA, batchId: batchB, assayId: assayCorrection.body.id,
+    }), sqlError('23503'));
+
+    const correctInitialAssay = await createTrade(proposal(batchA, assayCorrection.body.id));
+    assert.equal(correctInitialAssay.status, 201, correctInitialAssay.text);
+    const duplicateAdd = await request(app).post(`/api/v1/gold-trades/${tradeA}/lines`).set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send(proposal(batchA).lines[0]);
+    assert.equal(duplicateAdd.status, 409, duplicateAdd.text);
+    assert.equal(duplicateAdd.body.error.code, 'DUPLICATE_BATCH');
+
+    const validRevision = await request(app).post(`/api/v1/gold-trades/${tradeB}/lines/${lineB}/revisions`).set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send({ quantityGrams: '0.010000', unitPrice: '2400.00000000', correctionReason: 'Fictional valid linked successor for this batch.', occurredAt: tradeDate, assayRecordId: assayBResponse.body.id });
+    assert.equal(validRevision.status, 201, validRevision.text);
+    const staleRevision = await request(app).post(`/api/v1/gold-trades/${tradeB}/lines/${lineB}/revisions`).set('Authorization', `Bearer ${sellerToken}`)
+      .set('Idempotency-Key', randomUUID()).send({ quantityGrams: '0.010000', unitPrice: '2400.00000000', correctionReason: 'A superseded line cannot receive another successor.', occurredAt: tradeDate });
+    assert.equal(staleRevision.status, 409, staleRevision.text);
+    const currentLineCount = await db(`SELECT count(*)::int AS total FROM gold_trade_line WHERE trade_id=:tradeId AND batch_id=:batchId AND is_current`, { tradeId: tradeB, batchId: batchB }, undefined, QueryTypes.SELECT);
+    assert.equal(currentLineCount[0].total, 1);
+
+    const repeatTradeResponse = await createTrade(proposal(batchA));
+    assert.equal(repeatTradeResponse.status, 201, repeatTradeResponse.text);
+    const repeatKey = randomUUID();
+    const addBody = { ...proposal(batchB).lines[0], assayRecordId: assayBResponse.body.id };
+    const firstAdd = await request(app).post(`/api/v1/gold-trades/${repeatTradeResponse.body.id}/lines`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', repeatKey).send(addBody);
+    assert.equal(firstAdd.status, 201, firstAdd.text);
+    const repeatedAdd = await request(app).post(`/api/v1/gold-trades/${repeatTradeResponse.body.id}/lines`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', repeatKey).send(addBody);
+    assert.equal(repeatedAdd.status, 201, repeatedAdd.text);
+    assert.equal(repeatedAdd.body.id, firstAdd.body.id);
+    assert.equal(repeatedAdd.body.replayed, true);
+
+    const raceTradeResponse = await createTrade(proposal(batchA));
+    assert.equal(raceTradeResponse.status, 201, raceTradeResponse.text);
+    const concurrentAdds = await Promise.all([0, 1].map(() => request(app).post(`/api/v1/gold-trades/${raceTradeResponse.body.id}/lines`)
+      .set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send(proposal(batchB).lines[0])));
+    assert.deepEqual(concurrentAdds.map((response) => response.status).sort(), [201, 409]);
+    const raceCurrentLineCount = await db(`SELECT count(*)::int AS total FROM gold_trade_line WHERE trade_id=:tradeId AND batch_id=:batchId AND is_current`, { tradeId: raceTradeResponse.body.id, batchId: batchB }, undefined, QueryTypes.SELECT);
+    assert.equal(raceCurrentLineCount[0].total, 1);
   });
 
   await t.test('append-only per-aggregate audit chains verify sequence, payload, and concurrent appends', async () => {
