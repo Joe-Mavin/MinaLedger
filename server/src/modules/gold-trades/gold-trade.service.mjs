@@ -113,6 +113,19 @@ async function resolveTradeParty(auth, trade, allowedPartyIds = [trade.seller_pa
   throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
 }
 
+async function lockGoldTradeLine(tradeId, lineId, transaction) {
+  const [trade] = await query(`SELECT id,seller_party_id,buyer_party_id,status,currency_code FROM gold_trade WHERE id=:tradeId FOR UPDATE`, { tradeId }, transaction);
+  if (!trade) return null;
+  const [line] = await query(`SELECT * FROM gold_trade_line WHERE id=:lineId AND trade_id=:tradeId FOR UPDATE`, { lineId, tradeId }, transaction);
+  if (!line) return null;
+  return { ...line, seller_party_id: trade.seller_party_id, buyer_party_id: trade.buyer_party_id, status: trade.status, currency_code: trade.currency_code };
+}
+
+function assertObservationTargetIsCurrentAndOpen(line) {
+  if (line.status === 'CLOSED') throw new AppError(409, 'TRADE_CLOSED', 'Closed trade records cannot receive new observations.');
+  if (!line.is_current) throw new AppError(409, 'STALE_TRADE_LINE', 'Observations must be recorded against the current proposal line.');
+}
+
 async function assertActiveParty(partyId, transaction) {
   const [party] = await query(`SELECT id FROM party WHERE id=:partyId AND status='ACTIVE'`, { partyId }, transaction);
   if (!party) throw new AppError(400, 'INVALID_PARTY', 'Both gold trade parties must be active.');
@@ -357,15 +370,18 @@ export async function addGoldTradeLine(tradeId, line, auth, mutationId) {
 export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, mutationId) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  const representedPartyId = await resolveTradeParty(auth, line);
-  if (line.status === 'CLOSED') throw new AppError(409, 'TRADE_CLOSED', 'Closed trade records cannot receive new measurements.');
+  await resolveTradeParty(auth, line);
   if (!['g','kg','mg'].includes(input.sourceUnit) || input.conversionVersion !== 'canonical-mass-v1') throw new AppError(400, 'UNSUPPORTED_CONVERSION', 'Use g, kg or mg with canonical-mass-v1 conversion evidence.');
   const source = toScaled(input.sourceValue, 1_000_000_000_000n);
   const denominator = input.sourceUnit === 'kg' ? 1_000n : input.sourceUnit === 'mg' ? 1_000_000_000n : 1_000_000n;
   const convertedMicros = source / denominator;
   if (source % denominator !== 0n || convertedMicros !== toMicros(input.quantityGrams)) throw new AppError(400, 'MEASUREMENT_CONVERSION_MISMATCH', 'The source value and canonical gram quantity do not match exactly.');
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'gold-trade.measurement', tradeId, lineId, input }, transaction }, async () => {
-    const sourcePartyId = await assertGoldMeasurementSource({ auth, line, sourceRole: input.sourceRole, requestedSourcePartyId: input.sourcePartyId, occurredAt: input.occurredAt, transaction });
+    const lockedLine = await lockGoldTradeLine(tradeId, lineId, transaction);
+    if (!lockedLine) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+    const lockedRepresentedPartyId = await resolveTradeParty(auth, lockedLine, undefined, transaction);
+    assertObservationTargetIsCurrentAndOpen(lockedLine);
+    const sourcePartyId = await assertGoldMeasurementSource({ auth, line: lockedLine, sourceRole: input.sourceRole, requestedSourcePartyId: input.sourcePartyId, occurredAt: input.occurredAt, transaction });
     const id = randomUUID();
     const [set] = await query(`SELECT id FROM material_measurement_set WHERE gold_trade_line_id=:lineId`, { lineId }, transaction);
     if (input.supersedesMeasurementId) {
@@ -384,8 +400,8 @@ export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, m
     if (input.evidenceRef || input.supersedesMeasurementId) await appendEvidence(tradeId, {
       kind: 'WEIGHT', reference: input.evidenceRef ?? `MEASUREMENT:${id}`, note: input.supersedesMeasurementId ? `Correction of ${input.supersedesMeasurementId}: ${input.correctionReason}` : null,
       occurredAt: input.occurredAt,
-    }, auth, representedPartyId, transaction);
-    await appendAuditEvent({ transaction, eventType: input.supersedesMeasurementId ? 'GOLD_TRADE.MEASUREMENT_CORRECTED' : 'GOLD_TRADE.MEASUREMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, measurement_id: id, kind: input.kind, quantity_g: input.quantityGrams, supersedes_measurement_id: input.supersedesMeasurementId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: line.batch_id }] });
+    }, auth, lockedRepresentedPartyId, transaction);
+    await appendAuditEvent({ transaction, eventType: input.supersedesMeasurementId ? 'GOLD_TRADE.MEASUREMENT_CORRECTED' : 'GOLD_TRADE.MEASUREMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, measurement_id: id, kind: input.kind, quantity_g: input.quantityGrams, supersedes_measurement_id: input.supersedesMeasurementId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }] });
     return { id, tradeId, lineId, measurementSetId: set.id, kind: input.kind, quantityGrams: input.quantityGrams, supersedesMeasurementId: input.supersedesMeasurementId ?? null };
   }));
 }
@@ -393,50 +409,57 @@ export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, m
 export async function recordGoldTradeAssay(tradeId, lineId, input, auth, mutationId) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  const representedPartyId = await resolveTradeParty(auth, line);
+  await resolveTradeParty(auth, line);
   if (!line.is_current) throw new AppError(409, 'STALE_TRADE_LINE', 'Assays must be recorded against the current proposal line.');
-  const assayerPartyId = input.assayerPartyId ?? representedPartyId;
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'gold-trade.assay', tradeId, lineId, input }, transaction }, async () => {
-    if (!(await isRepresentedPartyAt(auth, assayerPartyId, input.observedAt, transaction))) {
+    const lockedLine = await lockGoldTradeLine(tradeId, lineId, transaction);
+    if (!lockedLine) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+    const lockedRepresentedPartyId = await resolveTradeParty(auth, lockedLine, undefined, transaction);
+    assertObservationTargetIsCurrentAndOpen(lockedLine);
+    const lockedAssayerPartyId = input.assayerPartyId ?? lockedRepresentedPartyId;
+    if (!(await isRepresentedPartyAt(auth, lockedAssayerPartyId, input.observedAt, transaction))) {
       throw new AppError(400, 'INVALID_ASSAYER', 'The authenticated user is not authorized to record an assay for this party at the claimed observation time.');
     }
     if (input.correctionOfId) {
       const [prior] = await query(`SELECT a.id FROM assay_record a WHERE a.id=:id AND a.batch_id=:batchId
         AND NOT EXISTS(SELECT 1 FROM assay_record successor WHERE successor.correction_of_id=a.id)`,
-      { id: input.correctionOfId, batchId: line.batch_id }, transaction);
+      { id: input.correctionOfId, batchId: lockedLine.batch_id }, transaction);
       if (!prior) throw new AppError(400, 'INVALID_ASSAY_CORRECTION', 'An assay correction must refer to the current observation for this batch.');
     }
     const id = randomUUID();
     await write(
       `INSERT INTO assay_record(id,batch_id,assayer_party_id,sample_ref,method_ref,result_value,result_unit,observed_at,evidence_ref,correction_of_id,recorded_by_user_id,correction_reason,gold_trade_line_id)
        VALUES (:id,:batchId,:assayer,:sample,:method,:value,:unit,:observedAt,:evidence,:correction,:userId,:reason,:lineId)`,
-      { id, batchId: line.batch_id, assayer: assayerPartyId, sample: input.sampleRef ?? null, method: input.methodRef ?? null,
+      { id, batchId: lockedLine.batch_id, assayer: lockedAssayerPartyId, sample: input.sampleRef ?? null, method: input.methodRef ?? null,
         value: input.resultValue, unit: input.resultUnit, observedAt: input.observedAt, evidence: input.evidenceRef ?? null,
         correction: input.correctionOfId ?? null, userId: auth.userId, reason: input.correctionReason ?? null, lineId }, transaction,
     );
-    if (input.evidenceRef) await appendEvidence(tradeId, { kind: 'ASSAY', reference: input.evidenceRef, occurredAt: input.observedAt }, auth, representedPartyId, transaction);
-    await appendAuditEvent({ transaction, eventType: input.correctionOfId ? 'GOLD_TRADE.ASSAY_CORRECTED' : 'GOLD_TRADE.ASSAY_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.observedAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, assay_record_id: id, batch_id: line.batch_id, result_value: input.resultValue, result_unit: input.resultUnit, evidenced: Boolean(input.evidenceRef), correction_of_id: input.correctionOfId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: line.batch_id }] });
-    return { id, tradeId, lineId, batchId: line.batch_id, status: 'RECORDED', resultValue: input.resultValue, resultUnit: input.resultUnit, evidenceRef: input.evidenceRef ?? null, correctionOfId: input.correctionOfId ?? null };
+    if (input.evidenceRef) await appendEvidence(tradeId, { kind: 'ASSAY', reference: input.evidenceRef, occurredAt: input.observedAt }, auth, lockedRepresentedPartyId, transaction);
+    await appendAuditEvent({ transaction, eventType: input.correctionOfId ? 'GOLD_TRADE.ASSAY_CORRECTED' : 'GOLD_TRADE.ASSAY_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.observedAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, assay_record_id: id, batch_id: lockedLine.batch_id, result_value: input.resultValue, result_unit: input.resultUnit, evidenced: Boolean(input.evidenceRef), correction_of_id: input.correctionOfId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }] });
+    return { id, tradeId, lineId, batchId: lockedLine.batch_id, status: 'RECORDED', resultValue: input.resultValue, resultUnit: input.resultUnit, evidenceRef: input.evidenceRef ?? null, correctionOfId: input.correctionOfId ?? null };
   }));
 }
 
 export async function proposeGoldTradeRevision(tradeId, lineId, input, auth, mutationId) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  const representedPartyId = await resolveTradeParty(auth, line);
+  await resolveTradeParty(auth, line);
   if (!['PROPOSED','DISPUTED'].includes(line.status)) throw new AppError(409, 'TRADE_NOT_OPEN', 'Agreed or closed trades cannot be revised through the proposal workflow.');
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'gold-trade.line.revise', tradeId, lineId, input }, transaction }, async () => {
-    const [locked] = await query(`SELECT l.*,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE l.id=:lineId FOR UPDATE OF t,l`, { lineId }, transaction);
+    const locked = await lockGoldTradeLine(tradeId, lineId, transaction);
+    if (!locked) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+    if (!['PROPOSED','DISPUTED'].includes(locked.status)) throw new AppError(409, 'TRADE_NOT_OPEN', 'Agreed or closed trades cannot be revised through the proposal workflow.');
+    const lockedRepresentedPartyId = await resolveTradeParty(auth, locked, undefined, transaction);
     await assertLineCurrent(lineId, transaction);
     if (locked.is_accepted) await write(`UPDATE gold_trade_line SET is_accepted=false WHERE id=:lineId`, { lineId }, transaction);
     await getEligibleGoldBatch(locked.batch_id, transaction);
-    await assertSellerAvailability(locked.batch_id, line.seller_party_id, input.quantityGrams, transaction);
-    const revision = await query(`SELECT COALESCE(max(revision_no),0)::int AS revision FROM gold_trade_line WHERE trade_id=:tradeId AND batch_id=:batchId`, { tradeId, batchId: line.batch_id }, transaction);
-    const assayRecordId = input.assayRecordId ?? await currentAssayId(line.assay_record_id, line.batch_id, transaction);
-    const result = await createProposalLine({ tradeId, line: { ...input, batchId: line.batch_id, assayRecordId }, revisionNo: revision[0].revision + 1, supersedesLineId: lineId, correctionReason: input.correctionReason }, transaction);
-    const [trade] = await query(`SELECT * FROM gold_trade WHERE id=:tradeId FOR UPDATE`, { tradeId }, transaction);
-    if (trade.status === 'DISPUTED') await recordTradeStatus({ tradeId, trade, nextStatus: 'PROPOSED', auth, representedPartyId, occurredAt: input.occurredAt, reason: input.correctionReason, evidenceRef: input.evidenceRef ?? null, transaction });
-    await appendAuditEvent({ transaction, eventType: 'GOLD_TRADE.LINE_REVISION_PROPOSED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, prior_line_id: lineId, successor_line_id: result.id, correction_reason: input.correctionReason, quantity_g: input.quantityGrams, unit_price: input.unitPrice }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: line.batch_id }] });
+    await assertSellerAvailability(locked.batch_id, locked.seller_party_id, input.quantityGrams, transaction);
+    const revision = await query(`SELECT COALESCE(max(revision_no),0)::int AS revision FROM gold_trade_line WHERE trade_id=:tradeId AND batch_id=:batchId`, { tradeId, batchId: locked.batch_id }, transaction);
+    const assayRecordId = input.assayRecordId ?? await currentAssayId(locked.assay_record_id, locked.batch_id, transaction);
+    const result = await createProposalLine({ tradeId, line: { ...input, batchId: locked.batch_id, assayRecordId }, revisionNo: revision[0].revision + 1, supersedesLineId: lineId, correctionReason: input.correctionReason }, transaction);
+    const trade = { status: locked.status };
+    if (trade.status === 'DISPUTED') await recordTradeStatus({ tradeId, trade, nextStatus: 'PROPOSED', auth, representedPartyId: lockedRepresentedPartyId, occurredAt: input.occurredAt, reason: input.correctionReason, evidenceRef: input.evidenceRef ?? null, transaction });
+    await appendAuditEvent({ transaction, eventType: 'GOLD_TRADE.LINE_REVISION_PROPOSED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, prior_line_id: lineId, successor_line_id: result.id, correction_reason: input.correctionReason, quantity_g: input.quantityGrams, unit_price: input.unitPrice }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: locked.batch_id }] });
     return { ...result, supersedesLineId: lineId, revisionNo: revision[0].revision + 1 };
   }));
 }
@@ -444,7 +467,7 @@ export async function proposeGoldTradeRevision(tradeId, lineId, input, auth, mut
 export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutationId) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status,t.currency_code FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  const representedPartyId = await resolveTradeParty(auth, line);
+  await resolveTradeParty(auth, line);
   if (!['PROPOSED','DISPUTED'].includes(line.status)) throw new AppError(409, 'TRADE_NOT_OPEN', 'Only open proposals can receive a commercial decision.');
   if (input.decision === 'ACCEPT') {
     if (toMicros(input.quantityGrams) > toMicros(line.transaction_quantity_g)) throw new AppError(400, 'QUANTITY_EXCEEDS_PROPOSAL', 'Accepted quantity cannot exceed the proposed quantity.');
@@ -452,7 +475,10 @@ export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutation
     if (input.deductionAmount && toScaled(input.deductionAmount, MONEY_SCALE) > 0n && !input.deductionReason) throw new AppError(400, 'DEDUCTION_REASON_REQUIRED', 'A recorded deduction requires a reason.');
   }
   return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'gold-trade.line.decision', tradeId, lineId, input }, transaction }, async () => {
-    const [locked] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.currency_code,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE l.id=:lineId FOR UPDATE OF t,l`, { lineId }, transaction);
+    const locked = await lockGoldTradeLine(tradeId, lineId, transaction);
+    if (!locked) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+    if (!['PROPOSED','DISPUTED'].includes(locked.status)) throw new AppError(409, 'TRADE_NOT_OPEN', 'Only open proposals can receive a commercial decision.');
+    const lockedRepresentedPartyId = await resolveTradeParty(auth, locked, undefined, transaction);
     await assertLineCurrent(lineId, transaction);
     const acceptedQuantity = input.decision === 'ACCEPT' ? input.quantityGrams : null;
     const acceptedUnitPrice = input.decision === 'ACCEPT' ? input.unitPrice : null;
@@ -462,17 +488,17 @@ export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutation
     await write(
       `INSERT INTO commercial_line_decision_event(id,gold_trade_line_id,actor_user_id,actor_party_id,decision,occurred_at,reason,evidence_ref,accepted_quantity_g,accepted_unit_price,accepted_line_amount,accepted_deduction_amount)
        VALUES (:id,:lineId,:userId,:partyId,:decision,:occurredAt,:reason,:evidence,:quantity,:price,:amount,:deduction)`,
-      { id: decisionId, lineId, userId: auth.userId, partyId: representedPartyId, decision: input.decision,
+      { id: decisionId, lineId, userId: auth.userId, partyId: lockedRepresentedPartyId, decision: input.decision,
         occurredAt: input.occurredAt, reason: input.reason ?? null, evidence: input.evidenceRef ?? null,
         quantity: acceptedQuantity, price: acceptedUnitPrice, amount: acceptedAmount, deduction }, transaction,
     );
-    if (input.evidenceRef) await appendEvidence(tradeId, { kind: 'TERMS', reference: input.evidenceRef, occurredAt: input.occurredAt }, auth, representedPartyId, transaction);
+    if (input.evidenceRef) await appendEvidence(tradeId, { kind: 'TERMS', reference: input.evidenceRef, occurredAt: input.occurredAt }, auth, lockedRepresentedPartyId, transaction);
     let successorLineId = null;
     let agreed = false;
     let disputed = false;
     if (input.decision === 'DISPUTE' || input.decision === 'REJECT') {
       disputed = true;
-      if (locked.status !== 'DISPUTED') await recordTradeStatus({ tradeId, trade: locked, nextStatus: 'DISPUTED', auth, representedPartyId, occurredAt: input.occurredAt, reason: input.reason, evidenceRef: input.evidenceRef ?? null, transaction });
+      if (locked.status !== 'DISPUTED') await recordTradeStatus({ tradeId, trade: locked, nextStatus: 'DISPUTED', auth, representedPartyId: lockedRepresentedPartyId, occurredAt: input.occurredAt, reason: input.reason, evidenceRef: input.evidenceRef ?? null, transaction });
     } else {
       const decisions = await query(`SELECT actor_party_id,accepted_quantity_g,accepted_unit_price,accepted_line_amount,accepted_deduction_amount FROM commercial_line_decision_event WHERE gold_trade_line_id=:lineId AND decision='ACCEPT'`, { lineId }, transaction);
       const seller = decisions.find((row) => row.actor_party_id === locked.seller_party_id);
@@ -481,7 +507,7 @@ export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutation
         const sameTerms = seller.accepted_quantity_g === buyer.accepted_quantity_g && seller.accepted_unit_price === buyer.accepted_unit_price && seller.accepted_line_amount === buyer.accepted_line_amount && seller.accepted_deduction_amount === buyer.accepted_deduction_amount;
         if (!sameTerms) {
           disputed = true;
-          if (locked.status !== 'DISPUTED') await recordTradeStatus({ tradeId, trade: locked, nextStatus: 'DISPUTED', auth, representedPartyId, occurredAt: input.occurredAt, reason: 'Counterparties accepted different effective terms', transaction });
+          if (locked.status !== 'DISPUTED') await recordTradeStatus({ tradeId, trade: locked, nextStatus: 'DISPUTED', auth, representedPartyId: lockedRepresentedPartyId, occurredAt: input.occurredAt, reason: 'Counterparties accepted different effective terms', transaction });
         } else {
           await assertSellerAvailability(locked.batch_id, locked.seller_party_id, buyer.accepted_quantity_g, transaction);
           const revisionNo = locked.revision_no + 1;
@@ -502,7 +528,7 @@ export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutation
           const [openLines] = await query(`SELECT count(*)::int AS total FROM gold_trade_line l WHERE l.trade_id=:tradeId AND l.is_current`, { tradeId }, transaction);
           const [unagreed] = await query(`SELECT count(*)::int AS total FROM gold_trade_line l WHERE l.trade_id=:tradeId AND l.is_current AND (NOT l.is_accepted OR l.accepted_trade_quantity_g IS NULL)`, { tradeId }, transaction);
           if (openLines.total > 0 && unagreed.total === 0) {
-            await recordTradeStatus({ tradeId, trade: currentTrade, nextStatus: 'AGREED', auth, representedPartyId, occurredAt: input.occurredAt, evidenceRef: input.evidenceRef ?? null, transaction });
+            await recordTradeStatus({ tradeId, trade: currentTrade, nextStatus: 'AGREED', auth, representedPartyId: lockedRepresentedPartyId, occurredAt: input.occurredAt, evidenceRef: input.evidenceRef ?? null, transaction });
             agreed = true;
           }
         }

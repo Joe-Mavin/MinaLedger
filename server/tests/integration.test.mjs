@@ -215,6 +215,18 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.deepEqual(phaseFourCorrectionColumns.map((row) => `${row.table_name}.${row.column_name}`), ['assay_record.gold_trade_line_id','gold_trade_line.is_current']);
     const phaseFourCorrectionIndex = await db(`SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname='gold_trade_line_one_current_batch_idx'`, {}, undefined, QueryTypes.SELECT);
     assert.equal(phaseFourCorrectionIndex.length, 1);
+
+    const rollbackEight = await readFile(new URL('../src/database/rollback/008_phase_four_observation_integrity.sql', import.meta.url), 'utf8');
+    const migrationEight = await readFile(new URL('../src/database/migrations/008_phase_four_observation_integrity.sql', import.meta.url), 'utf8');
+    const phaseFourObservationRollbackProbe = new Error('Phase 4 observation integrity migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackEight, { transaction, raw: true });
+      await sequelize.query(migrationEight, { transaction, raw: true });
+      throw phaseFourObservationRollbackProbe;
+    }), (error) => error === phaseFourObservationRollbackProbe);
+    const phaseFourObservationTriggers = await db(`SELECT event_object_table AS table_name FROM information_schema.triggers
+      WHERE trigger_schema='public' AND trigger_name='phase_four_observation_state_guard' ORDER BY event_object_table`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseFourObservationTriggers.map((row) => row.table_name), ['assay_record', 'material_measurement']);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -2102,7 +2114,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal((await verifyAuditStream('gold_trade', tradeId)).valid, true);
   });
 
-  await t.test('Phase 4 assay and measurement attribution, assay lineage, and current batch-line integrity', async () => {
+  await t.test('Phase 4 assay and measurement attribution, assay lineage, and current batch-line integrity', async (phaseFourIntegrity) => {
     const [recovered] = await db(`SELECT ro.batch_id,location.custodian_party_id AS seller_party_id,ril.inventory_location_id AS source_location_id
       FROM recovery_event_output ro JOIN recovery_event re ON re.event_id=ro.recovery_event_id
       JOIN recovery_inventory_location ril ON ril.recovery_facility_id=re.recovery_facility_id
@@ -2276,6 +2288,125 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.deepEqual(concurrentAdds.map((response) => response.status).sort(), [201, 409]);
     const raceCurrentLineCount = await db(`SELECT count(*)::int AS total FROM gold_trade_line WHERE trade_id=:tradeId AND batch_id=:batchId AND is_current`, { tradeId: raceTradeResponse.body.id, batchId: batchB }, undefined, QueryTypes.SELECT);
     assert.equal(raceCurrentLineCount[0].total, 1);
+
+    await phaseFourIntegrity.test('observations serialize with trade closure and line revision', async () => {
+      const observationCounts = async (lineId) => {
+        const [counts] = await db(`SELECT
+          (SELECT count(*)::int FROM material_measurement measurement JOIN material_measurement_set measurement_set ON measurement_set.id=measurement.measurement_set_id WHERE measurement_set.gold_trade_line_id=:lineId) AS measurements,
+          (SELECT count(*)::int FROM assay_record WHERE gold_trade_line_id=:lineId) AS assays`, { lineId }, undefined, QueryTypes.SELECT);
+        return counts;
+      };
+      const waitForBlockedWrites = async (tradeId) => {
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          const [waiters] = await db(`SELECT count(*)::int AS total FROM pg_stat_activity
+            WHERE datname=current_database() AND state='active' AND wait_event_type='Lock'
+              AND position('FOR UPDATE' IN upper(query))>0 AND position(:tradeId IN query)>0`, { tradeId }, undefined, QueryTypes.SELECT);
+          if (waiters.total >= 2) return;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        throw new Error(`Both observation requests did not reach the trade row lock for ${tradeId}.`);
+      };
+      const raceObservationsWith = async (tradeId, applyChange) => {
+        let releaseLock;
+        let acquiredLock;
+        const lockAcquired = new Promise((resolve) => { acquiredLock = resolve; });
+        const heldTransaction = sequelize.transaction(async (transaction) => {
+          await db(`SELECT id FROM gold_trade WHERE id=:tradeId FOR UPDATE`, { tradeId }, transaction);
+          await new Promise((resolve) => {
+            releaseLock = resolve;
+            acquiredLock();
+          });
+          await applyChange(transaction);
+        });
+        await lockAcquired;
+        const pendingResponses = Promise.all([
+          recordMeasurement(tradeId, (await db(`SELECT id FROM gold_trade_line WHERE trade_id=:tradeId AND is_current`, { tradeId }, undefined, QueryTypes.SELECT))[0].id, 'SELLER', sellerToken),
+          recordAssay(tradeId, (await db(`SELECT id FROM gold_trade_line WHERE trade_id=:tradeId AND is_current`, { tradeId }, undefined, QueryTypes.SELECT))[0].id, sellerToken, assayBody(sellerPartyId)),
+        ]);
+        let blockedWriteError;
+        try {
+          await waitForBlockedWrites(tradeId);
+        } catch (error) {
+          blockedWriteError = error;
+        } finally {
+          releaseLock();
+        }
+        await heldTransaction;
+        const responses = await pendingResponses;
+        if (blockedWriteError) throw blockedWriteError;
+        return responses;
+      };
+      const closeTrade = async (tradeId, transaction) => {
+        await db(`INSERT INTO gold_trade_status_event(id,gold_trade_id,previous_status,next_status,actor_user_id,actor_party_id,occurred_at,reason)
+          VALUES (:id,:tradeId,'PROPOSED','CLOSED',:actor,:party,:occurredAt,'Fictional integration-test closure.')`, {
+          id: randomUUID(), tradeId, actor: buyer.userId, party: buyerPartyId, occurredAt: tradeDate,
+        }, transaction);
+        await db(`UPDATE gold_trade SET status='CLOSED' WHERE id=:tradeId`, { tradeId }, transaction);
+      };
+
+      const closingTradeResponse = await createTrade(proposal(batchA));
+      assert.equal(closingTradeResponse.status, 201, closingTradeResponse.text);
+      const closingTradeId = closingTradeResponse.body.id;
+      const closingLineId = closingTradeResponse.body.lines[0].id;
+      const closeRace = await raceObservationsWith(closingTradeId, (transaction) => closeTrade(closingTradeId, transaction));
+      assert.deepEqual(closeRace.map((response) => [response.status, response.body.error.code]).sort((left, right) => left[1].localeCompare(right[1])), [
+        [409, 'TRADE_CLOSED'], [409, 'TRADE_CLOSED'],
+      ]);
+      assert.deepEqual(await observationCounts(closingLineId), { measurements: 0, assays: 0 });
+      assert.equal((await recordMeasurement(closingTradeId, closingLineId, 'SELLER', sellerToken)).body.error.code, 'TRADE_CLOSED');
+      assert.equal((await recordAssay(closingTradeId, closingLineId, sellerToken, assayBody(sellerPartyId))).body.error.code, 'TRADE_CLOSED');
+      assert.deepEqual(await observationCounts(closingLineId), { measurements: 0, assays: 0 });
+
+      const [closedMeasurementSet] = await db(`SELECT id FROM material_measurement_set WHERE gold_trade_line_id=:lineId`, { lineId: closingLineId }, undefined, QueryTypes.SELECT);
+      await assert.rejects(db(`INSERT INTO assay_record(id,batch_id,assayer_party_id,result_value,result_unit,observed_at,recorded_by_user_id,gold_trade_line_id)
+        VALUES (:id,:batchId,:assayer,'92.50000000','PERCENT',:observedAt,:actor,:lineId)`, {
+        id: randomUUID(), batchId: batchA, assayer: sellerPartyId, observedAt: tradeDate, actor: sellerPerson, lineId: closingLineId,
+      }), sqlError('23514'));
+      await assert.rejects(db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
+        VALUES (:id,:setId,'DECLARED','0.010000','10.000','mg','canonical-mass-v1','SELLER',:source,:actor,:occurredAt)`, {
+        id: randomUUID(), setId: closedMeasurementSet.id, source: sellerPartyId, actor: sellerPerson, occurredAt: tradeDate,
+      }), sqlError('23514'));
+      assert.deepEqual(await observationCounts(closingLineId), { measurements: 0, assays: 0 });
+
+      const revisionTradeResponse = await createTrade(proposal(batchB));
+      assert.equal(revisionTradeResponse.status, 201, revisionTradeResponse.text);
+      const revisionTradeId = revisionTradeResponse.body.id;
+      const priorLineId = revisionTradeResponse.body.lines[0].id;
+      const successorLineId = randomUUID();
+      const successorMeasurementSetId = randomUUID();
+      const revisionRace = await raceObservationsWith(revisionTradeId, async (transaction) => {
+        await db(`INSERT INTO gold_trade_line(id,trade_id,batch_id,revision_no,revision_kind,transaction_quantity_g,unit_price,line_amount,supersedes_line_id,correction_reason,is_current)
+          VALUES (:id,:tradeId,:batchId,2,'CORRECTION','0.010000','2400.00000000','24.00000000',:prior,'Fictional concurrent revision.',false)`, {
+          id: successorLineId, tradeId: revisionTradeId, batchId: batchB, prior: priorLineId,
+        }, transaction);
+        await db(`INSERT INTO material_measurement_set(id,batch_id,gold_trade_line_id) VALUES (:id,:batchId,:lineId)`, {
+          id: successorMeasurementSetId, batchId: batchB, lineId: successorLineId,
+        }, transaction);
+        await db(`UPDATE gold_trade_line SET is_current=false WHERE id=:lineId`, { lineId: priorLineId }, transaction);
+        await db(`UPDATE gold_trade_line SET is_current=true WHERE id=:lineId`, { lineId: successorLineId }, transaction);
+      });
+      assert.deepEqual(revisionRace.map((response) => [response.status, response.body.error.code]).sort((left, right) => left[1].localeCompare(right[1])), [
+        [409, 'STALE_TRADE_LINE'], [409, 'STALE_TRADE_LINE'],
+      ]);
+      assert.deepEqual(await observationCounts(priorLineId), { measurements: 0, assays: 0 });
+      assert.deepEqual(await observationCounts(successorLineId), { measurements: 0, assays: 0 });
+      const [currentLines] = await db(`SELECT count(*)::int AS total FROM gold_trade_line WHERE trade_id=:tradeId AND is_current`, { tradeId: revisionTradeId }, undefined, QueryTypes.SELECT);
+      assert.equal(currentLines.total, 1);
+      assert.equal((await recordMeasurement(revisionTradeId, priorLineId, 'SELLER', sellerToken)).body.error.code, 'STALE_TRADE_LINE');
+      assert.equal((await recordAssay(revisionTradeId, priorLineId, sellerToken, assayBody(sellerPartyId))).body.error.code, 'STALE_TRADE_LINE');
+
+      const [supersededMeasurementSet] = await db(`SELECT id FROM material_measurement_set WHERE gold_trade_line_id=:lineId`, { lineId: priorLineId }, undefined, QueryTypes.SELECT);
+      await assert.rejects(db(`INSERT INTO assay_record(id,batch_id,assayer_party_id,result_value,result_unit,observed_at,recorded_by_user_id,gold_trade_line_id)
+        VALUES (:id,:batchId,:assayer,'92.50000000','PERCENT',:observedAt,:actor,:lineId)`, {
+        id: randomUUID(), batchId: batchB, assayer: sellerPartyId, observedAt: tradeDate, actor: sellerPerson, lineId: priorLineId,
+      }), sqlError('23514'));
+      await assert.rejects(db(`INSERT INTO material_measurement(id,measurement_set_id,measurement_kind,quantity_g,source_value,source_unit_code,conversion_version,source_role,source_party_id,entered_by_user_id,occurred_at_claimed)
+        VALUES (:id,:setId,'DECLARED','0.010000','10.000','mg','canonical-mass-v1','SELLER',:source,:actor,:occurredAt)`, {
+        id: randomUUID(), setId: supersededMeasurementSet.id, source: sellerPartyId, actor: sellerPerson, occurredAt: tradeDate,
+      }), sqlError('23514'));
+      assert.deepEqual(await observationCounts(priorLineId), { measurements: 0, assays: 0 });
+    });
   });
 
   await t.test('append-only per-aggregate audit chains verify sequence, payload, and concurrent appends', async () => {

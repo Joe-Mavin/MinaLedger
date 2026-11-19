@@ -8,6 +8,12 @@
 
 Proposing a technical structure does not resolve a participant-dependent business rule. D-09, D-16 through D-25 remain proposals until owner/pilot review and their follow-up questions are answered. A database mechanism can be specified without deciding who may exercise it or whether the represented practice is acceptable locally.
 
+## Verified Phase 4 implementation note (2026-11-19)
+
+- **Implemented:** migration 008 and its rollback add insert-time PostgreSQL guards for assays and trade-line measurements on closed trades or superseded lines. Application observation, revision and line-decision commands share trade-then-line locks and revalidate state and live actor/source authorization inside their transactions.
+- **Tested and verified:** the full PostgreSQL `_test` suite passed **50/50**; deterministic integration races cover concurrent closure and revision with measurement and assay writes, and direct database inserts verify trigger enforcement. `npm run lint` passed for 24 ES modules. Migration 008 rollback/reapplication is tested, and the suite migrates the schema from empty.
+- **Pending field validation:** this technical rule does not choose local assay acceptance, instrument, custody, measurement, evidence or dispute procedures. It does not establish laboratory certification, production deployment or external verification.
+
 ## Decisions
 
 | ID | Status and decision | Reason | Alternative considered | Unresolved follow-up |

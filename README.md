@@ -65,9 +65,9 @@ npm test
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
-Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt, recovery genealogy and gold-trade settlement. They use synthetic fictional records only. The full verified suite reports **48 tests, 48 passed, 0 failed**, including rollback/reapply coverage for migrations 003, 004, 005 and 006.
+Tests run against PostgreSQL, apply the SQL migrations from an empty schema, and exercise API and database integrity across production, allocation, QR, measurement, inventory, commercial constraints, audit, residue pooling, custody, consignment, receipt, recovery genealogy and gold-trade settlement. They use synthetic fictional records only. The full verified suite reports **50 tests, 50 passed, 0 failed**, including rollback/reapply coverage for migrations 003, 004, 005, 006, 007 and 008.
 
-Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Verification on 2026-11-19 passed for **24 ES modules**; the full PostgreSQL suite passed **48/48 tests** against the dedicated `_test` database.
+Run `npm run lint` to syntax-check every server and integration-test ES module with Node.js before running `npm test`. Verification on 2026-11-19 passed for **24 ES modules**; the full PostgreSQL suite passed **50/50 tests** against the dedicated `_test` database. Phase 4 tests include measurement and assay rejection on closed trades and superseded lines, plus concurrent closure/revision races with persisted-state checks.
 
 ## Available API routes
 

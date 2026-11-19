@@ -2,7 +2,7 @@
 
 ## Current status
 
-The PostgreSQL backend passes `npm run lint` for 24 ES modules and the complete integration suite with **49 tests, 49 passed and 0 failed** (verified 2026-11-19 on the dedicated `_test` database). The suite covers 31 nested Phase 3 scenarios, Phase 4 recovered-gold trade and settlement behavior, and Phase 1/2 integrity/regression cases. Migrations 003, 004, 005, 006 and 007 rollback/reapplication is verified. Phase 4 backend criteria for gold trades are implemented and tested; residue-sale payment endpoints, full gold aggregation workflows, frontend/offline workflows, production rollout, broad pilot acceptance and blockchain remain incomplete.
+The PostgreSQL backend passes `npm run lint` for 24 ES modules and the complete integration suite with **50 tests, 50 passed and 0 failed** (verified 2026-11-19 on the dedicated `_test` database). The suite covers 31 nested Phase 3 scenarios, Phase 4 recovered-gold trade and settlement behavior, and Phase 1/2 integrity/regression cases. Migrations 003, 004, 005, 006, 007 and 008 rollback/reapplication is verified. Phase 4 backend criteria for gold trades are implemented and tested; residue-sale payment endpoints, full gold aggregation workflows, frontend/offline workflows, production rollout, broad pilot acceptance and blockchain remain incomplete.
 
 ## Domain coverage
 
@@ -29,6 +29,8 @@ The PostgreSQL backend passes `npm run lint` for 24 ES modules and the complete 
 **Phase 4 custody verification:** every tested gold handover offer cites a current measured/verified observation on the trade line whose quantity exactly matches the transfer. Recipient acceptance records the custody decision and posts balanced source OUT/destination IN lines atomically in the existing journal. Disputes and idempotent retries do not post duplicate inventory, and concurrent offers cannot make the source balance negative.
 
 **Phase 4 integrity verification:** assay submissions require the authenticated user to represent an active assayer person or organization at the claimed observation time; organization representation requires active effective membership and an active organization-scoped role. Gold trade measurement roles validate seller, buyer, recorder, witness, weigher and other-source attribution under the same representation rule; witness/weigher/other roles require an explicit source. Assays and trade lines have composite batch constraints. Each proposal has one current line per batch; changes append a linked successor, and a database partial unique index prevents concurrent duplicate current lines. Assays remain recorded observations and are not presented as laboratory certification or independent verification.
+
+**Phase 4 observation-state verification:** application writes lock the trade and then the referenced line inside the observation transaction and revalidate trade status, line currentness and live actor/source authorization before insert. PostgreSQL triggers repeat the authoritative closed-trade/current-line check for direct assay and trade-measurement inserts. Integration tests verify persisted state after closed/stale rejections and force concurrent closure and revision while both observation requests wait on the same trade lock. These software checks are verified; participant procedures and field measurement/assay practices remain pending field validation.
 
 ## Access and audit
 

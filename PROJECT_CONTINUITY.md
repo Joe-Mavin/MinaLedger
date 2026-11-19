@@ -2,20 +2,22 @@
 
 ## Current verified state
 
-Backend implementation through the Phase 4 gold-trade slice is present in the repository. Phase 4 was added on top of the Phase 1-3 baseline at `495eb932e3e4dedbc7dd7396c139554741cd28e2`; historical migrations 001-005 were not modified.
+Backend implementation through the Phase 4 gold-trade slice is present in the repository. Phase 4 was added on top of the Phase 1-3 baseline at `495eb932e3e4dedbc7dd7396c139554741cd28e2`; historical migrations 001-007 were not modified.
 
 Phase 4 provides gold-trade proposal and read/reconciliation APIs, bilateral term decisions and revisions, append-only weight and assay records, measured custody offers and decisions, atomic inventory journal posting for accepted handovers, and gold-trade payment reports/decisions. It uses the existing Express authentication middleware, live PostgreSQL account/role checks, party-level resource authorization, idempotency and audit streams. Custody remains independent from agreement, entitlement and settlement. Payment reports are claims and do not establish external financial verification.
 
-Additive migrations `server/src/database/migrations/006_phase_four_gold_trades.sql` and `007_phase_four_integrity_corrections.sql` and their rollback scripts are in place. Migration 007 adds current-line uniqueness/projection, exact assay-to-batch and assay-to-line linkage, and database-side assay and gold-measurement attribution checks. Historical migrations 001-006 remain unchanged. The full integration suite applies from an empty schema and covers rollback/reapplication of migrations 003-007.
+Additive migrations `server/src/database/migrations/006_phase_four_gold_trades.sql`, `007_phase_four_integrity_corrections.sql` and `008_phase_four_observation_integrity.sql` and their rollback scripts are in place. Migration 007 adds current-line uniqueness/projection, exact assay-to-batch and assay-to-line linkage, and database-side assay and gold-measurement attribution checks. Migration 008 rejects assay and trade-measurement inserts for closed trades or superseded lines, taking trade then line row locks. Historical migrations 001-007 remain unchanged. The full integration suite applies from an empty schema and covers rollback/reapplication of migrations 003-008.
 
 Verified on 2026-11-19 against the dedicated PostgreSQL `_test` database:
 
 - `npm run lint`: passed; 24 ES modules checked.
-- `npm test`: 49 tests, 49 passed, 0 failed.
+- `npm test`: 50 tests, 50 passed, 0 failed.
 - Phase 3 regression coverage: 31 nested scenarios, all passing.
-- Phase 4 corrections cover represented-party assay submission, revoked membership, all six measurement source roles, batch A/B assay mismatches across initial/add/revision paths, append-only assay corrections, duplicate/current line checks, idempotent replay and concurrent duplicate additions.
+- Phase 4 corrections cover represented-party assay submission, revoked membership, all six measurement source roles, batch A/B assay mismatches across initial/add/revision paths, append-only assay corrections, duplicate/current line checks, idempotent replay, concurrent duplicate additions, and observation writes racing with closure and revision. Both API revalidation and direct database insert guards were verified; failed writes leave no observations.
 
 Phase 4 technical rule: each trade proposal has at most one current line per batch; a correction is a linked successor that retains historical rows. A recorded assay identifies its trade-line context and batch, while its submission status remains `RECORDED`; no laboratory certification or independent verification is asserted. Measurement and assay attribution checks use active party representation and effective organization membership/role assignment at the claimed observation time.
+
+Observation integrity uses a parent-first lock order (`gold_trade`, then `gold_trade_line`) for measurement, assay, revision and decision commands. Application checks re-read status/currentness and live actor authorization inside the write transaction; migration 008 enforces closed/current-line state again in PostgreSQL. The tests establish implemented database/API behavior, not field validation or deployment.
 
 ## Remaining scope and decisions
 
