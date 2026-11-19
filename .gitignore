@@ -5,6 +5,8 @@ build/
 .env.*
 !.env.example
 coverage/
+client/playwright-report/
+client/test-results/
 .vscode/
 .DS_Store
 *.log

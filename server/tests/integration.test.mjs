@@ -61,6 +61,16 @@ function testToken(userId) {
   });
 }
 
+function makeSyncEnvelope({ userId, partyId, roleCode, scopeKind, scopeId, commandType, payload, occurredAt = happenedAt, actualParticipant = { identityState: 'UNKNOWN' }, captureProvenance, expectedVersion, parentCommandIds = [], revisionOf }) {
+  return {
+    clientMutationId: randomUUID(), deviceId: randomUUID(), recorderUserId: userId,
+    actualParticipant, actingContext: { partyId, roleCode, scopeKind, scopeId }, commandType, schemaVersion: 1,
+    payload, clientCreatedAt: new Date().toISOString(), clientTimezone: 'Africa/Nairobi', occurredAtClaimed: occurredAt,
+    ...(expectedVersion ? { expectedVersion } : {}), parentCommandIds, ...(revisionOf ? { revisionOf } : {}),
+    ...(captureProvenance ? { captureProvenance } : {}), evidence: [], localState: 'pending_upload',
+  };
+}
+
 function validRecoveryEventBody(locationId) {
   return {
     recoveryInventoryLocationId: locationId,
@@ -227,6 +237,22 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const phaseFourObservationTriggers = await db(`SELECT event_object_table AS table_name FROM information_schema.triggers
       WHERE trigger_schema='public' AND trigger_name='phase_four_observation_state_guard' ORDER BY event_object_table`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(phaseFourObservationTriggers.map((row) => row.table_name), ['assay_record', 'material_measurement']);
+
+    const rollbackNine = await readFile(new URL('../src/database/rollback/009_offline_sync.sql', import.meta.url), 'utf8');
+    const migrationNine = await readFile(new URL('../src/database/migrations/009_offline_sync.sql', import.meta.url), 'utf8');
+    const phaseFiveRollbackProbe = new Error('Phase 5 sync migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackNine, { transaction, raw: true });
+      const absent = await sequelize.query(`SELECT to_regclass('public.sync_command_receipt') AS table_name`, { type: QueryTypes.SELECT, transaction });
+      assert.equal(absent[0].table_name, null);
+      await sequelize.query(migrationNine, { transaction, raw: true });
+      const present = await sequelize.query(`SELECT to_regclass('public.sync_command_receipt') AS table_name`, { type: QueryTypes.SELECT, transaction });
+      assert.equal(present[0].table_name, 'sync_command_receipt');
+      throw phaseFiveRollbackProbe;
+    }), (error) => error === phaseFiveRollbackProbe);
+    const phaseFiveTables = await db(`SELECT table_name AS sync_table_name FROM information_schema.tables WHERE table_schema='public'
+      AND table_name IN ('sync_command_receipt','sync_command_receipt_history') ORDER BY table_name`, {}, undefined, QueryTypes.SELECT);
+    assert.deepEqual(phaseFiveTables.map((row) => row.sync_table_name), ['sync_command_receipt', 'sync_command_receipt_history']);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -475,6 +501,177 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     await assert.rejects(db(`INSERT INTO production_event_participant(id,production_event_id,party_id,hole_party_role_id) VALUES (:id,:eventId,:partyId,:relationshipId)`, {
       id: randomUUID(), eventId: ids.productionEventId, partyId: ids.minerPartyId, relationshipId: randomUUID(),
     }), sqlError('23514'));
+  });
+
+  await t.test('Phase 5 sync receipts reuse production services, preserve provenance, and enforce live authorization', async () => {
+    const submit = (token, envelope) => request(app).post('/api/v1/sync/commands')
+      .set('Authorization', `Bearer ${token}`).set('Idempotency-Key', envelope.clientMutationId).send(envelope);
+    const context = { userId: ids.siteUserId, partyId: ids.siteUserPartyId, roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteId };
+    const directCapture = {
+      actualParticipantPartyId: ids.minerPartyId, participantIdentityState: 'IDENTIFIED', sourceKind: 'DIRECT',
+      occurredAt: happenedAt, sourceReference: 'fictional-direct-note', evidenceRef: 'fictional-evidence-001',
+    };
+    const directInput = { holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [ids.holeOperatorRelationshipId], captureProvenance: directCapture, outputs: [{ materialKind: 'RESIDUE' }] };
+    const directEnvelope = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteId, input: directInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+    });
+    const created = await submit(ids.siteToken, directEnvelope);
+    assert.equal(created.status, 200, created.text);
+    assert.equal(created.body.receipt.status, 'server_accepted');
+    const acceptedEvent = created.body.receipt.response;
+    assert.equal(acceptedEvent.siteId, ids.siteId);
+    assert.equal(acceptedEvent.captureProvenance.sourceKind, 'DIRECT');
+    assert.equal((await db(`SELECT count(*)::int AS total FROM sync_command_receipt WHERE client_mutation_id=:id AND status='SERVER_ACCEPTED'`, { id: directEnvelope.clientMutationId }, undefined, QueryTypes.SELECT))[0].total, 1);
+
+    const replay = await submit(ids.siteToken, directEnvelope);
+    assert.equal(replay.status, 200, replay.text);
+    assert.equal(replay.body.receipt.response.id, acceptedEvent.id);
+    const changedReuse = await submit(ids.siteToken, { ...directEnvelope, payload: { siteId: ids.siteId, input: { ...directInput, shiftOrPeriodRef: 'changed-under-same-id' } } });
+    assert.equal(changedReuse.status, 409, changedReuse.text);
+    assert.equal(changedReuse.body.error.code, 'IDEMPOTENCY_KEY_REUSED');
+    const ownerReceipt = await request(app).get(`/api/v1/sync/receipts/${directEnvelope.clientMutationId}`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(ownerReceipt.status, 200, ownerReceipt.text);
+    const privateReceipt = await request(app).get(`/api/v1/sync/receipts/${directEnvelope.clientMutationId}`).set('Authorization', `Bearer ${ids.pilotToken}`);
+    assert.equal(privateReceipt.status, 404);
+
+    const [holeHead] = await db(`SELECT last_sequence FROM audit_stream_head WHERE stream_kind='mining_hole' AND stream_id=:holeId`, { holeId: ids.holeId }, undefined, QueryTypes.SELECT);
+    const paperCapture = {
+      actualParticipantPartyId: ids.minerPartyId, participantIdentityState: 'IDENTIFIED', sourceKind: 'PAPER_TRANSCRIPTION',
+      occurredAt: happenedAt, sourceReference: 'fictional-paper-book-17', evidenceRef: 'fictional-paper-image-17',
+    };
+    const paperInput = { holeId: ids.holeId, occurredAt: happenedAt, participantRelationshipIds: [ids.holeOperatorRelationshipId], captureProvenance: paperCapture, outputs: [{ materialKind: 'GOLD_BEARING_FEED' }] };
+    const paperEnvelope = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteId, input: paperInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: paperCapture,
+    });
+    const paper = await submit(ids.siteToken, paperEnvelope);
+    assert.equal(paper.status, 202, paper.text);
+    assert.equal(paper.body.receipt.status, 'needs_review');
+    const paperEvent = paper.body.receipt.response;
+    assert.equal(paperEvent.captureProvenance.sourceKind, 'PAPER_TRANSCRIPTION');
+    assert.equal(paperEvent.captureProvenance.actualParticipantPartyId, ids.minerPartyId);
+    const [storedPaper] = await db(`SELECT cp.source_kind,cp.source_reference,cp.evidence_ref,cp.occurred_at_claimed,cp.entered_at,cp.entered_by_user_id
+      FROM capture_provenance cp WHERE cp.id=:captureId`, { captureId: paperEvent.captureProvenance.id }, undefined, QueryTypes.SELECT);
+    assert.equal(storedPaper.source_kind, 'PAPER_TRANSCRIPTION');
+    assert.equal(storedPaper.source_reference, 'fictional-paper-book-17');
+    assert.notEqual(new Date(storedPaper.entered_at).toISOString(), happenedAt);
+    assert.equal(storedPaper.entered_by_user_id, ids.siteUserId);
+
+    const staleEnvelope = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteId, input: directInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+      expectedVersion: { streamKind: 'mining_hole', streamId: ids.holeId, sequence: Number(holeHead.last_sequence) },
+    });
+    const stale = await submit(ids.siteToken, staleEnvelope);
+    assert.equal(stale.status, 409, stale.text);
+    assert.equal(stale.body.receipt.status, 'conflict');
+    assert.equal(stale.body.receipt.error.code, 'STALE_VERSION');
+    const linkedRevision = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteId, input: { ...directInput, shiftOrPeriodRef: 'linked-correction' } },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+      parentCommandIds: [staleEnvelope.clientMutationId], revisionOf: staleEnvelope.clientMutationId,
+    });
+    const corrected = await submit(ids.siteToken, linkedRevision);
+    assert.equal(corrected.status, 200, corrected.text);
+    assert.equal(corrected.body.receipt.status, 'server_accepted');
+    assert.notEqual(corrected.body.receipt.response.id, acceptedEvent.id);
+
+    const output = acceptedEvent.outputs[0];
+    const measurementInput = { kind: 'MEASURED', quantityGrams: '2.500000', sourceValue: '2.5', sourceUnit: 'g', conversionVersion: 'sync-test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt };
+    const measurementEnvelope = makeSyncEnvelope({
+      ...context, commandType: 'production.measurement.add',
+      payload: { siteId: ids.siteId, eventId: acceptedEvent.id, outputId: output.id, input: measurementInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId },
+    });
+    const measured = await submit(ids.siteToken, measurementEnvelope);
+    assert.equal(measured.status, 200, measured.text);
+    assert.equal(measured.body.receipt.status, 'server_accepted');
+    assert.equal(measured.body.receipt.response.quantityGrams, '2.500000');
+
+    const participantUserId = randomUUID();
+    await db(`INSERT INTO user_account(id,person_party_id,email,password_hash) VALUES (:id,:partyId,'sync-participant@example.test',:hash)`, {
+      id: participantUserId, partyId: ids.minerPartyId, hash: await bcrypt.hash(password, 8),
+    });
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'MINER','HOLE',:holeId)`, {
+      id: randomUUID(), userId: participantUserId, holeId: ids.holeId,
+    });
+    const participantToken = testToken(participantUserId);
+    const acknowledgementTime = new Date().toISOString();
+    const acknowledgement = makeSyncEnvelope({
+      userId: participantUserId, partyId: ids.minerPartyId, roleCode: 'MINER', scopeKind: 'HOLE', scopeId: ids.holeId,
+      commandType: 'capture.acknowledgement.add',
+      payload: { siteId: ids.siteId, eventId: paperEvent.id, captureProvenanceId: paperEvent.captureProvenance.id,
+        acknowledgement: { status: 'ACKNOWLEDGED', acknowledgedByPartyId: ids.minerPartyId, method: 'IN_PERSON', occurredAt: acknowledgementTime } },
+      occurredAt: acknowledgementTime, actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId },
+      parentCommandIds: [paperEnvelope.clientMutationId],
+    });
+    const acknowledged = await submit(participantToken, acknowledgement);
+    assert.equal(acknowledged.status, 200, acknowledged.text);
+    assert.equal(acknowledged.body.receipt.status, 'server_accepted');
+    const [ackRow] = await db(`SELECT status,acknowledged_by_party_id,recorded_by_user_id FROM capture_acknowledgement_event WHERE id=:id`, { id: acknowledged.body.receipt.response.id }, undefined, QueryTypes.SELECT);
+    assert.equal(ackRow.status, 'ACKNOWLEDGED');
+    assert.equal(ackRow.acknowledged_by_party_id, ids.minerPartyId);
+    assert.equal(ackRow.recorded_by_user_id, participantUserId);
+
+    const unauthorizedAck = makeSyncEnvelope({
+      ...context, commandType: 'capture.acknowledgement.add',
+      payload: { siteId: ids.siteId, eventId: paperEvent.id, captureProvenanceId: paperEvent.captureProvenance.id,
+        acknowledgement: { status: 'DISPUTED', method: 'IN_PERSON', occurredAt: acknowledgementTime, reason: 'fictional dispute' } },
+      occurredAt: acknowledgementTime, actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId },
+    });
+    const forged = await submit(ids.siteToken, unauthorizedAck);
+    assert.equal(forged.status, 422, forged.text);
+    assert.equal(forged.body.receipt.error.code, 'RESOURCE_NOT_FOUND');
+
+    const disputeTime = new Date().toISOString();
+    const dispute = makeSyncEnvelope({
+      userId: participantUserId, partyId: ids.minerPartyId, roleCode: 'MINER', scopeKind: 'HOLE', scopeId: ids.holeId,
+      commandType: 'capture.acknowledgement.add',
+      payload: { siteId: ids.siteId, eventId: paperEvent.id, captureProvenanceId: paperEvent.captureProvenance.id,
+        acknowledgement: { status: 'DISPUTED', method: 'IN_PERSON', occurredAt: disputeTime, reason: 'fictional participant dispute' } },
+      occurredAt: disputeTime, actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId },
+    });
+    const disputed = await submit(participantToken, dispute);
+    assert.equal(disputed.status, 200, disputed.text);
+    assert.equal(disputed.body.receipt.response.status, 'DISPUTED');
+    const disputeHistory = await db(`SELECT status FROM capture_acknowledgement_event WHERE capture_provenance_id=:captureId ORDER BY recorded_at,id`, { captureId: paperEvent.captureProvenance.id }, undefined, QueryTypes.SELECT);
+    assert.deepEqual(disputeHistory.map((row) => row.status), ['ACKNOWLEDGED', 'DISPUTED']);
+
+    const missingParent = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteId, input: directInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+      parentCommandIds: [randomUUID()],
+    });
+    const dependency = await submit(ids.siteToken, missingParent);
+    assert.equal(dependency.status, 409, dependency.text);
+    assert.equal(dependency.body.receipt.error.code, 'DEPENDENCY_NOT_ACCEPTED');
+
+    const revokedUser = await seedUser('revoked-sync-recorder@example.test', 'Revoked Sync Recorder', { roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeId });
+    await db(`UPDATE role_assignment SET status='REVOKED',valid_to=now() WHERE id=:id`, { id: revokedUser.roleAssignmentId });
+    const revokedEnvelope = makeSyncEnvelope({
+      userId: revokedUser.userId, partyId: revokedUser.partyId, roleCode: 'FIELD_OFFICER', scopeKind: 'HOLE', scopeId: ids.holeId,
+      commandType: 'production.create', payload: { siteId: ids.siteId, input: directInput },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+    });
+    const revoked = await submit(testToken(revokedUser.userId), revokedEnvelope);
+    assert.equal(revoked.status, 422, revoked.text);
+    assert.equal(revoked.body.receipt.error.code, 'ACTING_CONTEXT_REVOKED');
+
+    const crossSiteEnvelope = makeSyncEnvelope({
+      ...context, commandType: 'production.create', payload: { siteId: ids.siteBId, input: { ...directInput, holeId: randomUUID() } },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId }, captureProvenance: directCapture,
+    });
+    const crossSite = await submit(ids.siteToken, crossSiteEnvelope);
+    assert.equal(crossSite.status, 422, crossSite.text);
+    assert.equal(crossSite.body.receipt.error.code, 'RESOURCE_NOT_FOUND');
+    const arbitrary = await submit(ids.siteToken, { ...directEnvelope, commandType: 'inventory.transfer' });
+    assert.equal(arbitrary.status, 400);
+    assert.equal(arbitrary.body.error.code, 'INVALID_INPUT');
+
+    await assert.rejects(db(`UPDATE sync_command_receipt SET envelope='{}'::jsonb WHERE client_mutation_id=:id`, { id: directEnvelope.clientMutationId }), sqlError('55000'));
+    await assert.rejects(db(`DELETE FROM sync_command_receipt_history WHERE receipt_id=(SELECT id FROM sync_command_receipt WHERE client_mutation_id=:id)`, { id: directEnvelope.clientMutationId }), sqlError('55000'));
+    assert.equal((await verifyAuditStream('mining_hole', ids.holeId)).valid, true);
   });
 
   await t.test('hole-scoped access stays within assigned holes across nested endpoints', async () => {

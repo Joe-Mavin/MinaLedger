@@ -2,7 +2,9 @@
 
 ## Status and operating rule
 
-**Proposed technical decision:** use IndexedDB for locally saved command envelopes and a PWA service worker for the app shell and sync opportunities. PostgreSQL is authoritative after server receipt; participant acknowledgement, business approval and ledger inclusion are separate states. Offline capture is never labelled server-accepted or blockchain-committed before those respective confirmations.
+**Phase 5 technical slice implemented and locally automated-test verified (2026-11-19); no production deployment or field acceptance is claimed.** The React/TypeScript client uses IndexedDB for command envelopes and scoped references, and a service worker for app-shell caching. PostgreSQL remains authoritative. The service worker does not cache API responses and there is no guaranteed background sync. Participant acknowledgement and server acceptance remain separate. No ledger states are active in the implementation.
+
+The current sync allowlist has three commands: production creation, production measurement addition and separate capture acknowledgement. Commands flow through the authenticated Express middleware and existing domain services. The server validates role/resource scope, acting party, participant relationship, command schema, dependencies and expected audit sequence. Migration 009 persists an immutable envelope and durable receipt/history. The client retries with the same mutation ID and envelope, uses bounded exponential backoff with jitter, and checks the receipt after an unknown upload outcome. A changed revision receives a new mutation ID and links to its parent.
 
 ## Personal phones are not a prerequisite
 
@@ -55,9 +57,9 @@ Each command has its own state. “Saved” must say whether it means local stor
 | `server_accepted` | Server accepted the command under domain rules; any separate participant-acknowledgement requirement remains visible. |
 | `conflict` | A current version, identity, inventory or prior event conflicts; review is required. |
 | `rejected` | Server rejected it with a reason; retain the receipt and allow a corrected new command when appropriate. |
-| `ledger_queued` / `ledger_submitted` | An eligible server-accepted commitment awaits network confirmation. |
-| `ledger_committed` | A network receipt confirms commitment under its configured policy. |
-| `ledger_failed` | Submission failed/exhausted attempts; server acceptance remains a separate state. |
+| `ledger_queued` / `ledger_submitted` | Future proposal only; no network submission is implemented. |
+| `ledger_committed` | Future proposal only; no network receipt is implemented. |
+| `ledger_failed` | Future proposal only; no ledger worker is implemented. |
 
 Unacknowledged/disputed submissions may be retained as attributed reports when the pilot permits, but cannot be presented as participant-approved. They must not satisfy an approval or custody condition that requires the participant's response. Ledger eligibility follows the approved event policy; no pre-acceptance ledger confirmation is shown.
 
@@ -70,18 +72,18 @@ Unacknowledged/disputed submissions may be retained as attributed reports when t
 - Different offline users can submit conflicting claims for one batch. Keep each attributed record; use an append-only dispute/reconciliation event, not timestamp-based merging.
 - A participant's later acknowledgement or dispute is a separate event referencing the submission; it does not edit the original provenance.
 
-## Server acknowledgement and inventory/ledger handoff
+## Server acknowledgement and future ledger handoff
 
-1. API checks schema, authenticated recorder role/scope, participant/capture provenance, idempotency, dependencies and current versions.
-2. In one PostgreSQL transaction, store domain facts, capture provenance, measurement records, one inventory journal posting set (if applicable), audit stream entries, idempotency receipt and any eligible outbox item.
-3. Return server receipt time and state separately from occurrence time, participant acknowledgement and business review. Persist the response locally before marking server receipt.
-4. Dispatch and receipt transfer measured quantity between stockpile, transit-consignment and recovery inventory locations with paired OUT/IN postings. The consignment manifest is not another balance posting.
-5. A background worker submits an eligible commitment after server acceptance and records the network transaction ID/receipt separately.
+1. The API validates schema, authenticated recorder role/scope, participant/capture provenance, idempotency, dependencies and current audit sequence.
+2. It durably records the submission receipt. When the command is ready to apply, the domain operation, audit event and accepted receipt transition commit together through the existing domain service transaction.
+3. The response keeps server receipt time and state separate from claimed occurrence time, participant acknowledgement and business review. The client persists the receipt before updating its local command state.
+4. Inventory dispatch/receipt remains an independent existing workflow and is not an accepted Phase 5 sync command. Its stockpile/transit/facility postings continue through the single inventory journal.
+5. An asynchronous ledger worker and separate network receipt are future work; no outbox handoff or ledger state is implemented in Phase 5.
 
 ## Retries, recovery and pilot decisions
 
-- Retry transient network/server failures with capped backoff; respect `Retry-After`. Pause for authentication expiry, revoked scope, schema incompatibility, permanent rejection or a conflict.
-- Resume IndexedDB commands after app restart. Server outbox retries independently of the device.
-- Track queue age, acknowledgements pending, paper transcriptions, disputes, duplicate attempts and ledger backlog. Set alert thresholds after pilot observation.
+- Retry transient network/server failures with capped exponential backoff and jitter; the client checks the durable receipt after an unknown outcome. The user must sign in again after session expiry. Server-side scope revocation is enforced on upload.
+- Resume IndexedDB commands after app restart. Synchronization is retried on foreground/online opportunities; browser suspension can delay it.
+- Queue-age monitoring, server-side workers, alert thresholds and ledger backlog metrics are operational follow-up, not implemented features.
 - Validate shared-device handling, recorder authorization, acknowledgement accessibility, no-phone use, paper retention, language, clock accuracy, connectivity, storage eviction and lost-device response with participants.
 - Decide who may transcribe paper records, whether witness capture is allowed, which acknowledgements are required per event, how a participant disputes an entry, whether evidence must be attached, and how long offline authorization lasts before implementing those rules.

@@ -1,0 +1,10 @@
+{
+  "name": "MinaLedger Field",
+  "short_name": "MinaLedger",
+  "description": "Offline field capture for MinaLedger",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7f4",
+  "theme_color": "#12372b",
+  "icons": [{ "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

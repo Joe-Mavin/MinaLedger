@@ -37,9 +37,15 @@ The gold-trade backend slice and targeted Phase 4 integrity corrections are impl
 - Targeted Phase 4 regression tests cover authorized and unauthorized assay parties, revoked organization membership, all six measurement source roles, cross-batch assay attachment on proposal/add/revision, direct database FK and state-trigger rejection, append-only assay history, duplicate batch checks, linked successors, idempotent add replay and concurrent add attempts. Deterministic closure/observation and revision/observation races prove that in-flight writes revalidate final state and leave no partial observations. Existing bilateral terms, custody movement and payment reconciliation scenarios also pass.
 - Remaining scope and validation: the current gold payment API does not expose residue-sale settlement; it does not connect to a payment provider or independently verify money movement. Currency conversion, a gold aggregation transformation, frontend/offline workflows, deployment and pilot operations are not implemented. The integration scenario exercises recovered gold; local-miner purchases and merchant-to-merchant aggregation/resale need broader scenario validation. Custody measurement practice, assay acceptance, price visibility, supported currencies and settlement evidence/authority remain participant decisions.
 
+## Phase 5 implementation status (2026-11-19)
+
+The Phase 5 offline queue, PWA and synchronization slice is implemented and locally automated-test verified. The client persists versioned command envelopes and scoped references in IndexedDB, caches only the app shell, and resumes upload on online/foreground opportunities. The authenticated sync API supports production creation, production measurement addition and separate capture acknowledgement. It rechecks live authorization and dispatches through existing domain services. Migration 009 and its rollback add durable receipts and append-only receipt history without modifying migrations 001–008.
+
+Verification on the dedicated PostgreSQL `_test` database: backend lint passed for 27 ES modules; backend integration suite passed 51/51, including migration rollback/reapplication 003–009; client ESLint passed; TypeScript and Vite production build passed; client unit tests passed 2/2; Chromium browser test passed 1/1. Hosting, HTTPS deployment, field acceptance and offline policy decisions remain open. Phase 6 is not started.
+
 ## Delivery rule
 
-The milestone definitions below describe scope and acceptance criteria; implementation status is stated in the Phase 1/2/3/4 summaries above. The Phase 4 backend slice is implemented, while broader Stage 4 deliverables and Stages 5 onward remain future work. Participant-dependent decisions in the [decision log](DECISION_LOG.md) remain unresolved and must be answered before their affected rules are treated as pilot policy. Do not turn unresolved assumptions into defaults. Each future implementation stage should ship a reviewable vertical slice with migrations, API/UI, permissions, observability and automated tests appropriate to its scope.
+The milestone definitions below describe scope and acceptance criteria; implementation status is stated in the Phase 1/2/3/4/5 summaries above. Phase 5's technical slice is implemented, while deployment, field acceptance and Stages 6 onward remain future work. Participant-dependent decisions in the [decision log](DECISION_LOG.md) remain unresolved and must be answered before their affected rules are treated as pilot policy. Do not turn unresolved assumptions into defaults. Each future implementation stage should ship a reviewable vertical slice with migrations, API/UI, permissions, observability and automated tests appropriate to its scope.
 
 ## Stage 0 — Phase 0 specification (current assignment)
 
@@ -88,7 +94,7 @@ The milestone definitions below describe scope and acceptance criteria; implemen
 - **Automated tests:** integration scenarios for both value-chain routes and both payment parents; authorization tests for counterpart versus unrelated prices; concurrency tests preventing overselling/overpayment; idempotency tests for trade/payment/custody; correction/reversal and disagreement tests.
 - **Known risks:** counterparties may disagree about price/assay or refuse detailed source disclosure; aggregation attribution may not be defensible.
 
-## Stage 5 — offline command queue and synchronization
+## Stage 5 — offline command queue and synchronization (implemented 2026-11-19)
 
 - **Scope:** IndexedDB command storage, service-worker app shell, sync status UI, idempotent upload/receipts, retries, dependency ordering, version conflicts, shared-device assisted capture, participant acknowledgement, paper transcription and offline-data lifecycle.
 - **Dependencies:** stable Stage 1–4 API schemas; pilot device/browser/connectivity observation; offline authentication and local data policy.
@@ -96,6 +102,8 @@ The milestone definitions below describe scope and acceptance criteria; implemen
 - **Acceptance criteria:** offline-created commands survive restart; no-phone participants can be captured by an authorized recorder; participant, recorder, source, acknowledgement, occurrence time and entry time are distinct; later paper transcription is labelled; no recorder entry implies consent/approval; duplicate retries and conflicts behave as specified.
 - **Automated tests:** browser storage/restart tests; network disconnect/reconnect tests; assisted/shared-device and paper-transcription tests; acknowledgement/dispute tests; idempotency and schema-version tests; conflict/ordering tests; local data clear/revocation tests.
 - **Known risks:** browser storage eviction, shared devices, stale permissions, local clock drift, poor connectivity and OS background-task limits.
+
+**Verified implementation:** React 19/TypeScript/Vite PWA; IndexedDB command and scoped-reference stores; app-shell-only service worker; three-command server allowlist (production creation, production measurement addition, capture acknowledgement); durable receipts and append-only history in migration 009 with rollback; live authorization checks; idempotent replay/collision checks; unknown-outcome recovery; dependency ordering; expected-version conflicts; paper-transcription provenance; and separate participant acknowledgement/dispute events. Verification passed on 2026-11-19: backend lint (27 ES modules), 51/51 PostgreSQL integration tests, client lint, production build, 2/2 unit tests and 1/1 Chromium browser test. Automated checks do not constitute pilot approval or field acceptance.
 
 ## Stage 6 — tamper-evidence prototype and conditional ledger pilot
 

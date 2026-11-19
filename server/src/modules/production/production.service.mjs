@@ -7,8 +7,8 @@ import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
 import { assertMeasurementSource, resolveMeasurementSourceParty } from '../measurements/source-attribution.service.mjs';
 
-export async function createProductionEvent(siteId, input, auth, mutationId) {
-  return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'production.create', siteId, input }, transaction }, async () => {
+export async function createProductionEvent(siteId, input, auth, mutationId, options = {}) {
+  const operation = (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'production.create', siteId, input }, transaction }, async () => {
     const hole = await MiningHole.findOne({ where: { id: input.holeId, siteId }, transaction, lock: transaction.LOCK.UPDATE });
     if (!hole) throw new AppError(400, 'INVALID_HOLE', 'The selected hole does not belong to this site.');
     const eventId = randomUUID();
@@ -131,13 +131,15 @@ export async function createProductionEvent(siteId, input, auth, mutationId) {
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
       payload: { production_event_id: eventId, site_id: siteId, hole_id: input.holeId, output_ids: outputs.map((row) => row.id), output_count: outputs.length },
       streams: [{ kind: 'material_event', id: eventId }, { kind: 'mining_hole', id: input.holeId }, ...outputs.map((row) => ({ kind: 'material_batch', id: row.batchId }))],
+      expectedVersions: options.expectedVersion ? [{ kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence }] : [],
     });
     return { id: event.id, eventCode: event.eventCode, eventKind: event.eventKind, siteId, holeId: input.holeId, occurredAt: input.occurredAt, recordedAt: event.recordedAt, participants: participantRows, captureProvenance: captureResult, outputs };
-  }));
+  });
+  return options.transaction ? operation(options.transaction) : sequelize.transaction(operation);
 }
 
-export async function addOutputMeasurement(siteId, eventId, outputId, input, auth, mutationId) {
-  return sequelize.transaction(async (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'measurement.add', siteId, eventId, outputId, input }, transaction }, async () => {
+export async function addOutputMeasurement(siteId, eventId, outputId, input, auth, mutationId, options = {}) {
+  const operation = (transaction) => executeIdempotent({ actorScope: `user:${auth.userId}`, mutationId, payload: { action: 'measurement.add', siteId, eventId, outputId, input }, transaction }, async () => {
     const rows = await sequelize.query(
       `SELECT eo.id AS output_id, eo.batch_id, ms.id AS measurement_set_id, pe.event_id AS production_event_id
        FROM production_event pe JOIN mining_hole h ON h.id=pe.hole_id
@@ -160,9 +162,53 @@ export async function addOutputMeasurement(siteId, eventId, outputId, input, aut
        VALUES (:id,:setId,:kind,:quantity,:sourceValue,:unit,:conversion,:sourceRole,:sourcePartyId,:userId,:method,:instrument,:occurredAt,:evidenceRef,:supersedesId)`,
       { replacements: { id: measurementId, setId: rows[0].measurement_set_id, kind: input.kind, quantity: input.quantityGrams, sourceValue: input.sourceValue, unit: input.sourceUnit, conversion: input.conversionVersion, sourceRole: input.sourceRole, sourcePartyId, userId: auth.userId, method: input.methodCode ?? null, instrument: input.instrumentRef ?? null, occurredAt, evidenceRef: input.evidenceRef ?? null, supersedesId: input.supersedesMeasurementId ?? null }, transaction },
     );
-    await appendAuditEvent({ transaction, eventType: 'MEASUREMENT.RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { measurement_id: measurementId, measurement_set_id: rows[0].measurement_set_id, batch_id: rows[0].batch_id, kind: input.kind, quantity_grams: input.quantityGrams }, streams: [{ kind: 'material_batch', id: rows[0].batch_id }, { kind: 'material_event', id: eventId }] });
+    await appendAuditEvent({ transaction, eventType: 'MEASUREMENT.RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { measurement_id: measurementId, measurement_set_id: rows[0].measurement_set_id, batch_id: rows[0].batch_id, kind: input.kind, quantity_grams: input.quantityGrams }, streams: [{ kind: 'material_batch', id: rows[0].batch_id }, { kind: 'material_event', id: eventId }], expectedVersions: options.expectedVersion ? [{ kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence }] : [] });
     return { id: measurementId, measurementSetId: rows[0].measurement_set_id, batchId: rows[0].batch_id, kind: input.kind, quantityGrams: input.quantityGrams, occurredAt: input.occurredAt, supersedesMeasurementId: input.supersedesMeasurementId ?? null, enteredAt: new Date() };
-  }));
+  });
+  return options.transaction ? operation(options.transaction) : sequelize.transaction(operation);
+}
+
+export async function recordCaptureAcknowledgement(siteId, eventId, captureProvenanceId, acknowledgement, auth, mutationId, options = {}) {
+  const operation = (transaction) => executeIdempotent({
+    actorScope: `user:${auth.userId}`, mutationId,
+    payload: { action: 'capture.acknowledgement.add', siteId, eventId, captureProvenanceId, acknowledgement }, transaction,
+  }, async () => {
+    const [capture] = await sequelize.query(
+      `SELECT cp.actual_participant_party_id, cp.participant_identity_state, pe.hole_id
+       FROM capture_provenance cp JOIN production_event_capture pec ON pec.capture_provenance_id=cp.id
+       JOIN production_event pe ON pe.event_id=pec.production_event_id
+       JOIN mining_hole h ON h.id=pe.hole_id
+       WHERE cp.id=:captureId AND pe.event_id=:eventId AND h.site_id=:siteId
+       FOR UPDATE OF cp`,
+      { replacements: { captureId: captureProvenanceId, eventId, siteId }, type: QueryTypes.SELECT, transaction },
+    );
+    if (!capture) throw new AppError(404, 'CAPTURE_NOT_FOUND', 'Capture provenance was not found for this site and event.');
+    if (capture.participant_identity_state !== 'IDENTIFIED' || capture.actual_participant_party_id !== auth.personPartyId) {
+      throw new AppError(403, 'PARTICIPANT_ACKNOWLEDGEMENT_REQUIRED', 'Only the identified participant account can record an acknowledgement or dispute.');
+    }
+    if (acknowledgement.status === 'ACKNOWLEDGED' && acknowledgement.acknowledgedByPartyId !== auth.personPartyId) {
+      throw new AppError(403, 'PARTICIPANT_ACKNOWLEDGEMENT_REQUIRED', 'The acknowledging party must be the authenticated participant.');
+    }
+    const acknowledgementId = randomUUID();
+    await sequelize.query(
+      `INSERT INTO capture_acknowledgement_event(id,capture_provenance_id,status,acknowledged_by_party_id,recorded_by_user_id,method,occurred_at_claimed,reason)
+       VALUES (:id,:captureId,:status,:partyId,:userId,:method,:occurredAt,:reason)`,
+      { replacements: {
+        id: acknowledgementId, captureId: captureProvenanceId, status: acknowledgement.status,
+        partyId: acknowledgement.acknowledgedByPartyId ?? null, userId: auth.userId,
+        method: acknowledgement.method ?? null, occurredAt: acknowledgement.occurredAt ?? null, reason: acknowledgement.reason ?? null,
+      }, transaction },
+    );
+    await appendAuditEvent({
+      transaction, eventType: 'CAPTURE.ACKNOWLEDGEMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,
+      occurredAt: acknowledgement.occurredAt ? new Date(acknowledgement.occurredAt) : new Date(), clientMutationId: mutationId,
+      payload: { capture_provenance_id: captureProvenanceId, acknowledgement_id: acknowledgementId, status: acknowledgement.status },
+      streams: [{ kind: 'material_event', id: eventId }, { kind: 'mining_hole', id: capture.hole_id }],
+      expectedVersions: options.expectedVersion ? [{ kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence }] : [],
+    });
+    return { id: acknowledgementId, captureProvenanceId, status: acknowledgement.status, acknowledgedByPartyId: acknowledgement.acknowledgedByPartyId ?? null, recordedByUserId: auth.userId };
+  });
+  return options.transaction ? operation(options.transaction) : sequelize.transaction(operation);
 }
 
 export async function listProductionEvents(siteId) {

@@ -1,0 +1,34 @@
+{
+  "name": "minaledger-field-client",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "preview": "vite preview",
+    "lint": "eslint src tests vite.config.mts playwright.config.cjs",
+    "build": "tsc --noEmit && vite build",
+    "test:unit": "tsx --test tests/unit/offline-storage.test.ts",
+    "test:e2e": "npm run build && playwright test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "4.7.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "vite": "6.4.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@playwright/test": "1.58.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.1",
+    "eslint-plugin-react-hooks": "5.2.0",
+    "eslint-plugin-react-refresh": "0.4.24",
+    "fake-indexeddb": "6.2.4",
+    "globals": "16.5.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.48.1"
+  }
+}

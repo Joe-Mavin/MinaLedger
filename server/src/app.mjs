@@ -13,6 +13,9 @@ import { authenticate, canAccessHole, canAccessProcessingFacility, canAccessSite
 import { login, getProfile, createAccount, createOrganisation, addRoleAssignment, revokeRoleAssignment } from './modules/identity/identity.service.mjs';
 import { createSite, listSites, getSite, updateSite, createHole, getHole, listHoles, createParticipant, listParticipants, listHoleParticipants } from './modules/mining-sites/site.service.mjs';
 import { createProductionEvent, addOutputMeasurement, listProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
+import { measurementSchema, newMeasurementSchema, productionSchema } from './modules/production/production.schemas.mjs';
+import { syncEnvelopeSchema } from './modules/sync/sync.schemas.mjs';
+import { getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
 import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
 import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
@@ -64,52 +67,6 @@ const participantSchema = z.object({
   if (!value.holeId && !siteRole.safeParse(value.roleCode).success) context.addIssue({ code: 'custom', path: ['roleCode'], message: 'roleCode is not a site role.' });
   if (value.validFrom && value.validTo && new Date(value.validTo) <= new Date(value.validFrom)) context.addIssue({ code: 'custom', path: ['validTo'], message: 'validTo must be later than validFrom.' });
 }).transform((value) => ({ ...value, organisationKind: value.organisationKind ?? null }));
-const measurementSchema = z.object({
-  kind: z.enum(['DECLARED', 'MEASURED', 'VERIFIED']),
-  quantityGrams: decimal(6),
-  sourceValue: decimal(12),
-  sourceUnit: z.string().trim().min(1).max(20),
-  conversionVersion: z.string().trim().min(1).max(40),
-  sourceRole: z.enum(['SELLER', 'BUYER', 'RECORDER', 'WITNESS', 'WEIGHER', 'OTHER']),
-  sourcePartyId: z.string().uuid().optional(),
-  methodCode: z.string().max(80).optional(),
-  instrumentRef: z.string().max(160).optional(),
-  occurredAt: dateTime.optional(),
-  evidenceRef: z.string().max(255).optional(),
-  supersedesMeasurementId: z.string().uuid().optional(),
-}).strict();
-const newMeasurementSchema = measurementSchema.omit({ supersedesMeasurementId: true });
-const productionSchema = z.object({
-  holeId: z.string().uuid(),
-  occurredAt: dateTime,
-  shiftOrPeriodRef: z.string().max(100).optional(),
-  participantRelationshipIds: z.array(z.string().uuid()).max(40).optional(),
-  captureProvenance: z.object({
-    actualParticipantPartyId: z.string().uuid().optional(),
-    participantIdentityState: z.enum(['IDENTIFIED', 'UNRESOLVED', 'UNKNOWN']),
-    sourceKind: z.enum(['DIRECT', 'ASSISTED_VERBAL', 'WITNESS', 'PAPER_TRANSCRIPTION', 'OTHER']),
-    occurredAt: dateTime.optional(),
-    sourceReference: z.string().max(255).optional(),
-    evidenceRef: z.string().max(255).optional(),
-    note: z.string().max(1000).optional(),
-    acknowledgement: z.object({
-      status: z.enum(['ACKNOWLEDGED', 'PENDING', 'DECLINED', 'DISPUTED', 'NOT_OBTAINED']),
-      acknowledgedByPartyId: z.string().uuid().optional(),
-      method: z.string().max(80).optional(),
-      occurredAt: dateTime.optional(),
-      reason: z.string().max(500).optional(),
-    }).strict().optional(),
-  }).strict().superRefine((value, context) => {
-    if ((value.participantIdentityState === 'IDENTIFIED') !== Boolean(value.actualParticipantPartyId)) context.addIssue({ code: 'custom', path: ['actualParticipantPartyId'], message: 'IDENTIFIED capture requires an actual participant; other identity states omit it.' });
-    if (value.acknowledgement?.status === 'ACKNOWLEDGED' && !value.acknowledgement.acknowledgedByPartyId) context.addIssue({ code: 'custom', path: ['acknowledgement', 'acknowledgedByPartyId'], message: 'ACKNOWLEDGED requires the acknowledging party.' });
-    if (value.acknowledgement?.status !== 'ACKNOWLEDGED' && value.acknowledgement?.acknowledgedByPartyId) context.addIssue({ code: 'custom', path: ['acknowledgement', 'acknowledgedByPartyId'], message: 'Only an ACKNOWLEDGED event names an acknowledging party.' });
-  }).optional(),
-  outputs: z.array(z.object({
-    materialKind: z.enum(['GOLD_BEARING_FEED', 'RESIDUE', 'GOLD_DORE', 'RECOVERED_GOLD', 'PROCESS_OUTPUT']),
-    outputKind: z.string().trim().min(1).max(40).optional(),
-    measurements: z.array(newMeasurementSchema).max(20).optional(),
-  }).strict()).min(1).max(20),
-}).strict();
 const doraSchema = z.object({ name: z.string().trim().min(1).max(160) }).strict();
 const doraPatchSchema = z.object({ name: z.string().trim().min(1).max(160).optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional() }).strict()
   .refine((value) => Object.keys(value).length > 0, 'At least one permitted Dora field must be supplied.');
@@ -420,6 +377,14 @@ app.post('/api/v1/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, 
 app.use('/api/v1', authenticate);
 
 app.get('/api/v1/me', asyncRoute(async (req, res) => res.json(await getProfile(req.auth.userId))));
+app.post('/api/v1/sync/commands', requireIdempotencyKey, validateBody(syncEnvelopeSchema), asyncRoute(async (req, res) => {
+  const receipt = await submitSyncCommand(req.body, req.auth, req.get('idempotency-key'));
+  const statusCode = receipt.status === 'conflict' ? 409 : receipt.status === 'rejected' ? 422 : receipt.status === 'needs_review' || receipt.status === 'server_received' ? 202 : 200;
+  return res.status(statusCode).json({ receipt });
+}));
+app.get('/api/v1/sync/receipts/:clientMutationId', requireUuidParams('clientMutationId'), asyncRoute(async (req, res) => {
+  return res.json({ receipt: await getSyncReceipt(req.auth.userId, req.params.clientMutationId) });
+}));
 
 app.post('/api/v1/admin/users', requireSystemAdministrator, requireIdempotencyKey, validateBody(accountSchema), asyncRoute(async (req, res) => {
   const account = await createAccount(req.body, req.auth.userId, req.get('idempotency-key'));

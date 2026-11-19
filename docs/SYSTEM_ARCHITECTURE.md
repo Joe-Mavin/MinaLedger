@@ -1,5 +1,33 @@
 # System architecture and API proposal
 
+## Phase 5 implemented architecture (verified 2026-11-19)
+
+The implemented technical slice is a React 19/TypeScript/Vite PWA, the existing Node.js/Express modular monolith, and PostgreSQL. The browser stores immutable versioned commands and scoped references in IndexedDB. Its service worker caches only the application shell; synchronization runs on online/foreground opportunities. The Express authentication middleware protects both sync routes, the sync service rechecks current access, and accepted commands run through the existing production domain services. Migration 009 stores durable receipts and append-only receipt history. There is no ledger adapter, outbox worker, or production hosting configuration.
+
+```mermaid
+flowchart LR
+  subgraph Device[Field device]
+    UI[React and TypeScript PWA]
+    SW[Service worker\napp shell only]
+    IDB[(IndexedDB\ncommands and scoped references)]
+    UI <--> IDB
+    UI <--> SW
+  end
+  subgraph Server[Application boundary]
+    API[Express API]
+    AUTH[Existing authentication middleware]
+    SYNC[Allowlisted sync service]
+    DOMAIN[Production domain services]
+    DB[(PostgreSQL\ndomain state, audit and receipts)]
+    API --> AUTH --> SYNC
+    SYNC --> DOMAIN --> DB
+    SYNC --> DB
+  end
+  UI <-->|HTTP in local development; HTTPS required for production PWA| API
+```
+
+The client does not cache API responses or hold long-lived credentials. Current sync commands are production creation, production measurement addition, and separate capture acknowledgement. This software has passed its local automated checks but has not been deployed or field-accepted.
+
 ## Proposed architecture
 
 Use a modular monolith for the prototype: one React PWA, one Node.js/Express API, one PostgreSQL database, and an asynchronous ledger adapter. Modules have explicit boundaries and business rules stay in backend domain services. This meets the requested separation of concerns without introducing microservices or an additional orchestration framework before scale or independent deployment needs are known.
@@ -71,20 +99,20 @@ The diagram is conceptual. It does not assert that a permissioned network exists
 | Custody and entitlement | `POST /custody-transfers`, `POST /custody-transfers/{id}/accept`, `POST /entitlement-events` | Offer/accept custody; record entitlement claims independently. |
 | Assisted capture | `POST /events/{id}/capture-provenance`, `/capture-acknowledgements` | Record participant, recorder, information source, acknowledgement and evidence without implying consent. |
 | Traceability and QR | `GET /batches/{id}/genealogy`, `POST /qr-records`, `GET /q/{opaqueToken}` | Authorized provenance view and opaque QR lookup. |
-| Offline synchronization | `POST /sync/commands`, `GET /sync/receipts/{clientMutationId}` | Idempotent upload, validation, acknowledgement and conflict reporting. |
+| Offline synchronization | `POST /api/v1/sync/commands`, `GET /api/v1/sync/receipts/{clientMutationId}` | Implemented idempotent upload and durable-receipt recovery for production creation, production measurement addition and separate capture acknowledgement. |
 | Audit and ledger | `GET /audit/{aggregate}`, `GET /ledger-submissions/{eventId}` | Scoped history, commitment and network receipt status. |
 
-Endpoint names are proposals, not a final OpenAPI contract. Do not create a generic endpoint that permits clients to write arbitrary event rows or bypass domain services. The measurement API resolves one explicit owner type to a typed relational FK and verifies its batch; clients cannot reassign an existing measurement set.
+Other representative endpoint names are proposals, not a final OpenAPI contract. Do not create a generic endpoint that permits clients to write arbitrary event rows or bypass domain services. The measurement API resolves one explicit owner type to a typed relational FK and verifies its batch; clients cannot reassign an existing measurement set.
 
 Payment creation under either a gold trade or residue sale creates an append-only reported-payment event. `/payments/{id}/events` appends counterparty confirmation, failure, reversal or correction with actor, timestamp, reason and evidence reference; it never edits the reported amount/status. The reconciliation endpoint derives net confirmed settlement per currency from event history. A payment report is not a confirmation, and reconciliation does not imply custody transfer.
 
 ## Backend command lifecycle
 
-1. Authenticate the caller and resolve the user's active, scoped roles and acting party.
-2. Validate the command schema and idempotency key; return the stored receipt for an identical retry.
-3. In one database transaction, check business prerequisites and versions, persist domain facts, append audit, store the receipt and insert a ledger outbox item if the event type is eligible.
-4. Commit and return `serverAccepted` separately from any ledger state.
-5. A worker submits allowlisted commitments and records `queued`, `submitted`, `committed`, or `failed` state and receipt. Retry transient failures with bounded backoff; alert on exhausted attempts.
+1. The existing middleware authenticates the user, and the sync service rechecks live account status, current role assignment, acting party and resource access.
+2. Validate the versioned command against the explicit allowlist, dependencies, expected audit sequence and immutable envelope hash. An identical mutation ID and payload returns its durable receipt; changed content under that ID is rejected.
+3. Persist `server_received`, then dispatch ready work through the existing production domain service. Domain state, audit append and accepted receipt transition commit atomically. Deterministic domain conflicts/rejections are retained as receipt outcomes.
+4. Return the durable receipt and persist it in IndexedDB before the client updates the local state. After an unknown network outcome, the client queries the receipt route and retries with the original mutation ID when needed.
+5. Ledger commitment, an outbox worker and network receipts are future work; they are not implied by server acceptance.
 
 For inventory movements, the server locks per-batch/location guard rows in stable order, derives balances from accepted journal lines, rejects any negative post-command balance, and writes the complete movement, accepted state and audit entries in one database transaction. Deferred database constraints validate balanced transfer legs; transformation inputs/outputs link to event genealogy and may carry a reasoned mass variance. Failure rolls back every leg. Accepted corrections append reversal/adjustment postings. Audit event ordering is per aggregate stream, with affected stream heads locked in stable sorted order, as detailed in [Blockchain design](BLOCKCHAIN_DESIGN.md). Payments and allocation reviews use the same append-only command/audit path.
 

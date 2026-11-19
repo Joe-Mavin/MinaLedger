@@ -66,21 +66,31 @@ export async function listHoles(siteId, auth) {
   const visible = [];
   for (const hole of holes) if (await canAccessHole(auth, siteId, hole.id)) visible.push(hole);
   if (!visible.length && !(await canAccessSite(auth, siteId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  return visible;
+  const versions = visible.length ? await sequelize.query(
+    `SELECT stream_id AS hole_id,last_sequence FROM audit_stream_head
+     WHERE stream_kind='mining_hole' AND stream_id IN (:holeIds)`,
+    { replacements: { holeIds: visible.map((hole) => hole.id) }, type: QueryTypes.SELECT },
+  ) : [];
+  const versionByHole = new Map(versions.map((row) => [row.hole_id, Number(row.last_sequence)]));
+  return visible.map((hole) => ({ ...hole.toJSON(), auditSequence: versionByHole.get(hole.id) ?? 0 }));
 }
 
 export async function getHole(siteId, holeId, auth) {
   if (!(await canAccessHole(auth, siteId, holeId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   const hole = await MiningHole.findOne({ where: { id: holeId, siteId }, attributes: ['id', 'siteId', 'holeCode', 'name', 'status', 'createdAt'] });
   if (!hole) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
-  return hole;
+  const [version] = await sequelize.query(
+    `SELECT last_sequence FROM audit_stream_head WHERE stream_kind='mining_hole' AND stream_id=:holeId`,
+    { replacements: { holeId }, type: QueryTypes.SELECT },
+  );
+  return { ...hole.toJSON(), auditSequence: Number(version?.last_sequence ?? 0) };
 }
 
 export async function listHoleParticipants(siteId, holeId, auth) {
   if (!(await canAccessHole(auth, siteId, holeId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   return sequelize.query(
     `SELECT p.id AS party_id, p.party_kind, COALESCE(pp.display_name, op.display_name) AS display_name,
-       hp.role_code, hp.valid_from, hp.valid_to, hp.source_reference, hp.evidence_ref, h.id AS hole_id
+       hp.id AS relationship_id, hp.role_code, hp.valid_from, hp.valid_to, hp.source_reference, hp.evidence_ref, h.id AS hole_id
      FROM hole_party_role hp JOIN mining_hole h ON h.id=hp.hole_id JOIN party p ON p.id=hp.party_id
        LEFT JOIN person_profile pp ON pp.party_id=p.id LEFT JOIN organisation_profile op ON op.party_id=p.id
      WHERE h.id=:holeId AND h.site_id=:siteId AND hp.status='ACTIVE'

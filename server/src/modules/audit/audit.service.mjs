@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import canonicalize from 'canonicalize';
 import { QueryTypes } from 'sequelize';
 import { sequelize } from '../../database/connection.mjs';
+import { AppError } from '../../utils/errors.mjs';
 
 const ZERO_HASH = '00'.repeat(32);
 const EVENT_PREFIX = Buffer.from('MinaLedger:event:v1\0', 'utf8');
@@ -16,7 +17,7 @@ export function hashStreamEntry(entry) {
   return sha256(Buffer.concat([STREAM_PREFIX, Buffer.from(canonicalize(entry), 'utf8')]));
 }
 
-export async function appendAuditEvent({ transaction, eventType, actorUserId, actorPartyId, occurredAt, payload, streams, clientMutationId = null }) {
+export async function appendAuditEvent({ transaction, eventType, actorUserId, actorPartyId, occurredAt, payload, streams, clientMutationId = null, expectedVersions = [] }) {
   const normalizedStreams = [...new Map(streams.map(({ kind, id }) => [`${kind}:${id}`, { kind, id }])).values()]
     .sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id));
   const canonicalPayload = canonicalize(payload);
@@ -36,6 +37,20 @@ export async function appendAuditEvent({ transaction, eventType, actorUserId, ac
       `INSERT INTO audit_stream_head(stream_kind, stream_id) VALUES (:kind, :id) ON CONFLICT DO NOTHING`,
       { replacements: { kind: stream.kind, id: stream.id }, transaction },
     );
+  }
+  const expectedByStream = new Map(expectedVersions.map((version) => [`${version.kind}:${version.id}`, Number(version.sequence)]));
+  for (const key of expectedByStream.keys()) {
+    if (!normalizedStreams.some((stream) => `${stream.kind}:${stream.id}` === key)) throw new AppError(400, 'INVALID_EXPECTED_VERSION', 'Expected version must reference an audit stream changed by this command.');
+  }
+  for (const stream of normalizedStreams) {
+    const [head] = await sequelize.query(
+      `SELECT last_sequence FROM audit_stream_head WHERE stream_kind = :kind AND stream_id = :id FOR UPDATE`,
+      { replacements: { kind: stream.kind, id: stream.id }, type: QueryTypes.SELECT, transaction },
+    );
+    const key = `${stream.kind}:${stream.id}`;
+    if (expectedByStream.has(key) && Number(head.last_sequence) !== expectedByStream.get(key)) {
+      throw new AppError(409, 'STALE_VERSION', 'The resource changed after this command was prepared.', { streamKind: stream.kind, streamId: stream.id, expectedSequence: expectedByStream.get(key), currentSequence: Number(head.last_sequence) });
+    }
   }
   for (const stream of normalizedStreams) {
     const [head] = await sequelize.query(
