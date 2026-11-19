@@ -15,7 +15,7 @@ import { createSite, listSites, getSite, updateSite, createHole, getHole, listHo
 import { createProductionEvent, addOutputMeasurement, listProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
 import { measurementSchema, newMeasurementSchema, productionSchema } from './modules/production/production.schemas.mjs';
 import { syncEnvelopeSchema } from './modules/sync/sync.schemas.mjs';
-import { getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
+import { getSyncCommandVersion, getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
 import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
 import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
@@ -381,6 +381,9 @@ app.post('/api/v1/sync/commands', requireIdempotencyKey, validateBody(syncEnvelo
   const receipt = await submitSyncCommand(req.body, req.auth, req.get('idempotency-key'));
   const statusCode = receipt.status === 'conflict' ? 409 : receipt.status === 'rejected' ? 422 : receipt.status === 'needs_review' || receipt.status === 'server_received' ? 202 : 200;
   return res.status(statusCode).json({ receipt });
+}));
+app.post('/api/v1/sync/versions', validateBody(syncEnvelopeSchema), asyncRoute(async (req, res) => {
+  return res.json(await getSyncCommandVersion(req.body, req.auth));
 }));
 app.get('/api/v1/sync/receipts/:clientMutationId', requireUuidParams('clientMutationId'), asyncRoute(async (req, res) => {
   return res.json({ receipt: await getSyncReceipt(req.auth.userId, req.params.clientMutationId) });

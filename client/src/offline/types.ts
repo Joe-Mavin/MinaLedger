@@ -1,7 +1,12 @@
 export const COMMAND_SCHEMA_VERSION = 1 as const;
 
 export type SyncState = 'draft' | 'pending_upload' | 'uploading' | 'server_received' | 'needs_review' | 'server_accepted' | 'conflict' | 'rejected';
-export type CommandType = 'production.create' | 'production.measurement.add' | 'capture.acknowledgement.add';
+export type CommandType =
+  | 'production.create' | 'production.measurement.add' | 'capture.acknowledgement.add'
+  | 'production.allocation.propose' | 'stockpile.transfer' | 'inventory.adjustment.create'
+  | 'consignment.dispatch' | 'consignment.receipt.add' | 'consignment.receipt.correct'
+  | 'consignment.custody.offer' | 'custody.transfer.decide' | 'gold_trade.assay.record'
+  | 'gold_trade.measurement.add' | 'gold_trade.custody.offer';
 
 export interface ActingContext {
   partyId: string;
@@ -22,7 +27,7 @@ export interface CommandEnvelope {
   clientCreatedAt: string;
   clientTimezone: string;
   occurredAtClaimed: string;
-  expectedVersion?: { streamKind: 'mining_hole' | 'material_event'; streamId: string; sequence: number };
+  expectedVersion?: { streamKind: 'mining_hole' | 'material_event' | 'inventory_location' | 'consignment' | 'custody_transfer' | 'gold_trade'; streamId: string; sequence: number };
   parentCommandIds: string[];
   revisionOf?: string;
   captureProvenance?: unknown;

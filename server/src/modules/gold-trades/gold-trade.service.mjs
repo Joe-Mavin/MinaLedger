@@ -10,6 +10,9 @@ const query = (sql, replacements = {}, transaction) => sequelize.query(sql, {
   replacements, ...(transaction ? { transaction } : {}), type: QueryTypes.SELECT,
 });
 const write = (sql, replacements = {}, transaction) => sequelize.query(sql, { replacements, transaction });
+const expectedVersionsFor = (options) => options?.expectedVersion ? [{
+  kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence,
+}] : [];
 const MICRO = 1_000_000n;
 const MONEY_SCALE = 100_000_000n;
 const MEMBER_ROLES = ['LOCAL_MERCHANT', 'LARGER_MERCHANT', 'MINING_OPERATOR', 'DORA_OPERATOR', 'RECOVERY_FACILITY_OPERATOR', 'FIELD_OFFICER', 'MINER'];
@@ -367,7 +370,7 @@ export async function addGoldTradeLine(tradeId, line, auth, mutationId) {
   }));
 }
 
-export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, mutationId) {
+export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, mutationId, options = {}) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   await resolveTradeParty(auth, line);
@@ -401,12 +404,12 @@ export async function recordGoldTradeMeasurement(tradeId, lineId, input, auth, m
       kind: 'WEIGHT', reference: input.evidenceRef ?? `MEASUREMENT:${id}`, note: input.supersedesMeasurementId ? `Correction of ${input.supersedesMeasurementId}: ${input.correctionReason}` : null,
       occurredAt: input.occurredAt,
     }, auth, lockedRepresentedPartyId, transaction);
-    await appendAuditEvent({ transaction, eventType: input.supersedesMeasurementId ? 'GOLD_TRADE.MEASUREMENT_CORRECTED' : 'GOLD_TRADE.MEASUREMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, measurement_id: id, kind: input.kind, quantity_g: input.quantityGrams, supersedes_measurement_id: input.supersedesMeasurementId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }] });
+    await appendAuditEvent({ transaction, eventType: input.supersedesMeasurementId ? 'GOLD_TRADE.MEASUREMENT_CORRECTED' : 'GOLD_TRADE.MEASUREMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, measurement_id: id, kind: input.kind, quantity_g: input.quantityGrams, supersedes_measurement_id: input.supersedesMeasurementId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }], expectedVersions: expectedVersionsFor(options) });
     return { id, tradeId, lineId, measurementSetId: set.id, kind: input.kind, quantityGrams: input.quantityGrams, supersedesMeasurementId: input.supersedesMeasurementId ?? null };
   }));
 }
 
-export async function recordGoldTradeAssay(tradeId, lineId, input, auth, mutationId) {
+export async function recordGoldTradeAssay(tradeId, lineId, input, auth, mutationId, options = {}) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   await resolveTradeParty(auth, line);
@@ -435,7 +438,7 @@ export async function recordGoldTradeAssay(tradeId, lineId, input, auth, mutatio
         correction: input.correctionOfId ?? null, userId: auth.userId, reason: input.correctionReason ?? null, lineId }, transaction,
     );
     if (input.evidenceRef) await appendEvidence(tradeId, { kind: 'ASSAY', reference: input.evidenceRef, occurredAt: input.observedAt }, auth, lockedRepresentedPartyId, transaction);
-    await appendAuditEvent({ transaction, eventType: input.correctionOfId ? 'GOLD_TRADE.ASSAY_CORRECTED' : 'GOLD_TRADE.ASSAY_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.observedAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, assay_record_id: id, batch_id: lockedLine.batch_id, result_value: input.resultValue, result_unit: input.resultUnit, evidenced: Boolean(input.evidenceRef), correction_of_id: input.correctionOfId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }] });
+    await appendAuditEvent({ transaction, eventType: input.correctionOfId ? 'GOLD_TRADE.ASSAY_CORRECTED' : 'GOLD_TRADE.ASSAY_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.observedAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, assay_record_id: id, batch_id: lockedLine.batch_id, result_value: input.resultValue, result_unit: input.resultUnit, evidenced: Boolean(input.evidenceRef), correction_of_id: input.correctionOfId ?? null }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'material_batch', id: lockedLine.batch_id }], expectedVersions: expectedVersionsFor(options) });
     return { id, tradeId, lineId, batchId: lockedLine.batch_id, status: 'RECORDED', resultValue: input.resultValue, resultUnit: input.resultUnit, evidenceRef: input.evidenceRef ?? null, correctionOfId: input.correctionOfId ?? null };
   }));
 }
@@ -539,7 +542,7 @@ export async function decideGoldTradeLine(tradeId, lineId, input, auth, mutation
   }));
 }
 
-export async function createGoldCustodyOffer(tradeId, lineId, input, auth, mutationId) {
+export async function createGoldCustodyOffer(tradeId, lineId, input, auth, mutationId, options = {}) {
   const [line] = await query(`SELECT l.*,t.seller_party_id,t.buyer_party_id,t.status FROM gold_trade_line l JOIN gold_trade t ON t.id=l.trade_id WHERE t.id=:tradeId AND l.id=:lineId`, { tradeId, lineId });
   if (!line || !line.is_accepted || line.status !== 'AGREED') throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   const representedPartyId = await resolveTradeParty(auth, line, [line.seller_party_id]);
@@ -561,12 +564,12 @@ export async function createGoldCustodyOffer(tradeId, lineId, input, auth, mutat
     if (toMicros(lineBalance.moved) + toMicros(input.quantityGrams) > toMicros(locked.accepted_trade_quantity_g)) throw new AppError(409, 'TRADE_QUANTITY_EXHAUSTED', 'Gold custody quantity would exceed the accepted trade quantity.');
     const id = randomUUID();
     await write(`INSERT INTO custody_transfer(id,batch_id,from_party_id,to_party_id,offered_at,status,offered_by_user_id,source_location_id,destination_location_id,evidence_ref,gold_trade_line_id,quantity_g,measurement_set_id,measurement_id) VALUES (:id,:batchId,:seller,:buyer,:at,'OFFERED',:actor,:source,:destination,:evidence,:lineId,:quantity,:measurementSetId,:measurementId)`, { id, batchId: locked.batch_id, seller: locked.seller_party_id, buyer: locked.buyer_party_id, at: input.occurredAt, actor: auth.userId, source: input.sourceLocationId, destination: input.destinationLocationId, evidence: input.evidenceRef ?? null, lineId, quantity: input.quantityGrams, measurementSetId: input.measurementSetId, measurementId: input.measurementId }, transaction);
-    await appendAuditEvent({ transaction, eventType: 'GOLD_TRADE.CUSTODY_OFFERED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, custody_transfer_id: id, batch_id: locked.batch_id, quantity_g: input.quantityGrams }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'custody_transfer', id }, { kind: 'material_batch', id: locked.batch_id }] });
+    await appendAuditEvent({ transaction, eventType: 'GOLD_TRADE.CUSTODY_OFFERED', actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { trade_id: tradeId, line_id: lineId, custody_transfer_id: id, batch_id: locked.batch_id, quantity_g: input.quantityGrams }, streams: [{ kind: 'gold_trade', id: tradeId }, { kind: 'custody_transfer', id }, { kind: 'material_batch', id: locked.batch_id }], expectedVersions: expectedVersionsFor(options) });
     return { id, tradeId, lineId, status: 'OFFERED', batchId: locked.batch_id, quantityGrams: input.quantityGrams };
   }));
 }
 
-export async function decideGoldCustodyTransfer(tradeId, transferId, input, auth, mutationId) {
+export async function decideGoldCustodyTransfer(tradeId, transferId, input, auth, mutationId, options = {}) {
   const [transfer] = await query(`SELECT ct.*,l.trade_id,t.seller_party_id,t.buyer_party_id,t.currency_code,l.is_accepted,t.status AS trade_status FROM custody_transfer ct JOIN gold_trade_line l ON l.id=ct.gold_trade_line_id JOIN gold_trade t ON t.id=l.trade_id WHERE ct.id=:id AND t.id=:tradeId`, { id: transferId, tradeId });
   if (!transfer) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   const actorPartyId = input.decision === 'WITHDRAW' ? transfer.from_party_id : transfer.to_party_id;
@@ -590,7 +593,7 @@ export async function decideGoldCustodyTransfer(tradeId, transferId, input, auth
       movementId = movement.id;
       await write(`UPDATE custody_transfer SET linked_inventory_movement_id=:movementId WHERE id=:id`, { movementId, id: transferId }, transaction);
     }
-    await appendAuditEvent({ transaction, eventType: `GOLD_TRADE.CUSTODY_${status}`, actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { custody_transfer_id: transferId, decision_id: decisionId, status, inventory_movement_id: movementId, reason: input.reason ?? null }, streams: [{ kind: 'gold_trade', id: transfer.trade_id }, { kind: 'custody_transfer', id: transferId }, { kind: 'material_batch', id: locked.batch_id }] });
+    await appendAuditEvent({ transaction, eventType: `GOLD_TRADE.CUSTODY_${status}`, actorUserId: auth.userId, actorPartyId: auth.personPartyId, occurredAt: new Date(input.occurredAt), clientMutationId: mutationId, payload: { custody_transfer_id: transferId, decision_id: decisionId, status, inventory_movement_id: movementId, reason: input.reason ?? null }, streams: [{ kind: 'gold_trade', id: transfer.trade_id }, { kind: 'custody_transfer', id: transferId }, { kind: 'material_batch', id: locked.batch_id }], expectedVersions: expectedVersionsFor(options) });
     return { id: transferId, status, decisionId, inventoryMovementId: movementId };
   }));
 }

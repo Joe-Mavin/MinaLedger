@@ -71,6 +71,17 @@ function makeSyncEnvelope({ userId, partyId, roleCode, scopeKind, scopeId, comma
   };
 }
 
+async function versionSyncEnvelope(token, envelope) {
+  const response = await request(app).post('/api/v1/sync/versions').set('Authorization', `Bearer ${token}`).send(envelope);
+  assert.equal(response.status, 200, response.text);
+  return { ...envelope, expectedVersion: response.body.expectedVersion };
+}
+
+async function submitSyncEnvelope(token, envelope) {
+  return request(app).post('/api/v1/sync/commands')
+    .set('Authorization', `Bearer ${token}`).set('Idempotency-Key', envelope.clientMutationId).send(envelope);
+}
+
 function validRecoveryEventBody(locationId) {
   return {
     recoveryInventoryLocationId: locationId,
@@ -253,6 +264,18 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const phaseFiveTables = await db(`SELECT table_name AS sync_table_name FROM information_schema.tables WHERE table_schema='public'
       AND table_name IN ('sync_command_receipt','sync_command_receipt_history') ORDER BY table_name`, {}, undefined, QueryTypes.SELECT);
     assert.deepEqual(phaseFiveTables.map((row) => row.sync_table_name), ['sync_command_receipt', 'sync_command_receipt_history']);
+
+    const rollbackTen = await readFile(new URL('../src/database/rollback/010_offline_workflows.sql', import.meta.url), 'utf8');
+    const migrationTen = await readFile(new URL('../src/database/migrations/010_offline_workflows.sql', import.meta.url), 'utf8');
+    const phaseFiveWorkflowRollbackProbe = new Error('Phase 5 workflow migration rollback probe');
+    await assert.rejects(sequelize.transaction(async (transaction) => {
+      await sequelize.query(rollbackTen, { transaction, raw: true });
+      await sequelize.query(migrationTen, { transaction, raw: true });
+      const constraint = await sequelize.query(`SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+        WHERE conrelid='sync_command_receipt'::regclass AND conname='sync_command_receipt_command_type_check'`, { type: QueryTypes.SELECT, transaction });
+      assert.match(constraint[0].definition, /production\.allocation\.propose/);
+      throw phaseFiveWorkflowRollbackProbe;
+    }), (error) => error === phaseFiveWorkflowRollbackProbe);
   });
 
   await t.test('health, password authentication, live roles, and profile serialization', async () => {
@@ -588,6 +611,42 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(measured.status, 200, measured.text);
     assert.equal(measured.body.receipt.status, 'server_accepted');
     assert.equal(measured.body.receipt.response.quantityGrams, '2.500000');
+    const participantMismatch = makeSyncEnvelope({
+      ...context, commandType: 'production.measurement.add', actualParticipant: { identityState: 'UNKNOWN' },
+      payload: { siteId: ids.siteId, eventId: acceptedEvent.id, outputId: output.id, input: { ...measurementInput, quantityGrams: '2.600000', sourceValue: '2.6' } },
+    });
+    const mismatchReceipt = await submit(ids.siteToken, participantMismatch);
+    assert.equal(mismatchReceipt.status, 422, mismatchReceipt.text);
+    assert.equal(mismatchReceipt.body.receipt.error.code, 'CAPTURE_PROVENANCE_MISMATCH');
+
+    const invalidMeasurement = makeSyncEnvelope({
+      ...context, commandType: 'production.measurement.add',
+      payload: { siteId: ids.siteId, eventId: acceptedEvent.id, outputId: randomUUID(), input: { ...measurementInput, quantityGrams: '2.700000', sourceValue: '2.7' } },
+      actualParticipant: { identityState: 'IDENTIFIED', partyId: ids.minerPartyId },
+    });
+    const firstCorrection = await submit(ids.siteToken, invalidMeasurement);
+    assert.equal(firstCorrection.status, 422, firstCorrection.text);
+    const stillInvalidRevision = makeSyncEnvelope({
+      ...context, commandType: 'production.measurement.add',
+      payload: invalidMeasurement.payload, actualParticipant: invalidMeasurement.actualParticipant,
+      parentCommandIds: [invalidMeasurement.clientMutationId], revisionOf: invalidMeasurement.clientMutationId,
+    });
+    const repeatedRejection = await submit(ids.siteToken, stillInvalidRevision);
+    assert.equal(repeatedRejection.status, 422, repeatedRejection.text);
+    const correctedMeasurement = makeSyncEnvelope({
+      ...context, commandType: 'production.measurement.add',
+      payload: { siteId: ids.siteId, eventId: acceptedEvent.id, outputId: output.id, input: { ...measurementInput, quantityGrams: '2.700000', sourceValue: '2.7' } },
+      actualParticipant: invalidMeasurement.actualParticipant,
+      parentCommandIds: [invalidMeasurement.clientMutationId, stillInvalidRevision.clientMutationId], revisionOf: stillInvalidRevision.clientMutationId,
+    });
+    const acceptedCorrection = await submit(ids.siteToken, correctedMeasurement);
+    assert.equal(acceptedCorrection.status, 200, acceptedCorrection.text);
+    assert.equal(acceptedCorrection.body.receipt.response.quantityGrams, '2.700000');
+    assert.notEqual(correctedMeasurement.clientMutationId, invalidMeasurement.clientMutationId);
+    const correctionReceipts = await db(`SELECT client_mutation_id,status,envelope->>'revisionOf' AS revision_of FROM sync_command_receipt
+      WHERE client_mutation_id IN (:ids) ORDER BY server_received_at`, { ids: [invalidMeasurement.clientMutationId, stillInvalidRevision.clientMutationId, correctedMeasurement.clientMutationId] }, undefined, QueryTypes.SELECT);
+    assert.deepEqual(correctionReceipts.map((row) => row.status), ['REJECTED', 'REJECTED', 'SERVER_ACCEPTED']);
+    assert.equal(correctionReceipts[2].revision_of, stillInvalidRevision.clientMutationId);
 
     const participantUserId = randomUUID();
     await db(`INSERT INTO user_account(id,person_party_id,email,password_hash) VALUES (:id,:partyId,'sync-participant@example.test',:hash)`, {
@@ -665,9 +724,9 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const crossSite = await submit(ids.siteToken, crossSiteEnvelope);
     assert.equal(crossSite.status, 422, crossSite.text);
     assert.equal(crossSite.body.receipt.error.code, 'RESOURCE_NOT_FOUND');
-    const arbitrary = await submit(ids.siteToken, { ...directEnvelope, commandType: 'inventory.transfer' });
+    const arbitrary = await submit(ids.siteToken, { ...directEnvelope, commandType: 'production.allocation.propose' });
     assert.equal(arbitrary.status, 400);
-    assert.equal(arbitrary.body.error.code, 'INVALID_INPUT');
+    assert.equal(arbitrary.body.error.code, 'INVALID_COMMAND_PAYLOAD');
 
     await assert.rejects(db(`UPDATE sync_command_receipt SET envelope='{}'::jsonb WHERE client_mutation_id=:id`, { id: directEnvelope.clientMutationId }), sqlError('55000'));
     await assert.rejects(db(`DELETE FROM sync_command_receipt_history WHERE receipt_id=(SELECT id FROM sync_command_receipt WHERE client_mutation_id=:id)`, { id: directEnvelope.clientMutationId }), sqlError('55000'));
@@ -968,6 +1027,29 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       });
     assert.equal(shareSet.status, 201, shareSet.text);
     assert.equal(shareSet.body.basisKind, 'SHARE');
+
+    const allocationContext = { userId: ids.siteUserId, partyId: ids.siteUserPartyId, roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteId };
+    const allocationPayload = { siteId: ids.siteId, eventId: ids.phase2ProductionEventId, outputId: ids.phase2Outputs[1].id, input: {
+      basisKind: 'SHARE', supersedesSetId: shareSet.body.id, correctionReason: 'Offline complete allocation revision.',
+      rows: [
+        { beneficiaryPartyId: ids.minerPartyId, allocatedShare: '0.550000000' },
+        { beneficiaryPartyId: ids.phase2BeneficiaryId, allocatedShare: '0.450000000' },
+      ],
+    } };
+    const allocationCommand = await versionSyncEnvelope(ids.siteToken, makeSyncEnvelope({
+      ...allocationContext, commandType: 'production.allocation.propose', payload: allocationPayload,
+    }));
+    const offlineAllocation = await submitSyncEnvelope(ids.siteToken, allocationCommand);
+    assert.equal(offlineAllocation.status, 200, offlineAllocation.text);
+    assert.equal(offlineAllocation.body.receipt.response.supersedesSetId, shareSet.body.id);
+    const staleAllocation = makeSyncEnvelope({
+      ...allocationContext, commandType: 'production.allocation.propose',
+      expectedVersion: allocationCommand.expectedVersion,
+      payload: { ...allocationPayload, input: { ...allocationPayload.input, supersedesSetId: offlineAllocation.body.receipt.response.id, correctionReason: 'Offline stale allocation revision.' } },
+    });
+    const staleAllocationResult = await submitSyncEnvelope(ids.siteToken, staleAllocation);
+    assert.equal(staleAllocationResult.status, 409, staleAllocationResult.text);
+    assert.equal(staleAllocationResult.body.receipt.error.code, 'STALE_VERSION');
 
     const mixed = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.phase2ProductionEventId}/outputs/${ids.phase2Outputs[1].id}/allocation-sets`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID()).send({
@@ -1409,6 +1491,64 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(crossDoraBalances.find((row) => row.location_id === ids.phaseThree.stockpileTwo).quantity_g, '0.000000');
     });
 
+    await phase.test('offline inventory commands serialize, retain receipts, and enforce live facility roles', async () => {
+      const doraContext = { userId: ids.doraUserId, partyId: ids.doraPartyId, roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId };
+      const makeStockpileTransfer = () => makeSyncEnvelope({
+        ...doraContext, commandType: 'stockpile.transfer', actualParticipant: { identityState: 'UNKNOWN' },
+        payload: { sourceLocationId: ids.phaseThree.stockpileOne, input: {
+          destinationStockpileId: ids.phaseThree.stockpileTwo, occurredAt: happenedAt, evidenceRef: 'offline-pooling-transfer',
+          items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.100000' }],
+        } },
+      });
+      const versionedPair = await Promise.all([makeStockpileTransfer(), makeStockpileTransfer()].map((envelope) => versionSyncEnvelope(ids.doraToken, envelope)));
+      const concurrent = await Promise.all(versionedPair.map((envelope) => submitSyncEnvelope(ids.doraToken, envelope)));
+      assert.deepEqual(concurrent.map((response) => response.status).sort(), [200, 409], JSON.stringify(concurrent.map((response) => response.body)));
+      const winnerIndex = concurrent.findIndex((response) => response.status === 200);
+      const loserIndex = 1 - winnerIndex;
+      assert.equal(concurrent[loserIndex].body.receipt.error.code, 'STALE_VERSION');
+      const retry = await submitSyncEnvelope(ids.doraToken, versionedPair[winnerIndex]);
+      assert.equal(retry.status, 200, retry.text);
+      assert.equal(retry.body.receipt.response.id, concurrent[winnerIndex].body.receipt.response.id);
+      assert.equal((await db(`SELECT count(*)::int AS total FROM sync_command_receipt_history h JOIN sync_command_receipt r ON r.id=h.receipt_id
+        WHERE r.client_mutation_id=:id AND h.to_status='SERVER_ACCEPTED'`, { id: versionedPair[winnerIndex].clientMutationId }, undefined, QueryTypes.SELECT))[0].total, 1);
+
+      const staleRevision = makeSyncEnvelope({
+        ...doraContext, commandType: 'stockpile.transfer', actualParticipant: { identityState: 'UNKNOWN' },
+        payload: versionedPair[loserIndex].payload, parentCommandIds: [versionedPair[loserIndex].clientMutationId], revisionOf: versionedPair[loserIndex].clientMutationId,
+      });
+      const correctedRevision = await versionSyncEnvelope(ids.doraToken, staleRevision);
+      const correctedTransfer = await submitSyncEnvelope(ids.doraToken, correctedRevision);
+      assert.equal(correctedTransfer.status, 200, correctedTransfer.text);
+      assert.equal(correctedTransfer.body.receipt.status, 'server_accepted');
+
+      const revoked = await seedUser('revoked-offline-stockpile@example.test', 'Revoked Offline Stockpile Operator', {
+        roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId,
+      });
+      const revokedToken = testToken(revoked.userId);
+      await db(`UPDATE role_assignment SET status='REVOKED',valid_to=now() WHERE id=:id`, { id: revoked.roleAssignmentId });
+      const revokedEnvelope = makeSyncEnvelope({
+        userId: revoked.userId, partyId: revoked.partyId, roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId,
+        commandType: 'stockpile.transfer', actualParticipant: { identityState: 'UNKNOWN' },
+        expectedVersion: correctedRevision.expectedVersion,
+        payload: versionedPair[0].payload,
+      });
+      const revokedWrite = await submitSyncEnvelope(revokedToken, revokedEnvelope);
+      assert.equal(revokedWrite.status, 422, revokedWrite.text);
+      assert.equal(revokedWrite.body.receipt.error.code, 'ACTING_CONTEXT_REVOKED');
+
+      const unrelated = await seedUser('other-dora-offline@example.test', 'Other Dora Offline Operator', {
+        roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraTwoId,
+      });
+      const unrelatedEnvelope = makeSyncEnvelope({
+        userId: unrelated.userId, partyId: unrelated.partyId, roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraTwoId,
+        commandType: 'stockpile.transfer', actualParticipant: { identityState: 'UNKNOWN' },
+        expectedVersion: correctedRevision.expectedVersion, payload: versionedPair[0].payload,
+      });
+      const crossFacility = await submitSyncEnvelope(testToken(unrelated.userId), unrelatedEnvelope);
+      assert.equal(crossFacility.status, 422, crossFacility.text);
+      assert.equal(crossFacility.body.receipt.error.code, 'RESOURCE_NOT_FOUND');
+    });
+
     await phase.test('stockpile transfers reject overdraw, same-location transfer, and cross-Dora access', async () => {
       const overdraw = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ destinationStockpileId: ids.phaseThree.stockpileTwo, occurredAt: happenedAt, evidenceRef: 'fictional-overdraw', items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '9.000000' }] });
       const sameLocation = await request(app).post(`/api/v1/stockpiles/${ids.phaseThree.stockpileOne}/transfers`).set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({ destinationStockpileId: ids.phaseThree.stockpileOne, occurredAt: happenedAt, evidenceRef: 'fictional-same-pile', items: [{ batchId: ids.processingOutputs[1].batchId, quantityGrams: '1.000000' }] });
@@ -1627,6 +1767,99 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(accepted.body.status, 'ACCEPTED');
       const [afterAccept] = await db(`SELECT count(*)::int AS total FROM inventory_movement`, {}, undefined, QueryTypes.SELECT);
       assert.equal(afterAccept.total, before.total);
+    });
+
+    await phase.test('offline dispatch, custody, receipt conflict, correction, and repeated receipt revision use domain services', async () => {
+      const doraContext = { userId: ids.doraUserId, partyId: ids.doraPartyId, roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraOneId };
+      const recoveryContext = {
+        userId: ids.phaseThree.recoveryUserId, partyId: ids.phaseThree.recoveryPartyUserId,
+        roleCode: 'RECOVERY_FACILITY_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.recoveryFacilityId,
+      };
+      const offlineLocation = await request(app).post(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/inventory-locations`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID())
+        .send({ locationCode: 'P5-OFFLINE-RECEIPT-VAULT', physicalPlaceRef: 'fictional-offline-receipt-vault' });
+      assert.equal(offlineLocation.status, 201, offlineLocation.text);
+      const offlineRecoveryLocationId = offlineLocation.body.id;
+      const created = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({
+        recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt,
+        items: [{ sourceStockpileId: ids.phaseThree.stockpileOne, batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.050000' }],
+      });
+      assert.equal(created.status, 201, created.text);
+      const item = created.body.items[0];
+      const dispatchCommand = await versionSyncEnvelope(ids.doraToken, makeSyncEnvelope({
+        ...doraContext, commandType: 'consignment.dispatch',
+        payload: { consignmentId: created.body.id, input: { occurredAt: happenedAt, evidenceRef: 'offline-dispatch-manifest', items: [{ consignmentItemId: item.id, measurementId: item.measurementId }] } },
+      }));
+      const [dispatch, dispatchRetry] = await Promise.all([
+        submitSyncEnvelope(ids.doraToken, dispatchCommand), submitSyncEnvelope(ids.doraToken, dispatchCommand),
+      ]);
+      assert.deepEqual([dispatch.status, dispatchRetry.status], [200, 200], JSON.stringify([dispatch.body, dispatchRetry.body]));
+      assert.equal(dispatch.body.receipt.response.id, dispatchRetry.body.receipt.response.id);
+
+      const offerCommand = await versionSyncEnvelope(ids.doraToken, makeSyncEnvelope({
+        ...doraContext, commandType: 'consignment.custody.offer', parentCommandIds: [dispatchCommand.clientMutationId],
+        payload: { consignmentId: created.body.id, input: { destinationLocationId: offlineRecoveryLocationId, occurredAt: happenedAt, evidenceRef: 'offline-custody-offer' } },
+      }));
+      const offered = await submitSyncEnvelope(ids.doraToken, offerCommand);
+      assert.equal(offered.status, 200, offered.text);
+      const transferId = offered.body.receipt.response.id;
+      const decisionCommand = await versionSyncEnvelope(ids.phaseThree.recoveryToken, makeSyncEnvelope({
+        ...recoveryContext, commandType: 'custody.transfer.decide', parentCommandIds: [offerCommand.clientMutationId],
+        payload: { transferId, input: { decision: 'ACCEPT', occurredAt: happenedAt, evidenceRef: 'offline-custody-acceptance' } },
+      }));
+      const acceptedCustody = await submitSyncEnvelope(ids.phaseThree.recoveryToken, decisionCommand);
+      assert.equal(acceptedCustody.status, 200, acceptedCustody.text);
+      assert.equal(acceptedCustody.body.receipt.response.status, 'ACCEPTED');
+      const repeatedCustodyDecision = await submitSyncEnvelope(ids.phaseThree.recoveryToken, await versionSyncEnvelope(ids.phaseThree.recoveryToken, makeSyncEnvelope({
+        ...recoveryContext, commandType: 'custody.transfer.decide',
+        payload: { transferId, input: { decision: 'ACCEPT', occurredAt: happenedAt } },
+      })));
+      assert.equal(repeatedCustodyDecision.status, 409, repeatedCustodyDecision.text);
+
+      const firstReceipt = await versionSyncEnvelope(ids.phaseThree.recoveryToken, makeSyncEnvelope({
+        ...recoveryContext, commandType: 'consignment.receipt.add', parentCommandIds: [decisionCommand.clientMutationId],
+        payload: { consignmentId: created.body.id, input: {
+          recoveryInventoryLocationId: offlineRecoveryLocationId, occurredAt: happenedAt, evidenceRef: 'offline-partial-receipt-a',
+          items: [{ consignmentItemId: item.id, quantityGrams: '0.020000', outcome: 'ACCEPTED' }],
+        } },
+      }));
+      const firstReceiptResult = await submitSyncEnvelope(ids.phaseThree.recoveryToken, firstReceipt);
+      assert.equal(firstReceiptResult.status, 200, firstReceiptResult.text);
+      assert.equal(firstReceiptResult.body.receipt.response.status, 'PART_RECEIVED');
+
+      const staleReceipt = makeSyncEnvelope({
+        ...recoveryContext, commandType: 'consignment.receipt.add', parentCommandIds: [firstReceipt.clientMutationId],
+        payload: { consignmentId: created.body.id, input: {
+          recoveryInventoryLocationId: offlineRecoveryLocationId, occurredAt: happenedAt, evidenceRef: 'offline-partial-receipt-b',
+          items: [{ consignmentItemId: item.id, quantityGrams: '0.020000', outcome: 'ACCEPTED' }],
+        } },
+        expectedVersion: firstReceipt.expectedVersion,
+      });
+      const receiptConflict = await submitSyncEnvelope(ids.phaseThree.recoveryToken, staleReceipt);
+      assert.equal(receiptConflict.status, 409, receiptConflict.text);
+      assert.equal(receiptConflict.body.receipt.error.code, 'STALE_VERSION');
+      const correctedReceipt = await versionSyncEnvelope(ids.phaseThree.recoveryToken, makeSyncEnvelope({
+        ...recoveryContext, commandType: 'consignment.receipt.add', revisionOf: staleReceipt.clientMutationId,
+        parentCommandIds: [firstReceipt.clientMutationId, staleReceipt.clientMutationId],
+        payload: staleReceipt.payload,
+      }));
+      const correctionResult = await submitSyncEnvelope(ids.phaseThree.recoveryToken, correctedReceipt);
+      assert.equal(correctionResult.status, 200, correctionResult.text);
+      assert.equal(correctionResult.body.receipt.response.status, 'PART_RECEIVED');
+
+      const itemReceiptId = correctionResult.body.receipt.response.items[0].id;
+      const receiptCorrection = await versionSyncEnvelope(ids.phaseThree.recoveryToken, makeSyncEnvelope({
+        ...recoveryContext, commandType: 'consignment.receipt.correct', parentCommandIds: [correctedReceipt.clientMutationId],
+        payload: { consignmentId: created.body.id, receiptItemId: itemReceiptId, input: {
+          recoveryInventoryLocationId: offlineRecoveryLocationId, quantityGrams: '0.015000', outcome: 'ACCEPTED',
+          correctionReason: 'Offline scale review corrected the second partial receipt.', occurredAt: happenedAt,
+          measurement: { kind: 'MEASURED', sourceValue: '0.015', sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt },
+        } },
+      }));
+      const correctedItem = await submitSyncEnvelope(ids.phaseThree.recoveryToken, receiptCorrection);
+      assert.equal(correctedItem.status, 200, correctedItem.text);
+      assert.equal(correctedItem.body.receipt.response.item.supersedesReceiptItemId, itemReceiptId);
+      assert.equal((await db(`SELECT count(*)::int AS total FROM consignment_receipt_item WHERE supersedes_receipt_item_id=:id`, { id: itemReceiptId }, undefined, QueryTypes.SELECT))[0].total, 1);
     });
 
     await phase.test('partial receipt transfers only accepted quantities and leaves disputes in transit', async () => {
@@ -1974,6 +2207,48 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).body.find((row) => row.batch_id === output.batch_id).quantity_g, '0.300000');
     });
 
+    await phase.test('offline count adjustment supports repeated immutable corrections and records full history', async () => {
+      const [output] = await db(`SELECT ro.batch_id FROM recovery_event_output ro JOIN material_batch mb ON mb.id=ro.batch_id WHERE ro.recovery_event_id=:id AND mb.material_kind='RECOVERED_GOLD'`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      const context = {
+        userId: ids.phaseThree.recoveryUserId, partyId: ids.phaseThree.recoveryPartyUserId,
+        roleCode: 'RECOVERY_FACILITY_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.recoveryFacilityId,
+      };
+      const makeAdjustment = (countedQuantityGrams, links = {}) => makeSyncEnvelope({
+        ...context, commandType: 'inventory.adjustment.create', ...links,
+        payload: { locationId: ids.phaseThree.recoveryLocationId, input: {
+          batchId: output.batch_id, countedQuantityGrams, reason: 'Offline witnessed inventory count.', evidenceRef: 'offline-count-evidence', occurredAt: happenedAt,
+          measurement: { kind: 'MEASURED', sourceValue: countedQuantityGrams, sourceUnit: 'g', conversionVersion: 'test-v1', sourceRole: 'RECORDER', occurredAt: happenedAt },
+        } },
+      });
+      const noChange = makeAdjustment('0.300000');
+      const noChangeResult = await submitSyncEnvelope(ids.phaseThree.recoveryToken, await versionSyncEnvelope(ids.phaseThree.recoveryToken, noChange));
+      assert.equal(noChangeResult.status, 409, noChangeResult.text);
+      assert.equal(noChangeResult.body.receipt.error.code, 'NO_ADJUSTMENT_REQUIRED');
+
+      const firstCorrection = makeAdjustment('0.400000', { parentCommandIds: [noChange.clientMutationId], revisionOf: noChange.clientMutationId });
+      const corrected = await submitSyncEnvelope(ids.phaseThree.recoveryToken, await versionSyncEnvelope(ids.phaseThree.recoveryToken, firstCorrection));
+      assert.equal(corrected.status, 200, corrected.text);
+
+      const repeatedNoChange = makeAdjustment('0.400000', {
+        parentCommandIds: [noChange.clientMutationId, firstCorrection.clientMutationId], revisionOf: firstCorrection.clientMutationId,
+      });
+      const repeatedResult = await submitSyncEnvelope(ids.phaseThree.recoveryToken, await versionSyncEnvelope(ids.phaseThree.recoveryToken, repeatedNoChange));
+      assert.equal(repeatedResult.status, 409, repeatedResult.text);
+      assert.equal(repeatedResult.body.receipt.error.code, 'NO_ADJUSTMENT_REQUIRED');
+
+      const finalCorrection = makeAdjustment('0.500000', {
+        parentCommandIds: [noChange.clientMutationId, firstCorrection.clientMutationId, repeatedNoChange.clientMutationId],
+        revisionOf: repeatedNoChange.clientMutationId,
+      });
+      const finalResult = await submitSyncEnvelope(ids.phaseThree.recoveryToken, await versionSyncEnvelope(ids.phaseThree.recoveryToken, finalCorrection));
+      assert.equal(finalResult.status, 200, finalResult.text);
+      assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).body.find((row) => row.batch_id === output.batch_id).quantity_g, '0.500000');
+      const history = await db(`SELECT client_mutation_id,status,envelope->>'revisionOf' AS revision_of FROM sync_command_receipt
+        WHERE client_mutation_id IN (:ids) ORDER BY server_received_at`, { ids: [noChange.clientMutationId, firstCorrection.clientMutationId, repeatedNoChange.clientMutationId, finalCorrection.clientMutationId] }, undefined, QueryTypes.SELECT);
+      assert.deepEqual(history.map((row) => row.status), ['CONFLICT', 'SERVER_ACCEPTED', 'CONFLICT', 'SERVER_ACCEPTED']);
+      assert.equal(history[3].revision_of, repeatedNoChange.clientMutationId);
+    });
+
     await phase.test('receipt, movement, and variance evidence cannot be overwritten', async () => {
       await assert.rejects(db(`UPDATE consignment_receipt_item SET outcome='REJECTED' WHERE id=:id`, { id: ids.phaseThree.partialReceipt.items[0].id }), sqlError('55000'));
       const [variance] = await db(`SELECT id FROM recovery_variance WHERE recovery_event_id=:id`, { id: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
@@ -2179,6 +2454,30 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     });
     assert.equal(assayCorrection.status, 201, assayCorrection.text);
 
+    const buyerTradeContext = { userId: buyer.userId, partyId: buyerPartyId, roleCode: 'LOCAL_MERCHANT', scopeKind: 'ORGANISATION', scopeId: buyerPartyId };
+    const offlineGoldMeasurement = await versionSyncEnvelope(buyerToken, makeSyncEnvelope({
+      ...buyerTradeContext, commandType: 'gold_trade.measurement.add', occurredAt: tradeDate,
+      payload: { tradeId, lineId: initialLineId, input: {
+        kind: 'MEASURED', quantityGrams: '0.051000', sourceValue: '51.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1',
+        sourceRole: 'BUYER', sourcePartyId: buyerPartyId, methodCode: 'OFFLINE-ASSAY-SAMPLE', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-OFFLINE-BUYER-WEIGHT',
+      } },
+    }));
+    const offlineMeasurementResult = await submitSyncEnvelope(buyerToken, offlineGoldMeasurement);
+    assert.equal(offlineMeasurementResult.status, 200, offlineMeasurementResult.text);
+    assert.equal(offlineMeasurementResult.body.receipt.response.quantityGrams, '0.051000');
+
+    const offlineGoldAssay = await versionSyncEnvelope(buyerToken, makeSyncEnvelope({
+      ...buyerTradeContext, commandType: 'gold_trade.assay.record', occurredAt: tradeDate,
+      payload: { tradeId, lineId: initialLineId, input: {
+        assayerPartyId: buyerPartyId, sampleRef: 'OFFLINE-SAMPLE-02', methodRef: 'RECORDED-FIRE-ASSAY', resultValue: '94.00000000',
+        resultUnit: 'PERCENT', observedAt: tradeDate, evidenceRef: 'FICTIONAL-OFFLINE-ASSAY-REPORT', correctionOfId: assayCorrection.body.id,
+        correctionReason: 'Offline assay transcription corrected against the signed report.',
+      } },
+    }));
+    const offlineAssayResult = await submitSyncEnvelope(buyerToken, offlineGoldAssay);
+    assert.equal(offlineAssayResult.status, 200, offlineAssayResult.text);
+    assert.equal(offlineAssayResult.body.receipt.response.correctionOfId, assayCorrection.body.id);
+
     const sellerAccept = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${initialLineId}/decisions`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
       decision: 'ACCEPT', quantityGrams: '0.050000', unitPrice: '2500.00000000', deductionAmount: '5.00000000', deductionReason: 'Fictional agreed refining deduction', occurredAt: tradeDate,
     });
@@ -2268,6 +2567,42 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(raceDecisions.filter((response) => response.status !== 200).length, 1);
     const [merchantBalanceAfterRace] = await db(`SELECT quantity_g FROM inventory_balance WHERE batch_id=:batchId AND location_id=:locationId`, { batchId: recovered.batch_id, locationId: buyerLocationId }, undefined, QueryTypes.SELECT);
     assert.equal(merchantBalanceAfterRace.quantity_g, '0.040000');
+
+    const activeSellerRoleId = randomUUID();
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'RECOVERY_FACILITY_OPERATOR','FACILITY',:facilityId)`, {
+      id: activeSellerRoleId, userId: ids.phaseThree.recoveryUserId, facilityId: ids.phaseThree.recoveryFacilityId,
+    });
+    const offlineSellerContext = {
+      userId: ids.phaseThree.recoveryUserId, partyId: ids.phaseThree.recoveryPartyUserId,
+      roleCode: 'RECOVERY_FACILITY_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.phaseThree.recoveryFacilityId,
+    };
+    const offlineCustodyMeasurement = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/measurements`)
+      .set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
+        kind: 'MEASURED', quantityGrams: '0.005000', sourceValue: '5.000', sourceUnit: 'mg', conversionVersion: 'canonical-mass-v1',
+        sourceRole: 'SELLER', methodCode: 'OFFLINE-CUSTODY-WEIGHING', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-OFFLINE-GOLD-WEIGHT',
+      });
+    assert.equal(offlineCustodyMeasurement.status, 201, offlineCustodyMeasurement.text);
+    const offlineGoldOffer = await versionSyncEnvelope(sellerToken, makeSyncEnvelope({
+      ...offlineSellerContext, commandType: 'gold_trade.custody.offer', occurredAt: tradeDate,
+      payload: { tradeId, lineId: acceptedLineId, input: {
+        sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId,
+        measurementSetId: acceptedMeasurementSet.id, measurementId: offlineCustodyMeasurement.body.id,
+        quantityGrams: '0.005000', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-OFFLINE-GOLD-HANDOVER',
+      } },
+    }));
+    const offeredOfflineGold = await submitSyncEnvelope(sellerToken, offlineGoldOffer);
+    assert.equal(offeredOfflineGold.status, 200, offeredOfflineGold.text);
+    const offlineGoldTransferId = offeredOfflineGold.body.receipt.response.id;
+    const offlineBuyerContext = { userId: buyer.userId, partyId: buyerPartyId, roleCode: 'LOCAL_MERCHANT', scopeKind: 'ORGANISATION', scopeId: buyerPartyId };
+    const offlineGoldDecision = await versionSyncEnvelope(buyerToken, makeSyncEnvelope({
+      ...offlineBuyerContext, commandType: 'custody.transfer.decide', occurredAt: tradeDate,
+      parentCommandIds: [offlineGoldOffer.clientMutationId],
+      payload: { transferId: offlineGoldTransferId, input: { decision: 'ACCEPT', occurredAt: tradeDate, evidenceRef: 'FICTIONAL-OFFLINE-GOLD-HANDOVER-ACK' } },
+    }));
+    const acceptedOfflineGold = await submitSyncEnvelope(buyerToken, offlineGoldDecision);
+    assert.equal(acceptedOfflineGold.status, 200, acceptedOfflineGold.text);
+    assert.ok(acceptedOfflineGold.body.receipt.response.inventoryMovementId);
+
     const insufficientMeasurementId = await recordCustodyMeasurement('0.190000', '190.000', 'FICTIONAL-INVENTORY-OVERDRAW-WEIGHT');
     const insufficientHandover = await request(app).post(`/api/v1/gold-trades/${tradeId}/lines/${acceptedLineId}/custody-offers`).set('Authorization', `Bearer ${sellerToken}`).set('Idempotency-Key', randomUUID()).send({
       sourceLocationId: recovered.source_location_id, destinationLocationId: buyerLocationId, measurementSetId: acceptedMeasurementSet.id, measurementId: insufficientMeasurementId,

@@ -44,6 +44,25 @@ export interface HoleParticipantReference {
   role_code: string;
 }
 
+export interface ProductionEventReference {
+  id: string;
+  siteId: string;
+  hole_id: string;
+  auditSequence: number;
+  participants: Array<{ party_id: string; role_code: string; relationship_id: string; relationship_kind: string }>;
+  captureProvenance: {
+    id: string;
+    actual_participant_party_id: string | null;
+    participant_identity_state: 'IDENTIFIED' | 'UNRESOLVED' | 'UNKNOWN';
+    source_kind: string;
+    occurred_at_claimed: string;
+    entered_at: string;
+    source_reference: string | null;
+    evidence_ref: string | null;
+  } | null;
+  outputs: Array<{ id: string; batch_id: string; batch_code: string; material_kind: string; measurement_set_id: string }>;
+}
+
 export async function getSites(token: string): Promise<SiteReference[]> {
   return apiRequest<SiteReference[]>('/api/v1/sites', token);
 }
@@ -54,4 +73,8 @@ export async function getHoles(siteId: string, token: string): Promise<HoleRefer
 
 export async function getHoleParticipants(siteId: string, holeId: string, token: string): Promise<HoleParticipantReference[]> {
   return apiRequest<HoleParticipantReference[]>(`/api/v1/sites/${siteId}/holes/${holeId}/participants`, token);
+}
+
+export async function getProductionEvent(siteId: string, eventId: string, token: string): Promise<ProductionEventReference> {
+  return apiRequest<ProductionEventReference>(`/api/v1/sites/${siteId}/production-events/${eventId}`, token);
 }

@@ -10,6 +10,9 @@ import { lockInventoryBalanceKeys, postMovementInTransaction } from '../inventor
 const query = (sql, replacements = {}, transaction, type = QueryTypes.SELECT) => sequelize.query(sql, {
   replacements, ...(transaction ? { transaction } : {}), ...(type ? { type } : {}),
 });
+const expectedVersionsFor = (options) => options?.expectedVersion ? [{
+  kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence,
+}] : [];
 
 function assertDistinctIds(values, field) {
   if (new Set(values).size !== values.length) throw new AppError(400, 'DUPLICATE_RESOURCE', `${field} may appear only once in a command.`);
@@ -226,7 +229,7 @@ export async function receiveDoraResidue(stockpileId, input, auth, mutationId) {
   }));
 }
 
-export async function transferBetweenStockpiles(sourceLocationId, input, auth, mutationId) {
+export async function transferBetweenStockpiles(sourceLocationId, input, auth, mutationId, options = {}) {
   if (sourceLocationId === input.destinationStockpileId) throw new AppError(400, 'INVALID_STOCKPILE_TRANSFER', 'Choose a different destination stockpile.');
   const [source] = await query(`SELECT processing_facility_id FROM residue_stockpile WHERE inventory_location_id=:id`, { id: sourceLocationId });
   const [destination] = await query(`SELECT processing_facility_id FROM residue_stockpile WHERE inventory_location_id=:id`, { id: input.destinationStockpileId });
@@ -253,7 +256,7 @@ export async function transferBetweenStockpiles(sourceLocationId, input, auth, m
         { batchId: item.batchId, locationId: input.destinationStockpileId, direction: 'IN', quantityGrams: item.quantityGrams, measurementSetId: setId, measurementId },
       );
     }
-    const movement = await postMovementInTransaction({ movementKind: 'TRANSFER', lines, reason: input.evidenceRef, occurredAt: input.occurredAt, auth, transaction, mutationId });
+    const movement = await postMovementInTransaction({ movementKind: 'TRANSFER', lines, reason: input.evidenceRef, occurredAt: input.occurredAt, auth, transaction, mutationId, expectedVersions: expectedVersionsFor(options) });
     await appendAuditEvent({
       transaction, eventType: 'RESIDUE.STOCKPILE_TRANSFERRED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
@@ -337,7 +340,7 @@ async function getConsignmentSourceFacilities(consignmentId) {
   return rows.map((row) => row.processing_facility_id);
 }
 
-export async function dispatchConsignment(consignmentId, input, auth, mutationId) {
+export async function dispatchConsignment(consignmentId, input, auth, mutationId, options = {}) {
   const sourceFacilityIds = await getConsignmentSourceFacilities(consignmentId);
   if (!sourceFacilityIds.length) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   for (const id of sourceFacilityIds) await assertDoraAccess(auth, id, true);
@@ -377,6 +380,7 @@ export async function dispatchConsignment(consignmentId, input, auth, mutationId
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
       payload: { consignment_id: consignmentId, inventory_movement_id: movement.id, item_count: items.length },
       streams: [{ kind: 'consignment', id: consignmentId }, { kind: 'inventory_location', id: consignment.transit_location_id }, ...items.map((row) => ({ kind: 'material_batch', id: row.batch_id }))],
+      expectedVersions: expectedVersionsFor(options),
     });
     return { ...movement, consignmentId, status: 'DISPATCHED' };
   }));
@@ -501,7 +505,7 @@ export async function listLocationBalances(locationId, auth) {
   );
 }
 
-export async function receiveConsignment(consignmentId, input, auth, mutationId) {
+export async function receiveConsignment(consignmentId, input, auth, mutationId, options = {}) {
   const [parent] = await query(`SELECT * FROM consignment WHERE id=:id`, { id: consignmentId });
   if (!parent) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   await assertRecoveryAccess(auth, parent.destination_recovery_facility_id, true);
@@ -588,12 +592,13 @@ export async function receiveConsignment(consignmentId, input, auth, mutationId)
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
       payload: { consignment_id: consignmentId, receipt_id: receiptId, status: nextStatus, accepted_item_count: results.filter((row) => row.outcome === 'ACCEPTED').length, disputed_item_count: results.filter((row) => row.outcome !== 'ACCEPTED').length, inventory_movement_id: movement?.id ?? null },
       streams: [{ kind: 'consignment', id: consignmentId }, { kind: 'recovery_facility', id: consignment.destination_recovery_facility_id }, { kind: 'inventory_location', id: consignment.transit_location_id }, { kind: 'inventory_location', id: destination.inventory_location_id }, ...results.map((row) => ({ kind: 'material_batch', id: row.batchId }))],
+      expectedVersions: expectedVersionsFor(options),
     });
     return { id: receiptId, consignmentId, status: nextStatus, items: results, movement };
   }));
 }
 
-export async function correctConsignmentReceiptItem(consignmentId, receiptItemId, input, auth, mutationId) {
+export async function correctConsignmentReceiptItem(consignmentId, receiptItemId, input, auth, mutationId, options = {}) {
   const [parent] = await query(`SELECT destination_recovery_facility_id FROM consignment WHERE id=:id`, { id: consignmentId });
   if (!parent) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   await assertRecoveryAccess(auth, parent.destination_recovery_facility_id, true);
@@ -732,6 +737,7 @@ export async function correctConsignmentReceiptItem(consignmentId, receiptItemId
         reversal_movement_id: reversal?.id ?? null, inventory_movement_id: movement?.id ?? null, status: nextStatus,
       },
       streams: [{ kind: 'consignment', id: consignmentId }, { kind: 'recovery_facility', id: consignment.destination_recovery_facility_id }, { kind: 'material_batch', id: prior.batch_id }],
+      expectedVersions: expectedVersionsFor(options),
     });
     return {
       id: receiptId, consignmentId, status: nextStatus,
@@ -741,7 +747,7 @@ export async function correctConsignmentReceiptItem(consignmentId, receiptItemId
   }));
 }
 
-export async function createCustodyOffer(consignmentId, input, auth, mutationId) {
+export async function createCustodyOffer(consignmentId, input, auth, mutationId, options = {}) {
   const [consignment] = await query(`SELECT * FROM consignment WHERE id=:id`, { id: consignmentId });
   const sourceFacilityIds = await getConsignmentSourceFacilities(consignmentId);
   if (!consignment || !sourceFacilityIds.length) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
@@ -783,12 +789,13 @@ export async function createCustodyOffer(consignmentId, input, auth, mutationId)
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
       payload: { custody_transfer_id: transferId, consignment_id: consignmentId, item_count: items.length },
       streams: [{ kind: 'custody_transfer', id: transferId }, { kind: 'consignment', id: consignmentId }],
+      expectedVersions: expectedVersionsFor(options),
     });
     return { id: transferId, consignmentId, status: 'OFFERED', itemCount: items.length };
   }));
 }
 
-export async function decideCustodyTransfer(transferId, input, auth, mutationId) {
+export async function decideCustodyTransfer(transferId, input, auth, mutationId, options = {}) {
   const [transfer] = await query(
     `SELECT ct.*,c.destination_recovery_facility_id FROM custody_transfer ct JOIN consignment c ON c.id=ct.consignment_id WHERE ct.id=:id`,
     { id: transferId },
@@ -824,6 +831,7 @@ export async function decideCustodyTransfer(transferId, input, auth, mutationId)
       occurredAt: new Date(input.occurredAt), clientMutationId: mutationId,
       payload: { custody_transfer_id: transferId, decision_event_id: eventId, status, reason: input.reason ?? null },
       streams: [{ kind: 'custody_transfer', id: transferId }, { kind: 'consignment', id: locked.consignment_id }],
+      expectedVersions: expectedVersionsFor(options),
     });
     return { id: transferId, status, decisionEventId: eventId };
   }));
@@ -1033,7 +1041,7 @@ export async function readResidueSale(saleId, auth) {
   return { ...sale, lines, decisions };
 }
 
-export async function adjustInventory(locationId, input, auth, mutationId) {
+export async function adjustInventory(locationId, input, auth, mutationId, options = {}) {
   const balances = await listLocationBalances(locationId, auth);
   const [location] = await query(
     `SELECT s.processing_facility_id,ril.recovery_facility_id FROM inventory_location l
@@ -1070,7 +1078,7 @@ export async function adjustInventory(locationId, input, auth, mutationId) {
       movementKind: 'ADJUSTMENT', lines: [{
         batchId: input.batchId, locationId, direction: delta > 0n ? 'IN' : 'OUT', quantityGrams: microsToGrams(delta > 0n ? delta : -delta),
         measurementSetId: setId, measurementId, inventoryCountId: countId,
-      }], reason: input.reason, occurredAt: input.occurredAt, auth, transaction, mutationId,
+      }], reason: input.reason, occurredAt: input.occurredAt, auth, transaction, mutationId, expectedVersions: expectedVersionsFor(options),
     });
     await appendAuditEvent({
       transaction, eventType: 'INVENTORY.COUNT_ADJUSTMENT_RECORDED', actorUserId: auth.userId, actorPartyId: auth.personPartyId,

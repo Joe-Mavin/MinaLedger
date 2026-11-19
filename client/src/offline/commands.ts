@@ -42,6 +42,33 @@ export async function createEnvelope(input: {
   };
 }
 
+export async function createLinkedRevision(input: {
+  original: QueuedCommand;
+  recorderUserId: string;
+  actingContext: ActingContext;
+  payload: unknown;
+  expectedVersion?: CommandEnvelope['expectedVersion'];
+  parentCommandIds?: string[];
+}): Promise<CommandEnvelope> {
+  const originalEnvelope = input.original.envelope;
+  if (input.original.state !== 'conflict' && input.original.state !== 'rejected') {
+    throw new Error('Only a conflicted or rejected command can be corrected.');
+  }
+  return createEnvelope({
+    recorderUserId: input.recorderUserId,
+    actingContext: input.actingContext,
+    commandType: originalEnvelope.commandType,
+    payload: input.payload,
+    occurredAtClaimed: originalEnvelope.occurredAtClaimed,
+    actualParticipant: originalEnvelope.actualParticipant,
+    captureProvenance: originalEnvelope.captureProvenance,
+    evidence: originalEnvelope.evidence,
+    expectedVersion: input.expectedVersion,
+    parentCommandIds: [...new Set([...originalEnvelope.parentCommandIds, ...(input.parentCommandIds ?? []), originalEnvelope.clientMutationId])],
+    revisionOf: originalEnvelope.clientMutationId,
+  });
+}
+
 export async function saveDraft(envelope: CommandEnvelope, contextKey: string): Promise<void> {
   const command: QueuedCommand = {
     envelope, state: 'draft', recorderUserId: envelope.recorderUserId, contextKey,

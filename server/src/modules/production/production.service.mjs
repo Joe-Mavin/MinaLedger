@@ -267,8 +267,13 @@ export async function getProductionEvent(siteId, eventId) {
      WHERE pec.production_event_id=:eventId`,
     { replacements: { eventId }, type: QueryTypes.SELECT },
   );
+  const [auditHead] = await sequelize.query(
+    `SELECT last_sequence FROM audit_stream_head WHERE stream_kind='material_event' AND stream_id=:eventId`,
+    { replacements: { eventId }, type: QueryTypes.SELECT },
+  );
   return {
     ...event,
+    auditSequence: Number(auditHead?.last_sequence ?? 0),
     participants,
     captureProvenance: capture ?? null,
     outputs: outputs.map((output) => ({ ...output, measurements: measurements.filter((measurement) => measurement.measurement_set_id === output.measurement_set_id) })),

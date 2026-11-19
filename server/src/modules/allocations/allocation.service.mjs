@@ -10,7 +10,7 @@ function decimalToScaledInteger(value, scale) {
   return BigInt(whole) * (10n ** BigInt(scale)) + BigInt(fraction.padEnd(scale, '0'));
 }
 
-export async function createAllocationSet(siteId, eventId, outputId, input, auth, mutationId) {
+export async function createAllocationSet(siteId, eventId, outputId, input, auth, mutationId, options = {}) {
   return sequelize.transaction(async (transaction) => executeIdempotent({
     actorScope: `user:${auth.userId}`, mutationId,
     payload: { action: 'allocation.propose', siteId, eventId, outputId, input }, transaction,
@@ -149,6 +149,7 @@ export async function createAllocationSet(siteId, eventId, outputId, input, auth
         { kind: 'material_batch', id: output.batch_id },
         ...input.rows.map((row) => ({ kind: 'party', id: row.beneficiaryPartyId })),
       ],
+      expectedVersions: options.expectedVersion ? [{ kind: options.expectedVersion.streamKind, id: options.expectedVersion.streamId, sequence: options.expectedVersion.sequence }] : [],
     });
     return {
       id: setId, allocationChainId: chain.id, productionEventOutputId: outputId,

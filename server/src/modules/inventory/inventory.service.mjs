@@ -101,7 +101,7 @@ export async function lockInventoryBalanceKeys(keys, transaction) {
 }
 
 export async function postMovementInTransaction({
-  movementKind, eventId = null, reversesMovementId = null, lines, reason = null, occurredAt, auth, transaction, mutationId,
+  movementKind, eventId = null, reversesMovementId = null, lines, reason = null, occurredAt, auth, transaction, mutationId, expectedVersions = [],
 }) {
   const keys = sortKeys(lines);
   await lockCommercialChains(lines, transaction);
@@ -163,6 +163,7 @@ export async function postMovementInTransaction({
     actorPartyId: auth.personPartyId, occurredAt: new Date(occurredAt), clientMutationId: mutationId,
     payload: { movement_id: movementId, movement_kind: movementKind, event_id: eventId, line_count: lines.length, batch_ids: [...new Set(lines.map((line) => line.batchId))] },
     streams: streamRefs,
+    expectedVersions,
   });
   await sequelize.query(
     'SET CONSTRAINTS inventory_validate_header_deferred, inventory_validate_line_deferred, phase_three_inventory_header_guard, phase_three_inventory_line_guard, phase_three_movement_links_header_guard, phase_three_movement_links_line_guard IMMEDIATE',
