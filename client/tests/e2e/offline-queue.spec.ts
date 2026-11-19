@@ -13,7 +13,9 @@ const validToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now(
 
 test('session token stays tab-scoped and offline commands survive reload with their server state', async ({ page, context }) => {
   const submitted: Array<Record<string, unknown>> = [];
+  const receiptLookups: string[] = [];
   let lostResponseMutationId: string | undefined;
+  const offlineCommand = { mutationId: undefined as string | undefined };
   await page.route('**/api/v1/auth/login', (route) => route.fulfill({ json: {
     token: validToken,
     user: { id: userId, personPartyId: partyId, displayName: 'Fictional Recorder' },
@@ -47,7 +49,7 @@ test('session token stays tab-scoped and offline commands survive reload with th
   await page.route('**/api/v1/sync/commands', async (route) => {
     const envelope = route.request().postDataJSON() as Record<string, unknown>;
     submitted.push(envelope);
-    if (submitted.length === 3) {
+    if (envelope.clientMutationId === offlineCommand.mutationId) {
       lostResponseMutationId = String(envelope.clientMutationId);
       await route.abort();
       return;
@@ -60,6 +62,8 @@ test('session token stays tab-scoped and offline commands survive reload with th
     } } });
   });
   await page.route('**/api/v1/sync/receipts/**', (route) => {
+    const mutationId = route.request().url().split('/').at(-1) ?? '';
+    receiptLookups.push(mutationId);
     if (lostResponseMutationId && route.request().url().endsWith(lostResponseMutationId)) {
       return route.fulfill({ status: 200, json: { receipt: {
         clientMutationId: lostResponseMutationId, status: 'server_accepted', receivedAt: new Date().toISOString(),
@@ -116,12 +120,38 @@ test('session token stays tab-scoped and offline commands survive reload with th
   await page.getByLabel('Actual participant identity').selectOption('UNKNOWN');
   await page.getByLabel('Source reference').fill('offline-notebook-2');
   await page.getByRole('button', { name: 'Save to offline queue' }).click();
-  await expect(page.getByText('Waiting to upload')).toBeVisible();
+  const queuedOfflineCommand = page.locator('.queue-item').filter({ has: page.getByText('Waiting to upload', { exact: true }) });
+  await expect(queuedOfflineCommand).toHaveCount(1);
+  offlineCommand.mutationId = await queuedOfflineCommand.locator('code').textContent() ?? undefined;
+  expect(offlineCommand.mutationId).toMatch(/^[0-9a-f-]{36}$/i);
   expect(submitted).toHaveLength(2);
   const cachedApiResponse = await page.evaluate(async () => Boolean(await caches.match('/api/v1/sites')));
   expect(cachedApiResponse).toBe(false);
   await context.setOffline(false);
-  await expect(page.getByText('Accepted by server')).toBeVisible();
+  const offlineCommandRow = page.locator('.queue-item').filter({ has: page.getByText(offlineCommand.mutationId!, { exact: true }) });
+  await expect(offlineCommandRow.getByText('Accepted by server', { exact: true })).toBeVisible();
+  await expect.poll(() => submitted.filter((envelope) => envelope.clientMutationId === offlineCommand.mutationId)).toHaveLength(1);
   expect(submitted).toHaveLength(3);
-  expect(submitted[2]?.clientMutationId).toBe(lostResponseMutationId);
+  expect(submitted[2]?.clientMutationId).toBe(offlineCommand.mutationId);
+  expect(lostResponseMutationId).toBe(offlineCommand.mutationId);
+  expect(receiptLookups).toEqual([offlineCommand.mutationId]);
+
+  const localState = await page.evaluate(async (mutationId) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('minaledger-field-v1', 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return await new Promise<{ command: { envelope: { clientMutationId: string }; state: string }; receipt: { clientMutationId: string; status: string } }>((resolve, reject) => {
+        const transaction = database.transaction(['commands', 'receipts'], 'readonly');
+        const commandRequest = transaction.objectStore('commands').get(mutationId);
+        const receiptRequest = transaction.objectStore('receipts').get(mutationId);
+        transaction.oncomplete = () => resolve({ command: commandRequest.result, receipt: receiptRequest.result });
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally { database.close(); }
+  }, offlineCommand.mutationId!);
+  expect(localState.command).toMatchObject({ envelope: { clientMutationId: offlineCommand.mutationId }, state: 'server_accepted' });
+  expect(localState.receipt).toMatchObject({ clientMutationId: offlineCommand.mutationId, status: 'server_accepted' });
 });
