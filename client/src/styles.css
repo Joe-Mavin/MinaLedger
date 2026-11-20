@@ -59,6 +59,8 @@ label { display: grid; gap: 7px; color: #394940; font-size: 13px; font-weight: 7
 .section-heading .eyebrow { margin-bottom: 6px; }
 .local-badge { padding: 7px 10px; border-radius: 999px; color: #6c5617; background: #fbf2d4; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.checkbox-field { display: flex; align-items: center; gap: 10px; }
+.checkbox-field input { flex: 0 0 18px; width: 18px; min-height: 18px; height: 18px; accent-color: #12372b; }
 .span-two { grid-column: 1 / -1; }
 .form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 .notice { margin-bottom: 16px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.45; }
@@ -121,6 +123,36 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 14px
 .registry-site-row span, .registry-site-row small { color: #728178; font-size: 11px; }
 .registry-policy { margin: 15px 0 0; color: #6e7c73; font-size: 11px; line-height: 1.55; }
 .registry-detail-panel .queue-section { min-width: 0; }
+.production-filters { margin-bottom: 17px; }
+.table-wrap { width: 100%; overflow-x: auto; border: 1px solid #e3eae4; border-radius: 10px; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+.data-table th, .data-table td { min-width: 115px; padding: 11px 12px; border-bottom: 1px solid #e8ede9; vertical-align: top; }
+.data-table th { color: #607167; background: #f7faf7; font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
+.data-table tr:last-child td { border-bottom: 0; }
+.data-table td small { display: block; margin-top: 4px; color: #77877e; font-size: 10px; overflow-wrap: anywhere; }
+.production-detail { scroll-margin-top: 20px; }
+.detail-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 24px; }
+.detail-list > div { min-width: 0; padding: 12px; border: 1px solid #e7ece8; border-radius: 9px; background: #fbfcfb; }
+.detail-list dt { color: #738178; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.detail-list dd { margin: 5px 0 0; color: #263b30; font-size: 12px; overflow-wrap: anywhere; }
+.production-subsection { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e8ede9; }
+.production-subsection h3 { margin: 0 0 14px; font-size: 17px; }
+.production-subsection h4 { margin: 16px 0 9px; font-size: 14px; }
+.production-output-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.production-output { display: grid; justify-items: start; gap: 7px; }
+.production-output strong, .production-output p { overflow-wrap: anywhere; }
+.production-output p { margin: 0; color: #66766d; font-size: 12px; line-height: 1.45; }
+.production-batch-detail { margin-top: 14px; }
+.production-batch-detail h4 { margin-top: 0; }
+.production-observation-group + .production-observation-group { margin-top: 20px; }
+.allocation-history { margin: 12px 0 18px; }
+.allocation-history .queue-item { padding-inline: 0; }
+.allocation-history ul { display: grid; gap: 5px; padding-left: 18px; color: #506158; font-size: 12px; }
+.allocation-form { margin-top: 18px; padding: 18px; border: 1px solid #e2e9e3; border-radius: 11px; background: #fafcfa; }
+.allocation-form h4 { margin-top: 0; }
+.allocation-form .field-note { margin-bottom: 15px; }
+.allocation-row { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(150px, .8fr) auto; align-items: end; gap: 12px; padding: 12px; border: 1px solid #e4ebe5; border-radius: 9px; background: #fff; }
+.nav-production { border-radius: 50%; }
 .registry-detail-heading { align-items: flex-start; }
 .registry-detail-heading .muted { margin: 5px 0 0; font-size: 12px; }
 .registry-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 20px 0 2px; }
@@ -271,6 +303,8 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 14px
   .form-grid { grid-template-columns: 1fr; }
   .span-two { grid-column: auto; }
   .queue-section .section-heading { display: grid; }
+  .detail-list { grid-template-columns: 1fr; }
+  .allocation-row { grid-template-columns: 1fr; }
   .queue-item { display: grid; }
   .queue-actions { justify-content: flex-start; }
   footer { display: grid; gap: 5px; }

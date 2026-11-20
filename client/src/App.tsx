@@ -9,6 +9,7 @@ import { AppShell, WorkspaceHeading } from './AppShell';
 import { getNavigationItems, type WorkspaceSection } from './navigation';
 import { RegistryWorkspace } from './registry/RegistryWorkspace';
 import { AccessAdministration, type RegisteredOrganization, type SessionAdminAccount } from './admin/AccessAdministration';
+import { ProductionWorkspace } from './production/ProductionWorkspace';
 
 interface RoleGrant {
   roleCode: string;
@@ -116,6 +117,7 @@ export default function App() {
   const [sourceKind, setSourceKind] = useState('DIRECT');
   const [sourceReference, setSourceReference] = useState('');
   const [evidenceReference, setEvidenceReference] = useState('');
+  const [includeInitialMeasurement, setIncludeInitialMeasurement] = useState(false);
   const [materialKind, setMaterialKind] = useState('GOLD_BEARING_FEED');
   const [eventId, setEventId] = useState('');
   const [measurementEventContext, setMeasurementEventContext] = useState<ProductionEventReference | null>(null);
@@ -129,6 +131,8 @@ export default function App() {
   const [conversionVersion, setConversionVersion] = useState('manual-v1');
   const [sourceRole, setSourceRole] = useState('RECORDER');
   const [measurementSourcePartyId, setMeasurementSourcePartyId] = useState('');
+  const [measurementMethodCode, setMeasurementMethodCode] = useState('');
+  const [measurementInstrumentRef, setMeasurementInstrumentRef] = useState('');
   const [ackStatus, setAckStatus] = useState('ACKNOWLEDGED');
   const [ackMethod, setAckMethod] = useState('IN_PERSON');
   const [ackReason, setAckReason] = useState('');
@@ -458,10 +462,26 @@ export default function App() {
         ...(evidenceReference.trim() ? { evidenceRef: evidenceReference.trim() } : {}),
       };
       captureProvenance = capture;
+      if (includeInitialMeasurement && (!quantityGrams.trim() || !sourceValue.trim() || !sourceUnit.trim() || !conversionVersion.trim())) {
+        throw new Error('An output observation needs a quantity, source value, source unit and conversion version.');
+      }
+      const initialMeasurements = includeInitialMeasurement ? [{
+        kind: measurementKind,
+        quantityGrams: quantityGrams.trim(),
+        sourceValue: sourceValue.trim(),
+        sourceUnit: sourceUnit.trim(),
+        conversionVersion: conversionVersion.trim(),
+        sourceRole,
+        ...(measurementSourcePartyId.trim() ? { sourcePartyId: measurementSourcePartyId.trim() } : {}),
+        ...(measurementMethodCode.trim() ? { methodCode: measurementMethodCode.trim() } : {}),
+        ...(measurementInstrumentRef.trim() ? { instrumentRef: measurementInstrumentRef.trim() } : {}),
+        occurredAt: occurredAtIso,
+        ...(evidenceReference.trim() ? { evidenceRef: evidenceReference.trim() } : {}),
+      }] : [];
       payload = { siteId, input: {
         holeId, occurredAt: occurredAtIso,
         ...(identityState === 'IDENTIFIED' ? { participantRelationshipIds: [participant!.relationship_id] } : {}),
-        captureProvenance: capture, outputs: [{ materialKind, measurements: [] }],
+        captureProvenance: capture, outputs: [{ materialKind, measurements: initialMeasurements }],
       } };
       if (evidenceReference.trim()) evidence = [{ reference: evidenceReference.trim() }];
     } else if (commandType === 'production.measurement.add' && !revisionSource) {
@@ -482,6 +502,8 @@ export default function App() {
           kind: measurementKind, quantityGrams: quantityGrams.trim(), sourceValue: sourceValue.trim(), sourceUnit: sourceUnit.trim(),
           conversionVersion: conversionVersion.trim(), sourceRole,
           ...(measurementSourcePartyId.trim() ? { sourcePartyId: measurementSourcePartyId.trim() } : {}),
+          ...(measurementMethodCode.trim() ? { methodCode: measurementMethodCode.trim() } : {}),
+          ...(measurementInstrumentRef.trim() ? { instrumentRef: measurementInstrumentRef.trim() } : {}),
           occurredAt: occurredAtIso, ...(evidenceReference.trim() ? { evidenceRef: evidenceReference.trim() } : {}),
         },
       };
@@ -679,6 +701,43 @@ export default function App() {
           onOrganizationCreated={(organization) => setSessionOrganizations((current) => [organization, ...current.filter((row) => row.partyId !== organization.partyId)])}
         />}
 
+        {activeSection === 'production' && token && <ProductionWorkspace
+          token={token}
+          recorderUserId={recorder.id}
+          actingContext={actingContext}
+          contextKey={contextKey}
+          online={online}
+          sites={sites}
+          canProposeAllocations={selectedRole?.roleCode === 'FIELD_OFFICER' || selectedRole?.roleCode === 'MINING_OPERATOR'}
+          onRecordProduction={(selectedSiteId, selectedHoleId) => {
+            setSiteId(selectedSiteId);
+            setHoleId(selectedHoleId);
+            setCommandType('production.create');
+            setIdentityState('UNKNOWN');
+            setParticipantRelationshipId('');
+            setSourceKind('DIRECT');
+            setSourceReference('');
+            setEvidenceReference('');
+            setIncludeInitialMeasurement(false);
+            setMeasurementKind('MEASURED');
+            setQuantityGrams('');
+            setSourceValue('');
+            setSourceUnit('g');
+            setConversionVersion('manual-v1');
+            setSourceRole('RECORDER');
+            setMeasurementSourcePartyId('');
+            setMeasurementMethodCode('');
+            setMeasurementInstrumentRef('');
+            setOccurredAt(localDateTimeNow());
+            setRevisionSource(null);
+            setError('');
+            setMessage('Site and hole were selected in Production. Complete capture provenance, then save through the existing offline command queue.');
+            sessionStorage.setItem('minaledger.selectedContext', JSON.stringify({ recorderUserId: recorder.id, siteId: selectedSiteId, holeId: selectedHoleId, roleKey: selectedRoleKey }));
+            setActiveSection('capture');
+          }}
+          onCommandQueued={() => refreshCommands(recorder.id)}
+        />}
+
 
         {activeSection === 'capture' && <>
         <WorkspaceHeading eyebrow="FIELD WORKSPACE" title="Capture field information" description="Prepare allowlisted commands for the active role and scope. Server authorization is rechecked during synchronization." action={<button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>} />
@@ -731,6 +790,19 @@ export default function App() {
               </select></label>
               <label>Source reference<input value={sourceReference} onChange={(event) => setSourceReference(event.target.value)} placeholder="Optional paper or source reference" /></label>
               <label>Evidence reference<input value={evidenceReference} onChange={(event) => setEvidenceReference(event.target.value)} placeholder="Optional evidence reference" /></label>
+              <label className="checkbox-field span-two"><input type="checkbox" checked={includeInitialMeasurement} onChange={(event) => setIncludeInitialMeasurement(event.target.checked)} /> Add a quantity observation to this output</label>
+              {includeInitialMeasurement && <>
+                <div className="notice info span-two">This adds a typed observation to the new output. Declared, measured and verified values remain distinct records.</div>
+                <label>Initial observation type<select value={measurementKind} onChange={(event) => setMeasurementKind(event.target.value)}><option>DECLARED</option><option>MEASURED</option><option>VERIFIED</option></select></label>
+                <label>Initial quantity in grams<input inputMode="decimal" value={quantityGrams} onChange={(event) => setQuantityGrams(event.target.value)} /></label>
+                <label>Initial source value<input inputMode="decimal" value={sourceValue} onChange={(event) => setSourceValue(event.target.value)} /></label>
+                <label>Initial source unit<input value={sourceUnit} onChange={(event) => setSourceUnit(event.target.value)} /></label>
+                <label>Initial conversion version<input value={conversionVersion} onChange={(event) => setConversionVersion(event.target.value)} /></label>
+                <label>Initial source role<select value={sourceRole} onChange={(event) => setSourceRole(event.target.value)}>{['SELLER', 'BUYER', 'RECORDER', 'WITNESS', 'WEIGHER', 'OTHER'].map((role) => <option key={role}>{role}</option>)}</select></label>
+                <label>Initial measurement source party ID<input value={measurementSourcePartyId} onChange={(event) => setMeasurementSourcePartyId(event.target.value)} placeholder="Optional; separate from actual participant" /></label>
+                <label>Initial method code<input value={measurementMethodCode} onChange={(event) => setMeasurementMethodCode(event.target.value)} /></label>
+                <label>Initial instrument reference<input value={measurementInstrumentRef} onChange={(event) => setMeasurementInstrumentRef(event.target.value)} /></label>
+              </>}
             </>}
             {commandType === 'production.measurement.add' && <>
               <label>Production event ID<input value={eventId} onChange={(event) => { setEventId(event.target.value); setMeasurementEventContext(null); setMeasurementParticipantPartyId(''); setOutputId(''); }} placeholder="UUID" /></label>
@@ -753,6 +825,8 @@ export default function App() {
               <label>Conversion version<input value={conversionVersion} onChange={(event) => setConversionVersion(event.target.value)} /></label>
               <label>Source role<select value={sourceRole} onChange={(event) => setSourceRole(event.target.value)}>{['SELLER', 'BUYER', 'RECORDER', 'WITNESS', 'WEIGHER', 'OTHER'].map((role) => <option key={role}>{role}</option>)}</select></label>
               <label>Measurement source party ID<input value={measurementSourcePartyId} onChange={(event) => setMeasurementSourcePartyId(event.target.value)} placeholder="Separate from the event participant; required for witness/weigher/other" /></label>
+              <label>Method code<input value={measurementMethodCode} onChange={(event) => setMeasurementMethodCode(event.target.value)} /></label>
+              <label>Instrument reference<input value={measurementInstrumentRef} onChange={(event) => setMeasurementInstrumentRef(event.target.value)} /></label>
               <label>Evidence reference<input value={evidenceReference} onChange={(event) => setEvidenceReference(event.target.value)} /></label>
             </>}
             {commandType === 'capture.acknowledgement.add' && <>
