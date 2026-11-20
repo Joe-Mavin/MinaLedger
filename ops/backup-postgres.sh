@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 : "${PGHOST:?Database host is required}"
 : "${PGPORT:?Database port is required}"

@@ -47,7 +47,7 @@ Invoke-RestMethod http://127.0.0.1:8080/livez
 Invoke-RestMethod http://127.0.0.1:8080/readyz
 ```
 
-The explicit migration command starts PostgreSQL if needed, applies pending migration files, then grants the runtime role access to the schema. Check its exit code before starting or updating the API. `up` does not invoke migrations. The API and checkpoint worker wait for a healthy database; the web container waits for API readiness. PostgreSQL and the API are not published on host ports. Only NGINX is published on host loopback. The web container proxies the same-origin API paths and serves the production-built PWA.
+The explicit migration command starts PostgreSQL if needed, applies pending migration files, then grants the runtime role access to the schema. Check its exit code before starting or updating the API. `up` does not invoke migrations. The API and checkpoint worker wait for a healthy database; the web container waits for API readiness. PostgreSQL and the API are not published on host ports. Only NGINX is published on host loopback. The web container proxies the same-origin API paths and serves the production-built PWA. Vite currently emits stable `/assets/app.js` and `/assets/index.css` names, so NGINX requires asset revalidation with `Cache-Control: no-cache`; HTML and `/sw.js` use `no-store` so deployments can be discovered. The service worker refreshes app-shell files from the network when online and serves the cache offline; the build verifies its precache list against generated files. API responses are never cached.
 
 For browser access, configure the hosting proxy to forward the staging hostname over HTTPS to `http://127.0.0.1:8080`, with sanitized forwarded headers. Keep the API and database unreachable from the public network. The Vite production client uses the current browser origin as its API base; the development client retains the local API default.
 
@@ -86,7 +86,7 @@ API and web logs omit query strings, redact opaque QR token path segments, omit 
 
 ## Backup and restore verification
 
-The Compose maintenance service runs PostgreSQL client tools over the private database network. It writes a custom-format `pg_dump` archive into `BACKUP_DIR`, validates the archive list, uses a temporary file, sets the archive mode to owner-only where supported, and refuses to overwrite an existing archive. The host backup directory must have restrictive ACLs and should be encrypted at rest. The procedure does not encrypt the archive itself, upload it off-host, retain it, or monitor backup freshness.
+The Compose maintenance service runs PostgreSQL client tools over the private database network. It writes a custom-format `pg_dump` archive into `BACKUP_DIR`, sets `umask 077` before creating the temporary file so it is owner-only from creation, validates the archive list, and refuses to overwrite an existing archive. The host backup directory must have restrictive ACLs and should be encrypted at rest. The procedure does not encrypt the archive itself, upload it off-host, retain it, or monitor backup freshness.
 
 Create a backup:
 

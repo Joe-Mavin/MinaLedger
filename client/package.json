@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "preview": "vite preview",
-    "lint": "eslint src tests vite.config.mts playwright.config.cjs",
-    "build": "tsc --noEmit && vite build",
+    "lint": "eslint src tests scripts vite.config.mts playwright.config.cjs",
+    "build": "tsc --noEmit && vite build && npm run verify:app-shell",
+    "verify:app-shell": "node scripts/verify-app-shell.mjs",
     "test:unit": "tsx --test tests/unit/offline-storage.test.ts tests/unit/offline-commands.test.ts",
     "test:e2e": "npm run build && playwright test"
   },

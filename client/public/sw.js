@@ -1,4 +1,4 @@
-const CACHE_NAME = 'minaledger-app-shell-v1';
+const CACHE_NAME = 'minaledger-app-shell-v2';
 const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icons/icon.svg', '/assets/app.js', '/assets/index.css'];
 
 self.addEventListener('install', (event) => {
@@ -14,13 +14,33 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url);
   if (request.method !== 'GET' || url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
   if (request.mode === 'navigate') {
-    event.respondWith(fetch(request).catch(async () => (await caches.match('/index.html')) || Response.error()));
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(request);
+        if (response.ok) {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put('/index.html', response.clone());
+        }
+        return response;
+      } catch {
+        return (await caches.match('/index.html')) || Response.error();
+      }
+    })());
     return;
   }
+  if (!APP_SHELL.includes(url.pathname)) return;
   if (request.destination === 'script' || request.destination === 'style' || request.destination === 'image' || url.pathname === '/manifest.webmanifest') {
-    event.respondWith(caches.match(url.pathname).then((cached) => cached || fetch(request).then((response) => {
-      if (response.ok) caches.open(CACHE_NAME).then((cache) => cache.put(url.pathname, response.clone()));
-      return response;
-    })));
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(request);
+        if (response.ok) {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put(url.pathname, response.clone());
+        }
+        return response;
+      } catch {
+        return (await caches.match(url.pathname)) || Response.error();
+      }
+    })());
   }
 });
