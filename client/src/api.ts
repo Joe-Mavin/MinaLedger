@@ -27,6 +27,9 @@ export interface SiteReference {
   id: string;
   siteCode: string;
   name: string;
+  countyCode?: string | null;
+  locality?: string | null;
+  status?: string;
 }
 
 export interface HoleReference {

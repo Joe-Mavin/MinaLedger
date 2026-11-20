@@ -399,6 +399,13 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const participants = await request(app).get(`/api/v1/sites/${ids.siteId}/participants`).set('Authorization', `Bearer ${ids.siteToken}`);
     assert.equal(participants.body.length, 5);
     assert.equal(new Set(participants.body.filter((row) => row.role_code === 'LANDOWNER').map((row) => row.party_id)).size, 2);
+    const minerRelationship = participants.body.find((row) => row.relationship_id === miner.body.relationshipId);
+    assert.equal(minerRelationship.party_kind, 'PERSON');
+    assert.equal(minerRelationship.relationship_kind, 'HOLE');
+    assert.equal(minerRelationship.hole_id, ids.holeId);
+    assert.deepEqual(minerRelationship.participant_categories.map((category) => category.participantKind).sort(), ['MINER', 'MINING_OPERATOR']);
+    assert.ok(minerRelationship.participant_categories.every((category) => category.validFrom));
+    assert.equal(minerRelationship.relationship_status, 'ACTIVE');
     await assert.rejects(db(`INSERT INTO mining_hole(id,site_id,hole_code) VALUES (:id,:siteId,'INVALID-HOLE')`, { id: randomUUID(), siteId: randomUUID() }), sqlError('23503'));
     await assert.rejects(db(`INSERT INTO hole_party_role(id,hole_id,party_id,role_code,asserted_by_user_id) VALUES (:id,:holeId,:partyId,'NOT_A_ROLE',:actor)`, { id: randomUUID(), holeId: ids.holeId, partyId: ids.minerPartyId, actor: ids.siteUserId }), sqlError('23514'));
   });

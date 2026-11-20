@@ -2,19 +2,19 @@
 
 **Assessment date:** 2026-11-20
 **Revision inspected:** `f8f37e35b3681bbcf1d4ea910f98b0809fec264d` (`main`; cached `origin/main` matched). No network fetch was performed.
-**Scope:** repository assessment only. Tests were not rerun and no field validation is claimed.
+**Scope:** the initial assessment below records the pre-Milestone-2 state. Stage 7A Milestone 2 implementation and verification are appended in [the implementation plan](IMPLEMENTATION_PLAN.md) and [demo contract](DEMO_CONTRACT.md). No field validation is claimed.
 
 ## Summary
 
-The backend contains substantial scoped identity, production, processing, inventory, recovery, trade, custody, audit and offline-sync capabilities. The frontend remains a field-capture workspace rather than a complete product interface. The full supply-chain journey cannot currently be completed through the UI.
+The backend contains substantial scoped identity, production, processing, inventory, recovery, trade, custody, audit and offline-sync capabilities. The UI now includes the shared workspace shell, a registry for authorized sites, holes and participants, and limited access administration. The full supply-chain journey still cannot be completed through the UI.
 
-The client has one `App.tsx`, no route/page/component directories and no module navigation. It displays login, then one workspace with role/context selection, capture, command queue and audit-checkpoint controls. Production, production measurement and participant acknowledgement have structured controls. Other offline-enabled operations use a generic JSON payload editor. There are no screens for site setup, participant administration, allocations, Dora processing, inventory/recovery, merchant trades/payments, consignments, QR tracing or reports.
+`App.tsx` retains login, overview, capture, command queue and audit-checkpoint controls. The shared shell now exposes Registry and Access administration according to the active role/scope. Registry supports site/hole and participant list/detail/create, plus permitted site metadata updates. Access administration supports account and organization creation, supported role grants and current-session revocation. Other offline-enabled operations still use the generic JSON editor. There are no screens for allocations, Dora processing, inventory/recovery, merchant trades/payments, consignments, QR tracing or reports.
 
 The existing workspace should remain a first-class **Capture** destination. New UI should call existing authenticated APIs and services; it should not duplicate business logic or create another inventory ledger.
 
 ## Frontend inventory
 
-The full `client/src` tree comprises `App.tsx`, `main.tsx`, `api.ts`, `apiBase.ts`, `styles.css` and `offline/` modules for IndexedDB, commands, types and synchronization. There is no router or feature page tree. `App.tsx` contains the login form, welcome/status section, role/context selector, capture form, command queue and checkpoint form. The production form selects existing site/hole/participant records; the production-measurement form loads an event and carries participant/capture context. The queue shows local/server states, receipt errors and linked corrections. Checkpoint creation asks the user for a stream UUID.
+The client keeps `App.tsx`, `main.tsx`, `api.ts`, `apiBase.ts`, `styles.css` and `offline/` modules for IndexedDB, commands, types and synchronization. `registry/RegistryWorkspace.tsx` and `admin/AccessAdministration.tsx` provide the Milestone 2 screens without adding a router or changing the offline command architecture. Capture, measurement context, queue recovery and checkpoint behavior remain in the shared app.
 
 `client/src/api.ts` provides the shared request helper and typed reads for sites, holes, hole participants and production events. Most other calls are direct from `App.tsx`; there are no feature-specific clients for other domains.
 
@@ -22,10 +22,10 @@ The full `client/src` tree comprises `App.tsx`, `main.tsx`, `api.ts`, `apiBase.t
 
 | Module | Backend status | Frontend status | Missing work | Evidence |
 |---|---|---|---|---|
-| **1. Authentication/access** | Login, profile, scoped roles, account/org creation and role grant/revocation exist. | **Partial:** login, session restore, role/context selection, logout and expiry; no administration UI. | Add account, organisation and role screens. Bootstrap currently occurs outside the app. | `App.tsx`; `POST /api/v1/auth/login`, `GET /api/v1/me`, `/api/v1/admin/...` in `server/src/app.mjs`; party/account/role tables in migration 001. |
+| **1. Authentication/access** | Login, profile, scoped roles, account/org creation and role grant/revocation exist. | **Partial:** login/session and role context; global system administrators can create accounts/organizations, assign roles, and revoke grants created in the active UI session. No full directory or existing-assignment ID listing. | Add authorized account/org/member/role directory endpoints before listing or managing existing records. Bootstrap remains outside the app. | `App.tsx`, `client/src/admin/AccessAdministration.tsx`; `POST /api/v1/admin/...`; party/account/role tables in migration 001. |
 | **2. Dashboard** | Health/readiness exists; no operational summary API found. | **Missing:** greeting and sync status are not an operations dashboard. | Define authorized indicators and implement overview. | `App.tsx` welcome section; route surface in `server/src/app.mjs`. |
-| **3. Sites and holes** | Site create/list/read/update and hole create/list/read APIs exist. | **Partial:** selection only during capture; no registry screens. | Site/hole lists, detail and forms. | `/api/v1/sites`, `/api/v1/sites/:siteId/holes`; `mining_site`, `mining_hole` in migration 001. |
-| **4. Participants/organisations** | Scoped participant create/list, organisation/account creation and user-role APIs exist; site and hole relationships are distinct. | **Partial:** capture can select an existing hole participant; no roster/admin screens. | Add rosters, details, create flows, effective-date display and relationship lifecycle. Directory/lifecycle API coverage is incomplete. | `/api/v1/sites/:siteId/participants`, hole participant read and admin routes; party/profile/membership/site-role/hole-role entities in migration 001. |
+| **3. Sites and holes** | Site create/list/read/update and hole create/list/read APIs exist. | **Implemented for site-readable scopes:** authorized list/detail, site create/edit, hole list/detail/create; server continues to enforce resource scope. | Add system-administrator resource discovery if admin assignment must support site/hole scopes; add navigation only if hole-only discovery becomes available. | `/api/v1/sites`, `/api/v1/sites/:siteId`, `/api/v1/sites/:siteId/holes`; `client/src/registry/RegistryWorkspace.tsx`; migration 001. |
+| **4. Participants/organisations** | Scoped participant create/list, organization/account creation and user-role APIs exist; site and hole relationships are distinct. | **Partial but usable:** site/hole relationship register and creation with identity, category, effective period, source and evidence; org creation and limited account/role administration. No complete account, organization or membership directories and no relationship lifecycle endpoint. | Add safe directory/detail/member and relationship lifecycle APIs where product workflows require them. | `/api/v1/sites/:siteId/participants`, `/api/v1/sites/:siteId/holes/:holeId/participants`, `/api/v1/admin/...`; migrations 001–002. |
 | **5. Sharing/allocations** | Allocation proposals, revisions and output history exist; proposals remain pending; review decisions are not exposed. No general negotiated sharing-agreement workflow was found. | **Partial:** generic JSON command only; no proposal/history/review screen. | Add proposal/revision UI. Do not represent approval until reviewer policy and backend decisions exist. | `GET/POST .../allocation-sets`; `allocation.service.mjs`; allocation tables in migration 001. |
 | **6. Production/batches** | Production create/list/read, output batches, capture provenance and measurements exist. | **Partial but usable for capture:** structured production/measurement/acknowledgement; no event/batch register or detail. | Add event/batch list, detail, lineage and measurement history. | Production routes and `production.service.mjs`; migration 001 material entities and migration 002 capture/participant tables. |
 | **7. Dora processing** | Dora create/list/read/update; processing event create/read and input/output measurements exist. | **Missing:** no Dora or processing UI. | Facility and processing forms plus event discovery. No processing-event collection endpoint exists. | `/api/v1/sites/:siteId/doras`, `/api/v1/processing-events...`; `dora.service.mjs`, `processing.service.mjs`. |
@@ -43,7 +43,7 @@ The full `client/src` tree comprises `App.tsx`, `main.tsx`, `api.ts`, `apiBase.t
 
 - HTTP handlers and many Zod schemas are registered in `server/src/app.mjs`; domain services are in `server/src/modules`. SQL migrations are the broad database definition. `server/src/database/models.mjs` models core tables, not every migrated table.
 - Collection reads exist for sites, holes, participants, Doras, production events and stockpiles. Processing events, gold trades, consignments, residue sales and recovery events are read-by-ID/action APIs without collection endpoints.
-- Recovery facility create/list and general dashboard/report APIs were not found.
+- Recovery facility create/list and general dashboard/report APIs were not found. Organization, account, membership and existing role-assignment list/detail endpoints are also absent; the UI limits those records to what existing authorized responses or the active session can provide.
 - Allocation review decisions are absent by design until reviewer policy is approved.
 - Payment routes are scoped to gold trades. `docs/ACCEPTANCE_CRITERIA.md` says payment coverage includes residue sales, while the implementation plan and actual route surface say residue-sale payment endpoints remain outstanding. Reconcile AC-08a before building payment UI.
 - Internal audit stream read/verify functions exist, but there is no general audit-event timeline route.
@@ -55,8 +55,8 @@ Core entities are defined across migrations 001–011: parties and scoped relati
 
 | Step | Backend | UI | Dependency/decision |
 |---|---|---|---|
-| Register site and hole | Create/list/read APIs | None; selection only | Build registry and assign access. |
-| Register participants/relationships | Scoped participant and admin APIs | Existing participant selection only | Build roster/management; keep landowner, hole operator, miner and beneficiary roles distinct. |
+| Register site and hole | Create/list/read APIs | Registry list/detail/create; permitted site metadata updates; hole list/detail/create | System administrators still lack a site/hole resource directory for assigning these scopes. |
+| Register participants/relationships | Scoped participant and admin APIs | Registry lists and creates participant identities/categories/site or hole relationships; dates and source/evidence references are shown | No relationship edit/revoke API; login account and role directories are incomplete. Keep participant category, relationship and system role distinct. |
 | Record sharing agreement | No general agreement workflow | None | Decide how negotiated arrangements are represented; do not infer ownership or percentages. |
 | Capture production | Event/output/batch APIs | Structured capture for preassigned context | Add event and batch register. |
 | Record allocation | Proposal/revision/history API; pending only | Generic JSON | Reviewer policy and decision API are absent. |
@@ -71,7 +71,7 @@ Core entities are defined across migrations 001–011: parties and scoped relati
 | Audit verification | Checkpoints and verifier | Manual UUID checkpoint UI | Add stream discovery/history; explain trust boundary and tail. |
 | Offline capture/sync | Supported allowlist and durable receipts | Production-first UI; generic JSON for much of the allowlist | Add typed forms; other workflows remain online-only. |
 
-The full journey cannot currently be completed through the product UI. The strongest current path is production capture, measurement, offline synchronization and checkpoint status. Later steps are mostly API-only; allocation acceptance and residue-sale settlement also have backend/policy gaps.
+The full journey cannot currently be completed through the product UI. Registry and limited access administration join the existing capture, measurement, offline synchronization and checkpoint tools. Processing, inventory, recovery, trade, custody and reporting remain API-only; allocation acceptance and residue-sale settlement also have backend/policy gaps.
 
 ## Proposed navigation
 
@@ -142,7 +142,7 @@ Prefer list/detail flows over isolated pages. A batch detail can show origin, pr
 
 ## Tests and acceptance plan
 
-The repository has three client unit tests and two Playwright tests. Those browser tests cover offline queue/session behavior and checkpoint display, but intercept API calls; they do not prove a browser-to-real-API full product journey. Backend PostgreSQL integration tests in `server/tests/integration.test.mjs` cover domain/API scenarios including allocation gating, Dora lineage, inventory, trade/payment authorization, role revocation and checkpoints.
+The client has three unit tests and sixteen Playwright tests. The browser suite covers all nine role navigation sets, registry and administration request flows, offline queue/session behavior and checkpoint display. Browser API interactions use fictional intercepted responses; they do not constitute a full browser-to-real-API journey. Backend PostgreSQL integration tests in `server/tests/integration.test.mjs` cover actual API/domain scenarios, including site/participant reads, account/role administration, allocation gating, Dora lineage, inventory, trade/payment authorization, role revocation and checkpoints. Stage 7A Milestone 2 verification passed client lint, production build, units **3/3**, Playwright **16/16**, backend lint and PostgreSQL tests **55/55**; details and screenshots are in [the implementation plan](IMPLEMENTATION_PLAN.md).
 
 Add acceptance coverage for:
 
@@ -153,7 +153,7 @@ Add acceptance coverage for:
 - Offline allowlist forms, no API caching, restart/reconnect, unknown uploads, receipt recovery, correction and authorization revocation.
 - QR scope and audit checks distinguishing covered history, unanchored tail and physical claims from recorded software evidence.
 
-Historical test counts in docs conflict: `docs/IMPLEMENTATION_PLAN.md` reports 55/55 for Phase 6/Stage 7; `docs/ACCEPTANCE_CRITERIA.md` still reports 54/54 and an older browser-test count. No tests were rerun for this assessment.
+The acceptance-criteria document contains historical verification counts from earlier phases. The latest Stage 7A Milestone 2 results are recorded above and in the implementation plan.
 
 ## Domain and product guardrails
 

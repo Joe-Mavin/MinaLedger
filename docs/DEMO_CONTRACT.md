@@ -1,6 +1,6 @@
 # MinaLedger fictional demo contract
 
-**Status:** Stage 7A Milestones 0–1. Demo identities and workflow records described here are fictional design fixtures. The repository does not yet provide a complete fixture seeder or an end-to-end product UI for either value-chain route. This document does not authorize live or production data entry.
+**Status:** Stage 7A Milestones 0–2. Demo identities and workflow records described here are fictional design fixtures. The repository does not provide a complete fixture seeder or an end-to-end product UI for either value-chain route. This document does not authorize live or production data entry.
 
 ## Safety boundary
 
@@ -56,7 +56,7 @@ These grants correspond to the scope validation in `identity.service.mjs`. Organ
 5. When recovery facility provisioning is available, record a recovery event using accepted source receipts and preserve every contributing consignment and residue input. Keep recovered output aggregate unless a defensible approved attribution basis exists.
 6. Expected evidence: linked processing inputs/outputs, exact qualifying inventory observations, accepted dispatch/receipt and custody evidence, and full recovery input genealogy. No recovery output is apportioned to individual miners by default.
 
-These are expected domain outcomes, not a claim that a user can complete either scenario in the product UI. The client currently provides role-scoped navigation to the implemented Overview, Field capture, My command queue and Audit evidence tools; it does not provide dedicated allocation-review, Dora, recovery, trade, payment, consignment or reporting pages.
+These are expected domain outcomes, not a claim that a user can complete either scenario in the product UI. The client now provides role-scoped Overview, Field capture, Registry, Access administration, My command queue and Audit evidence destinations. Registry supports authorized site/hole/participant records; Access administration supports only the existing create/grant/revoke endpoints and does not provide full directories. There are no dedicated allocation-review, Dora, recovery, trade, payment, consignment or reporting pages, so Route A and Route B remain incomplete in the UI.
 
 ## API-only fixture setup sequence
 
@@ -74,7 +74,8 @@ The current public API does not list all organizations or provide account/role c
 
 ## Implemented, verified and outstanding
 
-- **Implemented in this milestone:** shared role-aware shell; user, current role/scope and sign-out in the shell; responsive overview, capture, queue and audit navigation; overview site references from authenticated API responses and recorder-local queue count; role-specific navigation tests for all nine role codes; no navigation to unfinished business screens.
-- **Tested in this milestone:** fictional browser fixtures use `example.test` identity and fixed synthetic UUIDs, API-backed site data, scoped navigation expectations and isolated Playwright browser contexts. These browser fixtures do not populate PostgreSQL.
-- **Not implemented:** a complete repeatable API fixture runner; a recovery-facility creation/list API; recovery facility demo provisioning; dedicated transaction screens; complete Route A or Route B UI journeys; production deployment, field acceptance or real-data verification.
-- **Backend work needing a separately reviewed change:** an authenticated, scope-checked recovery facility provisioning/list/read contract and an approved safe fixture/reset mechanism. No backend endpoint or migration is added by Stage 7A Milestones 0–1.
+- **Implemented in Milestones 0–2:** responsive role-aware shell; site register/detail/edit, hole list/detail/create, participant register/create; account and organization create; supported role assignment and current-session grant revocation. The UI uses the existing authenticated APIs. Participant identity, category, site/hole relationship, validity, source and evidence remain separate. The participant query now returns relationship IDs/types/status and category/date details. No migration was added and migrations 001–011 are unchanged.
+- **Role/scope behavior:** Registry is shown to Field Officer and Mining Operator grants with site-readable scopes and to site-scoped auditors. Global System Administrators see Access administration. Other roles do not receive a registry destination because current APIs do not provide a safe authorized discovery path for their hole, facility or organization scope. These UI rules do not grant access; server authorization remains authoritative.
+- **Tested:** client lint, production build and app-shell verification, **3/3** unit tests, **16/16** Playwright tests, server lint and **55/55** PostgreSQL integration tests on a dedicated temporary `_test` database. The browser suite uses fictional API fixtures; PostgreSQL tests exercise actual backend services, authorization and database constraints. The screenshots and full verification record are in [the implementation plan](IMPLEMENTATION_PLAN.md).
+- **Not implemented:** complete account/organization/membership/role directories; existing-grant ID discovery or revocation from the UI; participant relationship edit/revoke endpoints; system-administrator site/hole/facility resource discovery; a repeatable API fixture runner; recovery-facility provisioning; complete Route A or Route B UI journeys; transaction screens; deployment, field acceptance or real-data verification.
+- **Recovery-facility decision:** no provisioning/list/detail route or migration was added. The nullable `recovery_facility.party_id` and shared `facility_party_role` table do not establish the intended organization ownership semantics. Resolve that domain and authorization contract before implementation; do not fabricate IDs or write direct fixture SQL.

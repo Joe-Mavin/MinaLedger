@@ -28,7 +28,7 @@ function scopeLabel(role: RoleOption | undefined): string {
 
 export function AppShell({ userName, roles, selectedRoleKey, section, online, onSelectRole, onNavigate, onSignOut, children }: AppShellProps) {
   const activeRole = roles.find((role) => role.key === selectedRoleKey);
-  const navigation = getNavigationItems(activeRole?.roleCode);
+  const navigation = getNavigationItems(activeRole?.roleCode, activeRole?.scopeKind, activeRole?.scopeId);
 
   return (
     <div className="app-shell">

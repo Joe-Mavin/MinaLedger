@@ -21,15 +21,15 @@ const roleScopes: Record<string, { scope_kind: string; scope_id: string }> = {
 };
 
 const expectedNavigation: Record<string, string[]> = {
-  SYSTEM_ADMIN: ['Overview', 'My command queue'],
-  FIELD_OFFICER: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
-  MINING_OPERATOR: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
+  SYSTEM_ADMIN: ['Overview', 'Access administration', 'My command queue'],
+  FIELD_OFFICER: ['Overview', 'Registry', 'Field capture', 'My command queue', 'Audit evidence'],
+  MINING_OPERATOR: ['Overview', 'Registry', 'Field capture', 'My command queue', 'Audit evidence'],
   MINER: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
   DORA_OPERATOR: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
   RECOVERY_FACILITY_OPERATOR: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
   LOCAL_MERCHANT: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
   LARGER_MERCHANT: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
-  AUDITOR: ['Overview', 'My command queue', 'Audit evidence'],
+  AUDITOR: ['Overview', 'Registry', 'My command queue', 'Audit evidence'],
 };
 
 const rolesWithSiteRead: string[] = ['FIELD_OFFICER', 'MINING_OPERATOR', 'AUDITOR'];
@@ -84,10 +84,12 @@ test('switching the acting grant updates available navigation and preserves serv
 
   const navigation = page.getByRole('navigation', { name: 'Workspace navigation' });
   await expect(navigation.getByRole('button', { name: 'Field capture' })).toBeVisible();
+  await expect(navigation.getByRole('button', { name: 'Registry' })).toBeVisible();
   await navigation.getByRole('button', { name: 'Field capture' }).click();
   await expect(page.getByRole('heading', { name: 'Capture field information' })).toBeVisible();
   await page.getByLabel('Acting role and scope', { exact: true }).selectOption(`AUDITOR:SITE:${siteId}`);
   await expect(navigation.getByRole('button', { name: 'Field capture' })).toHaveCount(0);
+  await expect(navigation.getByRole('button', { name: 'Registry' })).toBeVisible();
   await expect(navigation.getByRole('button', { name: 'Audit evidence' })).toBeVisible();
   await expect(page.getByLabel('Acting role and scope', { exact: true })).toContainText('AUDITOR');
   await expect(page.getByRole('banner').getByLabel(/Current acting role and scope: AUDITOR/)).toBeVisible();

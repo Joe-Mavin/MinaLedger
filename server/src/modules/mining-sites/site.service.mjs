@@ -90,7 +90,12 @@ export async function listHoleParticipants(siteId, holeId, auth) {
   if (!(await canAccessHole(auth, siteId, holeId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   return sequelize.query(
     `SELECT p.id AS party_id, p.party_kind, COALESCE(pp.display_name, op.display_name) AS display_name,
-       hp.id AS relationship_id, hp.role_code, hp.valid_from, hp.valid_to, hp.source_reference, hp.evidence_ref, h.id AS hole_id
+       hp.id AS relationship_id, hp.role_code, hp.status AS relationship_status, hp.valid_from, hp.valid_to,
+       hp.source_reference, hp.evidence_ref, h.id AS hole_id,
+       COALESCE((SELECT json_agg(json_build_object('participantKind',participation.participant_kind,
+         'status',participation.status,'validFrom',participation.valid_from,'validTo',participation.valid_to)
+         ORDER BY participation.valid_from,participation.participant_kind)
+         FROM party_participation participation WHERE participation.party_id=p.id),'[]'::json) AS participant_categories
      FROM hole_party_role hp JOIN mining_hole h ON h.id=hp.hole_id JOIN party p ON p.id=hp.party_id
        LEFT JOIN person_profile pp ON pp.party_id=p.id LEFT JOIN organisation_profile op ON op.party_id=p.id
      WHERE h.id=:holeId AND h.site_id=:siteId AND hp.status='ACTIVE'
@@ -162,12 +167,23 @@ export async function createParticipant(siteId, input, auth, mutationId) {
 export async function listParticipants(siteId) {
   return sequelize.query(
     `SELECT p.id AS party_id, p.party_kind, COALESCE(pp.display_name, op.display_name) AS display_name,
-       pp_role.role_code, pp_role.valid_from, pp_role.valid_to, pp_role.source_reference, pp_role.evidence_ref, NULL::uuid AS hole_id
+       pp_role.id AS relationship_id, 'SITE'::text AS relationship_kind, pp_role.role_code,
+       pp_role.status AS relationship_status, pp_role.valid_from, pp_role.valid_to,
+       pp_role.source_reference, pp_role.evidence_ref, NULL::uuid AS hole_id,
+       COALESCE((SELECT json_agg(json_build_object('participantKind',participation.participant_kind,
+         'status',participation.status,'validFrom',participation.valid_from,'validTo',participation.valid_to)
+         ORDER BY participation.valid_from,participation.participant_kind)
+         FROM party_participation participation WHERE participation.party_id=p.id),'[]'::json) AS participant_categories
      FROM site_party_role pp_role JOIN party p ON p.id=pp_role.party_id
        LEFT JOIN person_profile pp ON pp.party_id=p.id LEFT JOIN organisation_profile op ON op.party_id=p.id
      WHERE pp_role.site_id=:siteId AND pp_role.status='ACTIVE'
      UNION ALL
-     SELECT p.id, p.party_kind, COALESCE(pp.display_name, op.display_name), hp.role_code, hp.valid_from, hp.valid_to, hp.source_reference, hp.evidence_ref, h.id
+     SELECT p.id, p.party_kind, COALESCE(pp.display_name, op.display_name),
+       hp.id, 'HOLE'::text, hp.role_code, hp.status, hp.valid_from, hp.valid_to, hp.source_reference, hp.evidence_ref, h.id,
+       COALESCE((SELECT json_agg(json_build_object('participantKind',participation.participant_kind,
+         'status',participation.status,'validFrom',participation.valid_from,'validTo',participation.valid_to)
+         ORDER BY participation.valid_from,participation.participant_kind)
+         FROM party_participation participation WHERE participation.party_id=p.id),'[]'::json)
      FROM hole_party_role hp JOIN mining_hole h ON h.id=hp.hole_id JOIN party p ON p.id=hp.party_id
        LEFT JOIN person_profile pp ON pp.party_id=p.id LEFT JOIN organisation_profile op ON op.party_id=p.id
      WHERE h.site_id=:siteId AND hp.status='ACTIVE' ORDER BY display_name`,

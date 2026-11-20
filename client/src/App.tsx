@@ -7,6 +7,8 @@ import { synchronizeCommands } from './offline/sync';
 import type { ActingContext, CommandEnvelope, CommandType, QueuedCommand, SyncState } from './offline/types';
 import { AppShell, WorkspaceHeading } from './AppShell';
 import { getNavigationItems, type WorkspaceSection } from './navigation';
+import { RegistryWorkspace } from './registry/RegistryWorkspace';
+import { AccessAdministration, type RegisteredOrganization, type SessionAdminAccount } from './admin/AccessAdministration';
 
 interface RoleGrant {
   roleCode: string;
@@ -141,6 +143,8 @@ export default function App() {
   const [checkpointRecord, setCheckpointRecord] = useState<AuditCheckpointView | null>(null);
   const [checkpointError, setCheckpointError] = useState('');
   const [activeSection, setActiveSection] = useState<WorkspaceSection>('overview');
+  const [sessionOrganizations, setSessionOrganizations] = useState<RegisteredOrganization[]>([]);
+  const [sessionAdminAccounts, setSessionAdminAccounts] = useState<SessionAdminAccount[]>([]);
 
   const selectedRole = useMemo(() => recorder?.roles.find((role) => roleKey(role) === selectedRoleKey) ?? null, [recorder, selectedRoleKey]);
   const actingContext: ActingContext | null = useMemo(() => selectedRole && recorder ? {
@@ -213,6 +217,8 @@ export default function App() {
   }, []);
 
   const activateSession = useCallback(async (user: Recorder, accessToken: string) => {
+    setSessionOrganizations([]);
+    setSessionAdminAccounts([]);
     setRecorder(user);
     setToken(accessToken);
     setActiveSection('overview');
@@ -320,6 +326,7 @@ export default function App() {
     sessionStorage.removeItem('minaledger.selectedContext');
     await clearReferenceCache().catch(() => undefined);
     setToken(null); setRecorder(null); setSites([]); setSitesSource('unavailable'); setHoles([]); setCommands([]); setSelectedRoleKey('');
+    setSessionOrganizations([]); setSessionAdminAccounts([]);
     setCheckpointRecord(null); setCheckpointStreams([]); setCheckpointError('');
     setMessage('Signed out. Local commands remain on this device and are scoped to their recorder.');
   }
@@ -632,7 +639,7 @@ export default function App() {
         setSelectedRoleKey(value);
         if (recorder) sessionStorage.setItem('minaledger.selectedContext', JSON.stringify({ recorderUserId: recorder.id, siteId, holeId, roleKey: value }));
         const nextRole = recorder.roles.find((role) => roleKey(role) === value);
-        if (!getNavigationItems(nextRole?.roleCode).some((item) => item.id === activeSection)) setActiveSection('overview');
+        if (!getNavigationItems(nextRole?.roleCode, nextRole?.scopeKind, nextRole?.scopeId).some((item) => item.id === activeSection)) setActiveSection('overview');
       }}
       onNavigate={setActiveSection}
       onSignOut={() => void signOut()}
@@ -651,8 +658,26 @@ export default function App() {
             <div className="section-heading"><div><p className="eyebrow">AUTHORIZED API DATA</p><h2 id="site-references-heading">Site references</h2></div></div>
             {sitesSource === 'loading' ? <div className="empty-state" role="status">Loading site references…</div> : sites.length === 0 ? <div className="empty-state">{sitesSource === 'unavailable' && !online ? 'No authorized site references are cached on this device yet.' : sitesSource === 'unavailable' ? 'Site references could not be loaded for this account.' : 'The authenticated API returned no site references for this account.'} Other workflows remain subject to their own server authorization.</div> : <ul className="site-list">{sites.map((site) => <li key={site.id}><span className="site-dot" aria-hidden="true" /><span><strong>{site.name}</strong><small>{site.siteCode}</small></span></li>)}</ul>}
           </section>
-          <section className="queue-section overview-note"><p className="eyebrow">WHAT IS AVAILABLE</p><h2>Role-specific business screens are not part of this milestone</h2><p className="muted">Use the navigation to open implemented capture, queue, or audit tools. Site, processing, trading, custody, recovery, and reporting workflows without a dedicated screen are not represented here.</p></section>
+          <section className="queue-section overview-note"><p className="eyebrow">AVAILABLE WORKSPACES</p><h2>Tools follow your active role and scope</h2><p className="muted">Open Registry or Access administration when those destinations are available to your current grant. Other site, processing, trading, custody, recovery, and reporting workflows are not represented in this milestone.</p></section>
         </>}
+
+
+        {activeSection === 'registry' && token && <RegistryWorkspace
+          token={token}
+          roles={recorder.roles}
+          sites={sites}
+          onSiteSaved={(savedSite) => setSites((current) => [savedSite, ...current.filter((site) => site.id !== savedSite.id)])}
+        />}
+
+        {activeSection === 'access' && token && <AccessAdministration
+          token={token}
+          ownRoles={recorder.roles}
+          sites={sites}
+          organizations={sessionOrganizations}
+          accounts={sessionAdminAccounts}
+          setAccounts={setSessionAdminAccounts}
+          onOrganizationCreated={(organization) => setSessionOrganizations((current) => [organization, ...current.filter((row) => row.partyId !== organization.partyId)])}
+        />}
 
 
         {activeSection === 'capture' && <>
