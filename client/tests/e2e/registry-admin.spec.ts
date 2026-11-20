@@ -139,9 +139,22 @@ test('site, hole and participant registry sends supported create and update requ
 
   await page.getByRole('button', { name: 'Add participant relationship' }).click();
   await page.getByLabel('Person name').fill('Fictional Registry Miner');
-  await page.getByLabel('Participant category').selectOption('MINER');
   await page.getByLabel('Relationship scope').selectOption(`HOLE:${holeId}`);
-  await page.getByRole('combobox', { name: 'Hole relationship', exact: true }).selectOption('MINER');
+  const categorySelect = page.getByLabel('Participant category');
+  const relationshipRoleSelect = page.getByRole('combobox', { name: 'Hole relationship', exact: true });
+  const supportedParticipantKinds = [
+    'MINER', 'MINING_OPERATOR', 'LANDOWNER', 'PERMIT_HOLDER', 'DORA_OPERATOR', 'RECOVERY_FACILITY',
+    'LOCAL_MERCHANT', 'LARGER_MERCHANT', 'CARRIER', 'FIELD_OFFICER', 'AUDITOR', 'SERVICE_PROVIDER',
+    'FAMILY_OR_AGREED_BENEFICIARY', 'OTHER',
+  ];
+  const renderedParticipantKinds = await categorySelect.locator('option').evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value));
+  expect(renderedParticipantKinds).toEqual(supportedParticipantKinds);
+  for (const participantKind of ['SERVICE_PROVIDER', 'FAMILY_OR_AGREED_BENEFICIARY']) {
+    await categorySelect.selectOption(participantKind);
+    await expect(categorySelect).toHaveValue(participantKind);
+    await expect(relationshipRoleSelect).toHaveValue('MINER');
+  }
+  await categorySelect.selectOption('MINER');
   await page.getByLabel('Source reference').fill('PAPER-REGISTER-02');
   await page.getByLabel('Evidence reference').fill('FICTITIOUS-EVIDENCE-02');
   await page.getByRole('button', { name: 'Save participant relationship' }).click();
