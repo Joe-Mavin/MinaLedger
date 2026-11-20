@@ -63,9 +63,30 @@ Operational changes add liveness and database readiness endpoints, retain `/heal
 
 **Requires hosting and owner decisions:** select the host, TLS proxy and sanitized client-IP forwarding; secure Docker/host/secret access; choose image-digest updates, storage encryption, backup retention and support/monitoring owners; agree incident and lost-device procedures. Participant decisions still include site and user consent, accessibility/language, data visibility/retention, acknowledgment, measurement and assay practice, role review, checkpoint custody and payment evidence. The UI still does not demonstrate provisioning, allocation approval, Dora processing, recovery/consignment, and trade/payment reconciliation as one complete journey. Stage 7 Part 1 is prepared but not deployed; Stage 7 and pilot acceptance are incomplete.
 
+## Stage 7A product UI — Milestones 0–1 status (2026-11-20)
+
+**Milestone 0 — demo contract:** added [the fictional demo contract](DEMO_CONTRACT.md), with nine role personas and explicit scopes, fictional organizations/site/facilities, Route A and Route B evidence expectations, API-only setup order, idempotent retry guidance, safe reset boundaries, limitations and backend gaps. It does not seed PostgreSQL or include secrets. A full repeatable fixture runner is not implemented: the API has no recovery-facility create/list operation, so a clean database cannot safely provision the recovery persona or complete Route B fixture setup. Do not fill that gap with direct fixture SQL.
+
+**Milestone 1 — shared shell:** added a responsive desktop/mobile shell with role- and scope-aware navigation, signed-in user, acting grant selection, connection status and sign-out. The overview displays authorized site references returned by the existing API and the current recorder’s IndexedDB queue count; it invents no business totals. Navigation links only to the implemented overview, field capture, local queue and authorized audit evidence tools. Capture, offline storage/synchronization, and checkpoint evidence remain available. The acting role controls visible navigation only; existing server middleware continues to authenticate requests and enforce current account, role and resource access.
+
+```mermaid
+flowchart LR
+  session[Authenticated session] --> overview[Overview]
+  session --> queue[My command queue]
+  ops[Field officer, mining operator, miner, Dora operator, recovery operator, local merchant, larger merchant] --> capture[Field capture]
+  ops --> audit[Audit evidence]
+  auditor[Auditor] --> audit
+  auditor --> overview
+  admin[System administrator] --> overview
+```
+
+**Verification on 2026-11-20:** client ESLint passed; TypeScript and Vite production build passed, including app-shell asset verification; unit tests passed **3/3**; Playwright Chromium passed **14/14**. Browser coverage includes each of the nine role navigation sets, role switching, authorized versus empty site data, isolated/repeatable fictional browser fixtures, narrow mobile layout, and the existing capture/offline reload/receipt-recovery and audit checkpoint regressions. No backend code or migrations changed, so backend lint and PostgreSQL integration tests were not rerun for this UI-only slice. Screenshots: [desktop](screenshots/stage-7a-field-officer-overview.png), [mobile](screenshots/stage-7a-field-officer-mobile.png).
+
+**Not implemented or verified:** automated PostgreSQL fixture creation/reset; recovery-facility provisioning; dedicated registry, allocation approval, Dora, recovery, trade/payment, consignment/custody and reporting screens; complete Route A or Route B UI journeys; production deployment or field acceptance. The demo contract marks the missing recovery-facility API as a backend review item. The remaining Stage 7A and Stage 7 work is outside this delivery.
+
 ## Delivery rule
 
-The milestone definitions below describe scope and acceptance criteria; implementation status is stated in the Phase 1/2/3/4/5/6 summaries and Stage 7 Part 1 report above. Phases 5 and 6 technical slices and Stage 7 Part 1 readiness artifacts are implemented. Deployment, field acceptance, independent checkpoint holding and the remaining Stage 7 pilot work are incomplete. Participant-dependent decisions in the [decision log](DECISION_LOG.md) remain unresolved and must be answered before their affected rules are treated as pilot policy. Do not turn unresolved assumptions into defaults. Each future implementation stage should ship a reviewable vertical slice with migrations, API/UI, permissions, observability and automated tests appropriate to its scope.
+The milestone definitions below describe scope and acceptance criteria; implementation status is stated in the Phase 1/2/3/4/5/6 summaries and Stage 7 Part 1/7A reports above. Phases 5 and 6 technical slices and Stage 7 Part 1 readiness artifacts are implemented. Stage 7A's demo contract is delivered with fixture-provisioning gaps documented; its shared shell is implemented and tested. Deployment, complete Route A/B UI journeys, automated fixture setup, field acceptance, independent checkpoint holding and the remaining Stage 7 pilot work are incomplete. Participant-dependent decisions in the [decision log](DECISION_LOG.md) remain unresolved and must be answered before their affected rules are treated as pilot policy. Do not turn unresolved assumptions into defaults. Each future implementation stage should ship a reviewable vertical slice with migrations, API/UI, permissions, observability and automated tests appropriate to its scope.
 
 ## Stage 0 — Phase 0 specification (current assignment)
 

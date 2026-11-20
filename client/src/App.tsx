@@ -5,6 +5,8 @@ import { applyReceipt, clearReferenceCache, getReferenceCache, listCommands, sav
 import { createEnvelope, createLinkedRevision, queueCommand, recoverInterruptedUploads, saveDraft } from './offline/commands';
 import { synchronizeCommands } from './offline/sync';
 import type { ActingContext, CommandEnvelope, CommandType, QueuedCommand, SyncState } from './offline/types';
+import { AppShell, WorkspaceHeading } from './AppShell';
+import { getNavigationItems, type WorkspaceSection } from './navigation';
 
 interface RoleGrant {
   roleCode: string;
@@ -98,6 +100,7 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [online, setOnline] = useState(navigator.onLine);
   const [sites, setSites] = useState<SiteReference[]>([]);
+  const [sitesSource, setSitesSource] = useState<'loading' | 'live' | 'cached' | 'unavailable'>('loading');
   const [holes, setHoles] = useState<HoleReference[]>([]);
   const [participants, setParticipants] = useState<HoleParticipantReference[]>([]);
   const [commands, setCommands] = useState<QueuedCommand[]>([]);
@@ -137,6 +140,7 @@ export default function App() {
   const [checkpointStreams, setCheckpointStreams] = useState<Array<{ streamKind: CheckpointStreamKind; streamId: string }>>([]);
   const [checkpointRecord, setCheckpointRecord] = useState<AuditCheckpointView | null>(null);
   const [checkpointError, setCheckpointError] = useState('');
+  const [activeSection, setActiveSection] = useState<WorkspaceSection>('overview');
 
   const selectedRole = useMemo(() => recorder?.roles.find((role) => roleKey(role) === selectedRoleKey) ?? null, [recorder, selectedRoleKey]);
   const actingContext: ActingContext | null = useMemo(() => selectedRole && recorder ? {
@@ -154,10 +158,13 @@ export default function App() {
 
   const refreshReferences = useCallback(async (user: Recorder, accessToken: string, roleScope: string) => {
     const key = `sites:${user.id}:${roleScope}`;
+    setSitesSource('loading');
+    setSites([]);
     if (navigator.onLine) {
       try {
         const siteRows = await getSites(accessToken);
         setSites(siteRows);
+        setSitesSource('live');
         await saveReferenceCache({ key, recorderUserId: user.id, contextKey: roleScope, savedAt: new Date().toISOString(), value: siteRows });
         return;
       } catch (loadError) {
@@ -165,7 +172,10 @@ export default function App() {
       }
     }
     const cached = await getReferenceCache<SiteReference[]>(key);
-    if (cached?.recorderUserId === user.id) setSites(cached.value);
+    if (cached?.recorderUserId === user.id) {
+      setSites(cached.value);
+      setSitesSource('cached');
+    } else setSitesSource('unavailable');
   }, []);
 
   const loadSiteHoles = useCallback(async (selectedSiteId: string, user: Recorder, accessToken: string, roleScope: string) => {
@@ -205,6 +215,7 @@ export default function App() {
   const activateSession = useCallback(async (user: Recorder, accessToken: string) => {
     setRecorder(user);
     setToken(accessToken);
+    setActiveSection('overview');
     sessionStorage.setItem('minaledger.accessToken', accessToken);
     sessionStorage.setItem('minaledger.sessionUser', JSON.stringify(user));
     const preferredRole = user.roles.find((role) => ['FIELD_OFFICER', 'MINING_OPERATOR', 'MINER'].includes(role.roleCode)) ?? user.roles[0];
@@ -218,8 +229,8 @@ export default function App() {
       }
     } catch { sessionStorage.removeItem('minaledger.selectedContext'); }
     setSelectedRoleKey(activeRoleKey);
-    await Promise.all([refreshCommands(user.id), refreshReferences(user, accessToken, activeRoleKey || 'no-role')]);
-  }, [refreshCommands, refreshReferences]);
+    await refreshCommands(user.id);
+  }, [refreshCommands]);
 
   useEffect(() => {
     const onlineHandler = () => setOnline(true);
@@ -254,6 +265,11 @@ export default function App() {
       window.removeEventListener('offline', offlineHandler);
     };
   }, [activateSession]);
+
+  useEffect(() => {
+    if (!recorder || !token) return;
+    void refreshReferences(recorder, token, selectedRoleKey || 'no-role');
+  }, [recorder, token, selectedRoleKey, online, refreshReferences]);
 
   useEffect(() => {
     if (recorder && token) void loadSiteHoles(siteId, recorder, token, selectedRoleKey || 'no-role');
@@ -303,7 +319,7 @@ export default function App() {
     sessionStorage.removeItem('minaledger.sessionUser');
     sessionStorage.removeItem('minaledger.selectedContext');
     await clearReferenceCache().catch(() => undefined);
-    setToken(null); setRecorder(null); setSites([]); setHoles([]); setCommands([]); setSelectedRoleKey('');
+    setToken(null); setRecorder(null); setSites([]); setSitesSource('unavailable'); setHoles([]); setCommands([]); setSelectedRoleKey('');
     setCheckpointRecord(null); setCheckpointStreams([]); setCheckpointError('');
     setMessage('Signed out. Local commands remain on this device and are scoped to their recorder.');
   }
@@ -318,7 +334,7 @@ export default function App() {
       sessionStorage.removeItem('minaledger.accessToken');
       sessionStorage.removeItem('minaledger.sessionUser');
       void clearReferenceCache().catch(() => undefined);
-      setToken(null); setRecorder(null); setSites([]); setHoles([]); setSelectedRoleKey('');
+      setToken(null); setRecorder(null); setSites([]); setSitesSource('unavailable'); setHoles([]); setSelectedRoleKey('');
       setCheckpointRecord(null); setCheckpointStreams([]); setCheckpointError('');
       setMessage('Session expired. Sign in again to continue; local commands are preserved.');
     }, timeout);
@@ -606,33 +622,43 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark small">M</span><span>MinaLedger <small>FIELD</small></span></div>
-        <div className="top-actions"><span className={`connection ${online ? 'online' : 'offline'}`} role="status"><i />{online ? 'Online' : 'Offline'}</span><button className="quiet" type="button" onClick={signOut}>Sign out</button></div>
-      </header>
-      <div className="workspace">
-        <section className="welcome-row">
-          <div><p className="eyebrow">FIELD WORKSPACE</p><h1>Good day, {recorder.displayName}</h1><p className="muted">Recorder: <strong>{recorder.id}</strong></p></div>
-          <button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>
-        </section>
-        {!online && <div className="notice warning">Offline capture is available from cached site and hole references. Current authorization will be checked when the server receives each command.</div>}
+    <AppShell
+      userName={recorder.displayName}
+      roles={recorder.roles.map((role) => ({ key: roleKey(role), roleCode: role.roleCode, scopeKind: role.scopeKind, scopeId: role.scopeId }))}
+      selectedRoleKey={selectedRoleKey}
+      section={activeSection}
+      online={online}
+      onSelectRole={(value) => {
+        setSelectedRoleKey(value);
+        if (recorder) sessionStorage.setItem('minaledger.selectedContext', JSON.stringify({ recorderUserId: recorder.id, siteId, holeId, roleKey: value }));
+        const nextRole = recorder.roles.find((role) => roleKey(role) === value);
+        if (!getNavigationItems(nextRole?.roleCode).some((item) => item.id === activeSection)) setActiveSection('overview');
+      }}
+      onNavigate={setActiveSection}
+      onSignOut={() => void signOut()}
+    >
+        {activeSection === 'overview' && <>
+          <WorkspaceHeading eyebrow="MINALEDGER WORKSPACE" title={`Good day, ${recorder.displayName}`} description="A live view of authorized site references and work saved on this device." action={<button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>} />
+          {!online && <div className="notice warning">Offline. The site references shown here come from this recorder’s cached data. Server authorization is checked when commands synchronize.</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
+          {message && <div className="notice success" role="status">{message}</div>}
+          <section className="overview-grid" aria-label="Workspace summary">
+            <article className="overview-card"><span className="label">Authorized site references</span><strong className="metric">{sitesSource === 'loading' ? '…' : sites.length}</strong><p>{sitesSource === 'loading' ? 'Loading from the authenticated API' : sitesSource === 'cached' ? 'Cached for this recorder and acting role' : sitesSource === 'live' ? 'Returned by the authenticated site access API' : 'No authorized references are available locally'}</p></article>
+            <article className="overview-card"><span className="label">This recorder’s queue</span><strong className="metric">{commands.length}</strong><p>Commands stored locally in this browser profile</p></article>
+            <article className="overview-card context-summary"><span className="label">Current acting context</span><strong>{selectedRole?.roleCode.replaceAll('_', ' ') ?? 'No active role'}</strong><p>{selectedRole ? `${selectedRole.scopeKind.toLowerCase()} scope · ${selectedRole.scopeId}` : 'No role assignment is currently active.'}</p></article>
+          </section>
+          <section className="queue-section overview-sites" aria-labelledby="site-references-heading">
+            <div className="section-heading"><div><p className="eyebrow">AUTHORIZED API DATA</p><h2 id="site-references-heading">Site references</h2></div></div>
+            {sitesSource === 'loading' ? <div className="empty-state" role="status">Loading site references…</div> : sites.length === 0 ? <div className="empty-state">{sitesSource === 'unavailable' && !online ? 'No authorized site references are cached on this device yet.' : sitesSource === 'unavailable' ? 'Site references could not be loaded for this account.' : 'The authenticated API returned no site references for this account.'} Other workflows remain subject to their own server authorization.</div> : <ul className="site-list">{sites.map((site) => <li key={site.id}><span className="site-dot" aria-hidden="true" /><span><strong>{site.name}</strong><small>{site.siteCode}</small></span></li>)}</ul>}
+          </section>
+          <section className="queue-section overview-note"><p className="eyebrow">WHAT IS AVAILABLE</p><h2>Role-specific business screens are not part of this milestone</h2><p className="muted">Use the navigation to open implemented capture, queue, or audit tools. Site, processing, trading, custody, recovery, and reporting workflows without a dedicated screen are not represented here.</p></section>
+        </>}
+
+
+        {activeSection === 'capture' && <>
+        <WorkspaceHeading eyebrow="FIELD WORKSPACE" title="Capture field information" description="Prepare allowlisted commands for the active role and scope. Server authorization is rechecked during synchronization." action={<button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>} />
         {error && <div className="notice error" role="alert">{error}</div>}
         {message && <div className="notice success" role="status">{message}</div>}
-
-        <section className="context-panel" aria-label="Recorder and acting context">
-          <div><span className="label">Authenticated recorder</span><strong>{recorder.displayName}</strong></div>
-          <label className="context-select">Acting role and scope
-            <select aria-label="Acting role and scope" value={selectedRoleKey} onChange={(event) => {
-              const value = event.target.value; setSelectedRoleKey(value);
-              if (recorder) sessionStorage.setItem('minaledger.selectedContext', JSON.stringify({ recorderUserId: recorder.id, siteId, holeId, roleKey: value }));
-            }}>
-              {recorder.roles.map((role) => <option key={roleKey(role)} value={roleKey(role)}>{role.roleCode.replaceAll('_', ' ')} · {role.scopeKind.toLowerCase()} {role.scopeId}</option>)}
-            </select>
-          </label>
-          <div><span className="label">Local device</span><strong>Shared device · session only</strong></div>
-        </section>
-
         <section className="capture-card" aria-labelledby="capture-heading">
           <div className="section-heading"><div><p className="eyebrow">NEW COMMAND</p><h2 id="capture-heading">Record field information</h2></div><span className="local-badge">Saved locally first</span></div>
           <div className="form-grid">
@@ -721,7 +747,12 @@ export default function App() {
           {revisionSource && <div className="notice info">Linked revision of {revisionSource.envelope.clientMutationId}. The earlier submission stays unchanged.</div>}
           <div className="form-actions"><button className="secondary" onClick={() => handleCreate('draft')} disabled={busy}>Save draft</button><button className="primary" onClick={() => handleCreate('pending_upload')} disabled={busy || !selectedRole}>{busy ? 'Saving…' : online ? 'Save and sync' : 'Save to offline queue'}</button></div>
         </section>
+        </>}
 
+        {activeSection === 'queue' && <>
+        <WorkspaceHeading eyebrow="LOCAL DEVICE" title="My command queue" description="Local save is not server acceptance. These commands are scoped to the signed-in recorder." action={<button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>} />
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {message && <div className="notice success" role="status">{message}</div>}
         <section className="queue-section" aria-labelledby="queue-heading">
           <div className="section-heading"><div><p className="eyebrow">THIS RECORDER ONLY</p><h2 id="queue-heading">Command queue <span className="count">{commands.length}</span></h2></div><p className="muted">Local save is not server acceptance.</p></div>
           {commands.length === 0 ? <div className="empty-state">No local commands for this recorder.</div> : <div className="queue-list">
@@ -742,6 +773,11 @@ export default function App() {
             </article>)}
           </div>}
         </section>
+        </>}
+        {activeSection === 'audit' && <>
+        <WorkspaceHeading eyebrow="DATABASE EVIDENCE" title="Audit evidence" description="Create and verify checkpoints only for streams the authenticated server allows you to access." />
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {checkpointError && <p role="alert" className="error">{checkpointError}</p>}
         <section className="queue-section" aria-labelledby="checkpoint-heading">
           <div className="section-heading"><div><p className="eyebrow">DATABASE EVIDENCE</p><h2 id="checkpoint-heading">Audit checkpoints</h2></div></div>
           <p className="muted">Create an immutable checkpoint for streams you are authorized to read. Checkpoints cover the listed sequence and head only; later events remain an unanchored tail. No external or blockchain commitment is implemented.</p>
@@ -759,7 +795,6 @@ export default function App() {
               <button className="primary" type="submit" disabled={busy || !online || checkpointStreams.length === 0}>{busy ? 'Creating…' : 'Create checkpoint'}</button>
             </div>
           </form>
-          {checkpointError && <p role="alert" className="error">{checkpointError}</p>}
           {checkpointRecord && <div className="notice info" aria-live="polite">
             <strong>Outbox {checkpointRecord.processing.status.toLowerCase()} (attempts {checkpointRecord.processing.attemptCount})</strong>
             <button className="small-button" type="button" onClick={() => void refreshCheckpointStatus()} disabled={busy}>Refresh verification</button>
@@ -776,8 +811,8 @@ export default function App() {
             </>}
           </div>}
         </section>
-        <footer><span>Session-only sign-in</span><span>Local browser storage is not encrypted</span><span>Commands remain scoped to their recorder</span></footer>
-      </div>
-    </main>
+        </>}
+        {!online && activeSection !== 'overview' && <div className="notice warning">You are offline. Capture can use cached references; audit checkpoints and server synchronization require a connection.</div>}
+    </AppShell>
   );
 }

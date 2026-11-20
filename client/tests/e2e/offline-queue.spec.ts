@@ -79,6 +79,7 @@ test('session token stays tab-scoped and offline commands survive reload with th
   await page.getByLabel('Email').fill('recorder@example.test');
   await page.getByLabel('Password').fill('test-password');
   await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Field capture' }).click();
   await page.getByLabel('Assigned site').selectOption(siteId);
   await page.getByLabel('Assigned hole').selectOption(holeId);
   await page.getByLabel('Actual participant identity').selectOption('IDENTIFIED');
@@ -86,6 +87,7 @@ test('session token stays tab-scoped and offline commands survive reload with th
   await page.getByLabel('Information source').selectOption('PAPER_TRANSCRIPTION');
   await page.getByLabel('Source reference').fill('paper-book-17');
   await page.getByRole('button', { name: 'Save and sync' }).click();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'My command queue' }).click();
   await expect(page.getByText('Received; review required')).toBeVisible();
   expect(submitted).toHaveLength(1);
   expect(submitted[0]?.commandType).toBe('production.create');
@@ -94,6 +96,7 @@ test('session token stays tab-scoped and offline commands survive reload with th
   expect(await page.evaluate(() => localStorage.getItem('minaledger.accessToken'))).toBeNull();
   expect(await page.evaluate(() => sessionStorage.getItem('minaledger.accessToken'))).toBe(validToken);
 
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Field capture' }).click();
   await page.getByLabel('Command type').selectOption('production.measurement.add');
   await page.getByLabel('Production event ID').fill(productionEventId);
   await page.getByRole('button', { name: 'Load event and participant context' }).click();
@@ -103,6 +106,7 @@ test('session token stays tab-scoped and offline commands survive reload with th
   await page.getByLabel('Quantity in grams').fill('2.500000');
   await page.getByLabel('Source value').fill('2.5');
   await page.getByRole('button', { name: 'Save and sync' }).click();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'My command queue' }).click();
   await expect(page.getByText('Accepted by server')).toBeVisible();
   expect(submitted).toHaveLength(2);
   expect(submitted[1]?.commandType).toBe('production.measurement.add');
@@ -111,15 +115,19 @@ test('session token stays tab-scoped and offline commands survive reload with th
   expect(submitted[1]?.expectedVersion).toEqual({ streamKind: 'material_event', streamId: productionEventId, sequence: 5 });
   expect(submitted[1]?.payload).toMatchObject({ eventId: productionEventId, outputId });
 
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Field capture' }).click();
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByText('Offline', { exact: true })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'My command queue' }).click();
   await expect(page.getByText('Received; review required')).toBeVisible();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Field capture' }).click();
   await expect(page.getByText(/paper-book-17/)).toHaveCount(0);
   await expect(page.getByLabel('Assigned site')).toHaveValue(siteId);
   await page.getByLabel('Actual participant identity').selectOption('UNKNOWN');
   await page.getByLabel('Source reference').fill('offline-notebook-2');
   await page.getByRole('button', { name: 'Save to offline queue' }).click();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'My command queue' }).click();
   const queuedOfflineCommand = page.locator('.queue-item').filter({ has: page.getByText('Waiting to upload', { exact: true }) });
   await expect(queuedOfflineCommand).toHaveCount(1);
   offlineCommand.mutationId = await queuedOfflineCommand.locator('code').textContent() ?? undefined;
@@ -197,6 +205,7 @@ test('audit checkpoint UI distinguishes database acceptance from a live unanchor
   await page.getByLabel('Email').fill('recorder@example.test');
   await page.getByLabel('Password').fill('test-password');
   await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Audit evidence' }).click();
   await page.getByLabel('Checkpoint stream ID').fill(siteId);
   await page.getByRole('button', { name: 'Add stream' }).click();
   await page.getByRole('button', { name: 'Create checkpoint' }).click();
