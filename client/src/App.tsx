@@ -10,6 +10,7 @@ import { getNavigationItems, type WorkspaceSection } from './navigation';
 import { RegistryWorkspace } from './registry/RegistryWorkspace';
 import { AccessAdministration, type RegisteredOrganization, type SessionAdminAccount } from './admin/AccessAdministration';
 import { ProductionWorkspace } from './production/ProductionWorkspace';
+import { OperationsWorkspace } from './operations/OperationsWorkspace';
 
 interface RoleGrant {
   roleCode: string;
@@ -680,7 +681,7 @@ export default function App() {
             <div className="section-heading"><div><p className="eyebrow">AUTHORIZED API DATA</p><h2 id="site-references-heading">Site references</h2></div></div>
             {sitesSource === 'loading' ? <div className="empty-state" role="status">Loading site references…</div> : sites.length === 0 ? <div className="empty-state">{sitesSource === 'unavailable' && !online ? 'No authorized site references are cached on this device yet.' : sitesSource === 'unavailable' ? 'Site references could not be loaded for this account.' : 'The authenticated API returned no site references for this account.'} Other workflows remain subject to their own server authorization.</div> : <ul className="site-list">{sites.map((site) => <li key={site.id}><span className="site-dot" aria-hidden="true" /><span><strong>{site.name}</strong><small>{site.siteCode}</small></span></li>)}</ul>}
           </section>
-          <section className="queue-section overview-note"><p className="eyebrow">AVAILABLE WORKSPACES</p><h2>Tools follow your active role and scope</h2><p className="muted">Open Registry or Access administration when those destinations are available to your current grant. Other site, processing, trading, custody, recovery, and reporting workflows are not represented in this milestone.</p></section>
+          <section className="queue-section overview-note"><p className="eyebrow">AVAILABLE WORKSPACES</p><h2>Tools follow your active role and scope</h2><p className="muted">Open Registry, Production, Material operations or Access administration when those destinations are available to your current grant. Every operation is checked again by the server.</p></section>
         </>}
 
 
@@ -736,6 +737,13 @@ export default function App() {
             setActiveSection('capture');
           }}
           onCommandQueued={() => refreshCommands(recorder.id)}
+        />}
+
+        {activeSection === 'operations' && token && <OperationsWorkspace
+          token={token}
+          selectedRole={selectedRole}
+          sites={sites}
+          online={online}
         />}
 
 

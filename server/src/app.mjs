@@ -12,14 +12,14 @@ import { sequelize } from './database/connection.mjs';
 import { authenticate, canAccessHole, canAccessProcessingFacility, canAccessSite, hasRole, requireHoleAccess, requirePilotFieldOfficer, requireParticipantWriteAccess, requireProcessingFacilityAccess, requireProductionEventAccess, requireProductionHoleAccess, requireSiteAccess, requireSystemAdministrator } from './middleware/auth.mjs';
 import { login, getProfile, createAccount, createOrganisation, addRoleAssignment, revokeRoleAssignment } from './modules/identity/identity.service.mjs';
 import { createSite, listSites, getSite, updateSite, createHole, getHole, listHoles, createParticipant, listParticipants, listHoleParticipants } from './modules/mining-sites/site.service.mjs';
-import { createProductionEvent, addOutputMeasurement, listProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
+import { createProductionEvent, addOutputMeasurement, listAccessibleProductionEvents, getProductionEvent } from './modules/production/production.service.mjs';
 import { measurementSchema, newMeasurementSchema, productionSchema } from './modules/production/production.schemas.mjs';
 import { syncEnvelopeSchema } from './modules/sync/sync.schemas.mjs';
 import { getSyncCommandVersion, getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
 import { createAuditCheckpointSchema } from './modules/audit/checkpoint.schemas.mjs';
 import { createAuditCheckpoint, getAuditCheckpoint } from './modules/audit/checkpoint.service.mjs';
-import { createDora, listSiteDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
-import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows } from './modules/processing/processing.service.mjs';
+import { createDora, listSiteDoras, listAccessibleDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
+import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows, listAccessibleProcessingEvents } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
 import { createBatchQr, rotateBatchQr, lookupQr, canAccessBatch } from './modules/qr/qr.service.mjs';
 import {
@@ -27,7 +27,10 @@ import {
   dispatchConsignment, addTransportLeg, readConsignment, createRecoveryInventoryLocation, listLocationBalances,
   receiveConsignment, correctConsignmentReceiptItem, createCustodyOffer, decideCustodyTransfer,
   createResidueSale, proposeResidueSaleLineRevision, decideResidueSaleLine,
-  readResidueSale, adjustInventory, createRecoveryEvent, readRecoveryEvent,
+  readResidueSale, listAccessibleResidueSales, adjustInventory, createRecoveryEvent, readRecoveryEvent,
+  listAccessibleRecoveryFacilities, getRecoveryFacility, listAccessibleRecoveryEvents,
+  listInventoryMovements, listAccessibleConsignments, listEligibleDoraResidueOutputs, listEligibleRecoveryInputs,
+  listEligibleRecoveryDestinations,
 } from './modules/residue/residue.service.mjs';
 import {
   createGoldTrade, addGoldTradeLine, readGoldTrade, recordGoldTradeMeasurement, recordGoldTradeAssay,
@@ -447,6 +450,7 @@ app.post('/api/v1/sites/:siteId/participants', requireUuidParams('siteId'), requ
   return res.status(201).json(await createParticipant(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
 app.get('/api/v1/sites/:siteId/doras', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listSiteDoras(req.params.siteId))));
+app.get('/api/v1/doras', asyncRoute(async (req, res) => res.json(await listAccessibleDoras(req.auth))));
 app.post('/api/v1/sites/:siteId/doras', requireUuidParams('siteId'), requireSiteAccess, requireIdempotencyKey, validateBody(doraSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createDora(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
 }));
@@ -454,7 +458,7 @@ app.get('/api/v1/doras/:facilityId', requireUuidParams('facilityId'), requirePro
 app.patch('/api/v1/doras/:facilityId', requireUuidParams('facilityId'), requireProcessingFacilityAccess, requireIdempotencyKey, validateBody(doraPatchSchema), asyncRoute(async (req, res) => {
   return res.json(await updateDora(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
 }));
-app.get('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireSiteAccess, asyncRoute(async (req, res) => res.json(await listProductionEvents(req.params.siteId))));
+app.get('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), asyncRoute(async (req, res) => res.json(await listAccessibleProductionEvents(req.params.siteId, req.auth))));
 app.get('/api/v1/sites/:siteId/production-events/:eventId', requireUuidParams('siteId', 'eventId'), requireProductionEventAccess, asyncRoute(async (req, res) => res.json(await getProductionEvent(req.params.siteId, req.params.eventId))));
 app.post('/api/v1/sites/:siteId/production-events', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(productionSchema), requireProductionHoleAccess, asyncRoute(async (req, res) => {
   return res.status(201).json(await createProductionEvent(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
@@ -471,6 +475,11 @@ app.post('/api/v1/sites/:siteId/production-events/:eventId/outputs/:outputId/all
 }));
 app.post('/api/v1/sites/:siteId/processing-events', requireUuidParams('siteId'), requireIdempotencyKey, validateBody(processingSchema), requireProcessingCommandAccess, asyncRoute(async (req, res) => {
   return res.status(201).json(await createProcessingEvent(req.params.siteId, req.body, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/processing-events', asyncRoute(async (req, res) => {
+  const siteId = req.query.siteId === undefined ? undefined : String(req.query.siteId);
+  if (siteId && !z.string().uuid().safeParse(siteId).success) throw new AppError(400, 'INVALID_ID', 'siteId must be a UUID.');
+  return res.json(await listAccessibleProcessingEvents(req.auth, siteId));
 }));
 app.get('/api/v1/processing-events/:eventId', requireUuidParams('eventId'), requireProcessingEventAccess, asyncRoute(async (req, res) => res.json(await getProcessingEvent(req.params.eventId))));
 app.post('/api/v1/processing-events/:eventId/inputs/:inputId/measurements', requireUuidParams('eventId', 'inputId'), requireProcessingEventAccess, requireIdempotencyKey, validateBody(measurementSchema), asyncRoute(async (req, res) => {
@@ -493,6 +502,12 @@ app.get('/api/v1/qr/:token', asyncRoute(async (req, res) => {
 app.get('/api/v1/doras/:facilityId/stockpiles', requireUuidParams('facilityId'), asyncRoute(async (req, res) => {
   return res.json(await listStockpiles(req.params.facilityId, req.auth));
 }));
+app.get('/api/v1/doras/:facilityId/residue-outputs', requireUuidParams('facilityId'), asyncRoute(async (req, res) => {
+  return res.json(await listEligibleDoraResidueOutputs(req.params.facilityId, req.auth));
+}));
+app.get('/api/v1/doras/:facilityId/recovery-destinations', requireUuidParams('facilityId'), asyncRoute(async (req, res) => {
+  return res.json(await listEligibleRecoveryDestinations(req.params.facilityId, req.auth));
+}));
 app.post('/api/v1/doras/:facilityId/stockpiles', requireUuidParams('facilityId'), requireIdempotencyKey, validateBody(stockpileSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createStockpile(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
 }));
@@ -504,6 +519,9 @@ app.post('/api/v1/stockpiles/:stockpileId/transfers', requireUuidParams('stockpi
 }));
 app.get('/api/v1/inventory/locations/:locationId/balances', requireUuidParams('locationId'), asyncRoute(async (req, res) => {
   return res.json(await listLocationBalances(req.params.locationId, req.auth));
+}));
+app.get('/api/v1/inventory/locations/:locationId/movements', requireUuidParams('locationId'), asyncRoute(async (req, res) => {
+  return res.json(await listInventoryMovements(req.params.locationId, req.auth));
 }));
 app.post('/api/v1/inventory/locations/:locationId/adjustments', requireUuidParams('locationId'), requireIdempotencyKey, validateBody(adjustmentSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await adjustInventory(req.params.locationId, req.body, req.auth, req.get('idempotency-key')));
@@ -543,6 +561,7 @@ app.post('/api/v1/gold-trades/:tradeId/payments/:paymentId/decisions', requireUu
   return res.status(201).json(await decideGoldTradePayment(req.params.tradeId, req.params.paymentId, req.body, req.auth, req.get('idempotency-key')));
 }));
 
+app.get('/api/v1/consignments', asyncRoute(async (req, res) => res.json(await listAccessibleConsignments(req.auth))));
 app.post('/api/v1/consignments', requireIdempotencyKey, validateBody(consignmentSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createConsignment(req.body, req.auth, req.get('idempotency-key')));
 }));
@@ -568,6 +587,7 @@ app.post('/api/v1/custody-transfers/:transferId/decisions', requireUuidParams('t
   return res.status(200).json(await decideCustodyTransfer(req.params.transferId, req.body, req.auth, req.get('idempotency-key')));
 }));
 
+app.get('/api/v1/residue-sales', asyncRoute(async (req, res) => res.json(await listAccessibleResidueSales(req.auth))));
 app.post('/api/v1/residue-sales', requireIdempotencyKey, validateBody(residueSaleSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createResidueSale(req.body, req.auth, req.get('idempotency-key')));
 }));
@@ -581,6 +601,10 @@ app.post('/api/v1/residue-sales/:saleId/lines/:lineId/decisions', requireUuidPar
   return res.status(201).json(await decideResidueSaleLine(req.params.saleId, req.params.lineId, req.body, req.auth, req.get('idempotency-key')));
 }));
 
+app.get('/api/v1/recovery-facilities', asyncRoute(async (req, res) => res.json(await listAccessibleRecoveryFacilities(req.auth))));
+app.get('/api/v1/recovery-facilities/:facilityId', requireUuidParams('facilityId'), asyncRoute(async (req, res) => res.json(await getRecoveryFacility(req.params.facilityId, req.auth))));
+app.get('/api/v1/recovery-facilities/:facilityId/recovery-events', requireUuidParams('facilityId'), asyncRoute(async (req, res) => res.json(await listAccessibleRecoveryEvents(req.params.facilityId, req.auth))));
+app.get('/api/v1/recovery-facilities/:facilityId/eligible-inputs', requireUuidParams('facilityId'), asyncRoute(async (req, res) => res.json(await listEligibleRecoveryInputs(req.params.facilityId, req.auth))));
 app.post('/api/v1/recovery-facilities/:facilityId/inventory-locations', requireUuidParams('facilityId'), requireIdempotencyKey, validateBody(recoveryLocationSchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createRecoveryInventoryLocation(req.params.facilityId, req.body, req.auth, req.get('idempotency-key')));
 }));

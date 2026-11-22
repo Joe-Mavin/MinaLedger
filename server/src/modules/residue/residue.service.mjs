@@ -181,6 +181,97 @@ export async function listStockpiles(facilityId, auth) {
   );
 }
 
+export async function listAccessibleRecoveryFacilities(auth) {
+  const facilities = await query(
+    `SELECT id,name,status,party_id,created_at FROM recovery_facility ORDER BY name,id`,
+  );
+  const visible = [];
+  for (const facility of facilities) {
+    if (await canAccessRecoveryFacility(auth, facility.id)) visible.push(facility);
+  }
+  return visible;
+}
+
+export async function listEligibleRecoveryDestinations(processingFacilityId, auth) {
+  await assertDoraAccess(auth, processingFacilityId, true);
+  return query(
+    `SELECT rf.id,rf.name,rf.status,
+       COALESCE(json_agg(json_build_object('id',l.id,'locationCode',l.location_code)
+         ORDER BY l.location_code,l.id) FILTER (WHERE l.id IS NOT NULL),'[]') AS locations
+     FROM recovery_facility rf LEFT JOIN recovery_inventory_location ril ON ril.recovery_facility_id=rf.id
+     LEFT JOIN inventory_location l ON l.id=ril.inventory_location_id
+     WHERE rf.status='ACTIVE' AND rf.party_id IS NOT NULL
+     GROUP BY rf.id ORDER BY rf.name,rf.id`,
+  );
+}
+
+export async function getRecoveryFacility(facilityId, auth) {
+  await assertRecoveryAccess(auth, facilityId, false);
+  const [facility] = await query(
+    `SELECT id,name,status,party_id,created_at FROM recovery_facility WHERE id=:facilityId`, { facilityId },
+  );
+  if (!facility) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  const locations = await query(
+    `SELECT l.id,l.location_code,l.physical_place_ref,ril.location_ref
+     FROM recovery_inventory_location ril JOIN inventory_location l ON l.id=ril.inventory_location_id
+     WHERE ril.recovery_facility_id=:facilityId ORDER BY l.location_code,l.id`, { facilityId },
+  );
+  return { ...facility, locations };
+}
+
+export async function listAccessibleRecoveryEvents(facilityId, auth) {
+  await assertRecoveryAccess(auth, facilityId, false);
+  return query(
+    `SELECT me.id,me.event_code,me.occurred_at_claimed,me.recorded_at,me.current_status,
+            re.method_ref, count(DISTINCT ri.material_event_input_id)::int AS input_count,
+            count(DISTINCT ro.material_event_output_id)::int AS output_count
+     FROM recovery_event re JOIN material_event me ON me.id=re.event_id
+     LEFT JOIN recovery_event_input ri ON ri.recovery_event_id=re.event_id
+     LEFT JOIN recovery_event_output ro ON ro.recovery_event_id=re.event_id
+     WHERE re.recovery_facility_id=:facilityId
+     GROUP BY me.id,re.method_ref ORDER BY me.recorded_at DESC,me.id`, { facilityId },
+  );
+}
+
+export async function listEligibleDoraResidueOutputs(facilityId, auth) {
+  await assertDoraAccess(auth, facilityId, false);
+  return query(
+    `SELECT eo.id AS output_id,eo.event_id AS processing_event_id,me.event_code,me.occurred_at_claimed,
+            eo.batch_id,mb.batch_code,mb.material_kind,peo.output_role,mm.id AS measurement_id,
+            mm.measurement_kind,mm.quantity_g,mm.source_value,mm.source_unit_code,mm.conversion_version,
+            mm.source_role,mm.method_code,mm.instrument_ref,mm.evidence_ref
+     FROM processing_event_output peo JOIN material_event_output eo ON eo.id=peo.material_event_output_id
+     JOIN processing_event pe ON pe.event_id=peo.processing_event_id
+     JOIN material_event me ON me.id=pe.event_id JOIN material_batch mb ON mb.id=eo.batch_id
+     JOIN material_measurement_set ms ON ms.material_event_output_id=eo.id AND ms.batch_id=eo.batch_id
+     JOIN material_measurement mm ON mm.measurement_set_id=ms.id
+     WHERE pe.processing_facility_id=:facilityId AND peo.output_role='DORA_RETAINED_RESIDUE'
+       AND mb.material_kind='RESIDUE' AND mm.measurement_kind IN ('MEASURED','VERIFIED')
+       AND NOT EXISTS (SELECT 1 FROM material_measurement successor WHERE successor.supersedes_measurement_id=mm.id)
+       AND NOT EXISTS (SELECT 1 FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id AND m.current_status='ACCEPTED' WHERE ml.source_material_event_output_id=eo.id)
+     ORDER BY me.recorded_at,eo.output_sequence,mm.entered_at`, { facilityId },
+  );
+}
+
+export async function listEligibleRecoveryInputs(facilityId, auth) {
+  await assertRecoveryAccess(auth, facilityId, false);
+  return query(
+    `SELECT ri.id AS receipt_item_id,ri.consignment_id,ci.batch_id,mb.batch_code,mb.material_kind,
+            c.consignment_code,ri.quantity_g,ri.outcome,ri.evidence_ref,ri.recorded_at,
+            GREATEST(ri.quantity_g-COALESCE(used.quantity_g,0),0)::NUMERIC(20,6) AS available_quantity_g
+     FROM consignment_receipt_item ri JOIN consignment_item ci ON ci.id=ri.consignment_item_id
+     JOIN consignment c ON c.id=ci.consignment_id JOIN material_batch mb ON mb.id=ci.batch_id
+     LEFT JOIN LATERAL (
+       SELECT sum(source.source_quantity_g)::NUMERIC(20,6) AS quantity_g
+       FROM recovery_event_input_source source WHERE source.consignment_receipt_item_id=ri.id
+     ) used ON true
+     WHERE c.destination_recovery_facility_id=:facilityId AND ri.outcome='ACCEPTED'
+       AND NOT EXISTS (SELECT 1 FROM consignment_receipt_item successor WHERE successor.supersedes_receipt_item_id=ri.id)
+       AND COALESCE(used.quantity_g,0)<ri.quantity_g
+     ORDER BY ri.recorded_at,ri.id`, { facilityId },
+  );
+}
+
 export async function receiveDoraResidue(stockpileId, input, auth, mutationId) {
   const [stockpile] = await query(`SELECT processing_facility_id FROM residue_stockpile WHERE inventory_location_id=:stockpileId`, { stockpileId });
   if (!stockpile) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
@@ -340,6 +431,24 @@ async function getConsignmentSourceFacilities(consignmentId) {
   return rows.map((row) => row.processing_facility_id);
 }
 
+export async function listAccessibleConsignments(auth) {
+  const consignments = await query(
+    `SELECT id,consignment_code,status,destination_recovery_facility_id,created_at,dispatched_at,received_at
+     FROM consignment ORDER BY created_at DESC,id`,
+  );
+  const visible = [];
+  for (const consignment of consignments) {
+    const sourceFacilityIds = await getConsignmentSourceFacilities(consignment.id);
+    const receiverAllowed = await canAccessRecoveryFacility(auth, consignment.destination_recovery_facility_id);
+    let senderAllowed = sourceFacilityIds.length > 0;
+    for (const facilityId of sourceFacilityIds) {
+      if (!(await canAccessProcessingFacility(auth, facilityId))) senderAllowed = false;
+    }
+    if (receiverAllowed || senderAllowed) visible.push({ ...consignment, sourceFacilityIds });
+  }
+  return visible;
+}
+
 export async function dispatchConsignment(consignmentId, input, auth, mutationId, options = {}) {
   const sourceFacilityIds = await getConsignmentSourceFacilities(consignmentId);
   if (!sourceFacilityIds.length) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
@@ -424,6 +533,10 @@ export async function readConsignment(consignmentId, auth) {
   if (!senderAllowed && !receiverAllowed) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   const items = await query(
     `SELECT ci.id,ci.batch_id,mb.batch_code,ci.source_location_id,ci.line_no,
+       (SELECT mm.id FROM material_measurement_set dispatch_set
+        JOIN material_measurement mm ON mm.measurement_set_id=dispatch_set.id
+        WHERE dispatch_set.consignment_item_id=ci.id AND dispatch_set.consignment_stage='DISPATCH'
+        ORDER BY mm.entered_at,mm.id LIMIT 1) AS dispatch_measurement_id,
        (SELECT COALESCE(sum(dispatch.posted_quantity_g-COALESCE(reversed.quantity_g,0)),0)::NUMERIC(20,6)
         FROM inventory_movement_line dispatch
         JOIN inventory_movement movement ON movement.id=dispatch.inventory_movement_id AND movement.current_status='ACCEPTED' AND movement.movement_kind='TRANSFER'
@@ -444,7 +557,15 @@ export async function readConsignment(consignmentId, auth) {
   const legs = await query(`SELECT * FROM transport_record WHERE consignment_id=:id ORDER BY created_at,id`, { id: consignmentId });
   const receipts = await query(`SELECT * FROM consignment_receipt WHERE consignment_id=:id ORDER BY recorded_at,id`, { id: consignmentId });
   const receiptItems = await query(`SELECT * FROM consignment_receipt_item WHERE consignment_id=:id ORDER BY recorded_at,id`, { id: consignmentId });
-  return { ...parent, items, transportLegs: legs, receipts, receiptItems };
+  const custodyTransfers = await query(
+    `SELECT ct.*,COALESCE(json_agg(json_build_object(
+       'id',d.id,'decision',d.decision,'actorPartyId',d.actor_party_id,'occurredAt',d.occurred_at,
+       'reason',d.reason,'evidenceRef',d.evidence_ref
+     ) ORDER BY d.occurred_at,d.id) FILTER (WHERE d.id IS NOT NULL),'[]') AS decisions
+     FROM custody_transfer ct LEFT JOIN custody_transfer_decision d ON d.custody_transfer_id=ct.id
+     WHERE ct.consignment_id=:id GROUP BY ct.id ORDER BY ct.offered_at,ct.id`, { id: consignmentId },
+  );
+  return { ...parent, items, transportLegs: legs, receipts, receiptItems, custodyTransfers };
 }
 
 export async function createRecoveryInventoryLocation(facilityId, input, auth, mutationId) {
@@ -502,6 +623,22 @@ export async function listLocationBalances(locationId, auth) {
      JOIN material_batch mb ON mb.id=ml.batch_id WHERE ml.location_id=:locationId
      GROUP BY mb.id,mb.batch_code,mb.material_kind ORDER BY mb.batch_code`,
     { locationId },
+  );
+}
+
+export async function listInventoryMovements(locationId, auth) {
+  await listLocationBalances(locationId, auth);
+  return query(
+    `SELECT m.id AS movement_id,m.movement_kind,m.occurred_at_claimed,m.recorded_at,m.current_status,m.reason,
+            ml.id AS movement_line_id,ml.batch_id,mb.batch_code,mb.material_kind,ml.direction,ml.posted_quantity_g,
+            ml.source_material_event_output_id,ml.consignment_receipt_item_id,ml.consignment_item_id,ml.consignment_stage,
+            mm.measurement_kind,mm.source_value,mm.source_unit_code,mm.conversion_version,mm.source_role,
+            mm.source_party_id,mm.method_code,mm.instrument_ref,mm.evidence_ref
+     FROM inventory_movement_line ml JOIN inventory_movement m ON m.id=ml.inventory_movement_id
+     JOIN material_batch mb ON mb.id=ml.batch_id
+     LEFT JOIN material_measurement mm ON mm.id=ml.basis_measurement_id
+     WHERE ml.location_id=:locationId
+     ORDER BY m.occurred_at_claimed,m.recorded_at,m.id,ml.id`, { locationId },
   );
 }
 
@@ -1041,6 +1178,35 @@ export async function readResidueSale(saleId, auth) {
   return { ...sale, lines, decisions };
 }
 
+export async function listAccessibleResidueSales(auth) {
+  const sales = await query(
+    `SELECT id,sale_code,seller_party_id,buyer_party_id,agreed_at,currency_code,terms_ref,created_at
+     FROM residue_sale ORDER BY created_at DESC,id`,
+  );
+  const visible = [];
+  for (const sale of sales) {
+    const sellerFacilities = await query(
+      `SELECT DISTINCT pe.processing_facility_id
+       FROM residue_sale_line line JOIN material_event_output eo ON eo.batch_id=line.batch_id
+       JOIN processing_event_output peo ON peo.material_event_output_id=eo.id
+       JOIN processing_event pe ON pe.event_id=peo.processing_event_id
+       WHERE line.residue_sale_id=:saleId`, { saleId: sale.id },
+    );
+    let allowed = false;
+    for (const row of sellerFacilities) {
+      if (await canAccessProcessingFacility(auth, row.processing_facility_id)) { allowed = true; break; }
+    }
+    if (!allowed) {
+      const buyerFacilities = await query(`SELECT id FROM recovery_facility WHERE party_id=:partyId`, { partyId: sale.buyer_party_id });
+      for (const facility of buyerFacilities) {
+        if (await canAccessRecoveryFacility(auth, facility.id)) { allowed = true; break; }
+      }
+    }
+    if (allowed) visible.push(sale);
+  }
+  return visible;
+}
+
 export async function adjustInventory(locationId, input, auth, mutationId, options = {}) {
   const balances = await listLocationBalances(locationId, auth);
   const [location] = await query(
@@ -1210,23 +1376,32 @@ export async function readRecoveryEvent(eventId, auth) {
   if (!event) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   await assertRecoveryAccess(auth, event.recovery_facility_id, false);
   const inputs = await query(
-    `SELECT ri.material_event_input_id AS id,ri.batch_id,mb.batch_code,mm.quantity_g,
-       COALESCE(json_agg(json_build_object('receipt_item_id',src.consignment_receipt_item_id,'consignment_item_id',src.consignment_item_id,'quantity_g',src.source_quantity_g) ORDER BY src.consignment_receipt_item_id) FILTER (WHERE src.id IS NOT NULL),'[]') AS sources
+    `SELECT ri.material_event_input_id AS id,ri.batch_id,mb.batch_code,mm.id AS measurement_id,
+       mm.measurement_kind,mm.quantity_g,mm.source_value,mm.source_unit_code,mm.conversion_version,
+       mm.source_role,mm.source_party_id,mm.method_code,mm.instrument_ref,mm.evidence_ref,
+       COALESCE(json_agg(json_build_object(
+         'receipt_item_id',src.consignment_receipt_item_id,'consignment_item_id',src.consignment_item_id,
+         'consignment_id',ci.consignment_id,'consignment_code',c.consignment_code,'quantity_g',src.source_quantity_g
+       ) ORDER BY src.consignment_receipt_item_id) FILTER (WHERE src.id IS NOT NULL),'[]') AS sources
      FROM recovery_event_input ri JOIN material_batch mb ON mb.id=ri.batch_id
      JOIN material_measurement_set ms ON ms.material_event_input_id=ri.material_event_input_id
      JOIN material_measurement mm ON mm.measurement_set_id=ms.id
      LEFT JOIN recovery_event_input_source src ON src.recovery_event_input_id=ri.material_event_input_id
-     WHERE ri.recovery_event_id=:eventId GROUP BY ri.material_event_input_id,ri.batch_id,mb.batch_code,mm.quantity_g ORDER BY ri.material_event_input_id`, { eventId },
+     LEFT JOIN consignment_item ci ON ci.id=src.consignment_item_id
+     LEFT JOIN consignment c ON c.id=ci.consignment_id
+     WHERE ri.recovery_event_id=:eventId GROUP BY ri.material_event_input_id,ri.batch_id,mb.batch_code,mm.id,mm.measurement_kind,mm.quantity_g,mm.source_value,mm.source_unit_code,mm.conversion_version,mm.source_role,mm.source_party_id,mm.method_code,mm.instrument_ref,mm.evidence_ref ORDER BY ri.material_event_input_id`, { eventId },
   );
   const outputs = await query(
-    `SELECT ro.material_event_output_id AS id,ro.batch_id,mb.batch_code,mb.material_kind,ro.output_role,mm.quantity_g,
+    `SELECT ro.material_event_output_id AS id,ro.batch_id,mb.batch_code,mb.material_kind,ro.output_role,
+       mm.id AS measurement_id,mm.measurement_kind,mm.quantity_g,mm.source_value,mm.source_unit_code,
+       mm.conversion_version,mm.source_role,mm.source_party_id,mm.method_code,mm.instrument_ref,mm.evidence_ref,
        array_agg(DISTINCT ri.batch_id ORDER BY ri.batch_id) AS contributing_batch_ids
      FROM recovery_event_output ro JOIN material_batch mb ON mb.id=ro.batch_id
      JOIN material_measurement_set ms ON ms.material_event_output_id=ro.material_event_output_id
      JOIN material_measurement mm ON mm.measurement_set_id=ms.id
      JOIN recovery_output_input_link link ON link.material_event_output_id=ro.material_event_output_id
      JOIN recovery_event_input ri ON ri.material_event_input_id=link.material_event_input_id
-     WHERE ro.recovery_event_id=:eventId GROUP BY ro.material_event_output_id,ro.batch_id,mb.batch_code,mb.material_kind,ro.output_role,mm.quantity_g`, { eventId },
+     WHERE ro.recovery_event_id=:eventId GROUP BY ro.material_event_output_id,ro.batch_id,mb.batch_code,mb.material_kind,ro.output_role,mm.id,mm.measurement_kind,mm.quantity_g,mm.source_value,mm.source_unit_code,mm.conversion_version,mm.source_role,mm.source_party_id,mm.method_code,mm.instrument_ref,mm.evidence_ref`, { eventId },
   );
   const stages = await query(`SELECT stage_code,occurred_at_claimed,evidence_ref,note FROM recovery_process_stage WHERE recovery_event_id=:eventId ORDER BY occurred_at_claimed,id`, { eventId });
   const variances = await query(`SELECT variance_kind,expected_quantity_g,observed_quantity_g,variance_quantity_g,reason,evidence_ref FROM recovery_variance WHERE recovery_event_id=:eventId ORDER BY recorded_at,id`, { eventId });

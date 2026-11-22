@@ -278,3 +278,41 @@ export async function processingEventAccessRows(eventId, siteId = undefined) {
     { replacements: { eventId, ...(siteId ? { siteId } : {}) }, type: QueryTypes.SELECT },
   );
 }
+
+export async function listAccessibleProcessingEvents(auth, siteId = undefined) {
+  const events = await sequelize.query(
+    `SELECT me.id, me.event_code, me.occurred_at_claimed, me.recorded_at, me.current_status,
+            pe.processing_facility_id, pf.name AS processing_facility_name,
+            count(DISTINCT pei.material_event_input_id)::int AS input_count,
+            count(DISTINCT peo.material_event_output_id)::int AS output_count
+     FROM processing_event pe
+     JOIN material_event me ON me.id=pe.event_id
+     JOIN processing_facility pf ON pf.id=pe.processing_facility_id
+     JOIN processing_event_input pei ON pei.processing_event_id=pe.event_id
+     JOIN material_event_input mei ON mei.id=pei.material_event_input_id
+     JOIN production_event_output source_output ON source_output.material_event_output_id=pei.source_production_output_id
+     JOIN production_event source_event ON source_event.event_id=source_output.production_event_id
+     JOIN mining_hole h ON h.id=source_event.hole_id
+     LEFT JOIN processing_event_output peo ON peo.processing_event_id=pe.event_id
+     WHERE (:siteId IS NULL OR h.site_id=:siteId)
+     GROUP BY me.id, pe.processing_facility_id, pf.name
+     ORDER BY me.recorded_at DESC, me.id`,
+    { replacements: { siteId: siteId ?? null }, type: QueryTypes.SELECT },
+  );
+  const visible = [];
+  for (const event of events) {
+    if (!(await canAccessProcessingFacility(auth, event.processing_facility_id))) continue;
+    const sources = await processingEventAccessRows(event.id);
+    if (siteId && !sources.some((source) => source.site_id === siteId)) continue;
+    let allSourcesAllowed = sources.length > 0;
+    for (const source of sources) {
+      if (!(await canAccessHole(auth, source.site_id, source.hole_id))) { allSourcesAllowed = false; break; }
+    }
+    if (allSourcesAllowed) visible.push({
+      ...event,
+      sourceSiteIds: [...new Set(sources.map((source) => source.site_id))],
+      sourceHoleIds: [...new Set(sources.map((source) => source.hole_id))],
+    });
+  }
+  return visible;
+}

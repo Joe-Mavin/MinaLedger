@@ -130,6 +130,21 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 14px
 .data-table th { color: #607167; background: #f7faf7; font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
 .data-table tr:last-child td { border-bottom: 0; }
 .data-table td small { display: block; margin-top: 4px; color: #77877e; font-size: 10px; overflow-wrap: anywhere; }
+
+.workspace-tabs { display: flex; gap: 8px; margin: 0 0 18px; overflow-x: auto; padding-bottom: 4px; }
+.workspace-tabs button { flex: 0 0 auto; border: 1px solid #dce6de; border-radius: 999px; padding: 9px 14px; background: #fff; color: #365143; font: inherit; cursor: pointer; }
+.workspace-tabs button[aria-selected="true"] { border-color: #1c724b; background: #e9f4ec; color: #155c3b; font-weight: 700; }
+.field-value { display: grid; gap: 5px; align-content: start; }
+.field-value code { overflow-wrap: anywhere; color: #47594e; font-size: 12px; }
+.field-value small { color: #708075; }
+.data-table tr[role="button"] { cursor: pointer; }
+.data-table tr[role="button"]:hover { background: #f4f8f4; }
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 620px) {
+  .workspace-tabs { margin-right: -4px; }
+  .workspace-tabs button { padding: 8px 11px; font-size: 12px; }
+}
 .production-detail { scroll-margin-top: 20px; }
 .detail-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 24px; }
 .detail-list > div { min-width: 0; padding: 12px; border: 1px solid #e7ece8; border-radius: 9px; background: #fbfcfb; }

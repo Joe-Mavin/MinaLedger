@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { QueryTypes } from 'sequelize';
 import { sequelize } from '../../database/connection.mjs';
+import { canAccessHole, canAccessSite } from '../../middleware/auth.mjs';
 import { MaterialBatch, MaterialEvent, MiningHole, ProductionEvent } from '../../database/models.mjs';
 import { AppError } from '../../utils/errors.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
@@ -221,6 +222,16 @@ export async function listProductionEvents(siteId) {
      WHERE h.site_id=:siteId GROUP BY me.id, pe.hole_id, h.hole_code ORDER BY me.recorded_at DESC`,
     { replacements: { siteId }, type: QueryTypes.SELECT },
   );
+}
+
+export async function listAccessibleProductionEvents(siteId, auth) {
+  const events = await listProductionEvents(siteId);
+  const visible = [];
+  for (const event of events) {
+    if (await canAccessHole(auth, siteId, event.hole_id)) visible.push(event);
+  }
+  if (!visible.length && !(await canAccessSite(auth, siteId))) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
+  return visible;
 }
 
 export async function getProductionEvent(siteId, eventId) {

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { QueryTypes } from 'sequelize';
 import { sequelize } from '../../database/connection.mjs';
+import { canAccessProcessingFacility, canAccessSite } from '../../middleware/auth.mjs';
 import { AppError } from '../../utils/errors.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
@@ -40,6 +41,29 @@ export async function listSiteDoras(siteId) {
      WHERE pfs.mining_site_id=:siteId ORDER BY pf.created_at, pf.id`,
     { replacements: { siteId }, type: QueryTypes.SELECT },
   );
+}
+
+export async function listAccessibleDoras(auth) {
+  const facilities = await sequelize.query(
+    `SELECT pf.id, pf.name, pf.status,
+            COALESCE(array_agg(pfs.mining_site_id ORDER BY pfs.mining_site_id)
+              FILTER (WHERE pfs.mining_site_id IS NOT NULL), '{}') AS site_ids
+     FROM processing_facility pf
+     LEFT JOIN processing_facility_site pfs ON pfs.processing_facility_id=pf.id
+     GROUP BY pf.id ORDER BY pf.name, pf.id`,
+    { type: QueryTypes.SELECT },
+  );
+  const visible = [];
+  for (const facility of facilities) {
+    let allowed = await canAccessProcessingFacility(auth, facility.id);
+    if (!allowed) {
+      for (const siteId of facility.site_ids) {
+        if (await canAccessSite(auth, siteId)) { allowed = true; break; }
+      }
+    }
+    if (allowed) visible.push(facility);
+  }
+  return visible;
 }
 
 export async function getDora(facilityId) {

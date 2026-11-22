@@ -2285,6 +2285,46 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       await assert.rejects(db(`UPDATE inventory_movement SET reason='Changed' WHERE id=:id`, { id: acceptedMovement.id }), sqlError('55000'));
     });
 
+    await phase.test('operations registers apply live facility, hole, and participant-side authorization', async () => {
+      const doras = await request(app).get('/api/v1/doras').set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(doras.status, 200, doras.text);
+      assert.deepEqual(doras.body.map((row) => row.id), [ids.doraOneId]);
+      const destinations = await request(app).get(`/api/v1/doras/${ids.doraOneId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(destinations.status, 200, destinations.text);
+      assert.ok(destinations.body.some((row) => row.id === ids.phaseThree.recoveryFacilityId));
+      assert.equal((await request(app).get(`/api/v1/doras/${ids.doraTwoId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 404);
+      const processing = await request(app).get('/api/v1/processing-events').set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(processing.status, 200, processing.text);
+      assert.ok(processing.body.some((row) => row.id === ids.processingEventId));
+      const sourceEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(sourceEvents.status, 200, sourceEvents.text);
+      assert.ok(sourceEvents.body.some((row) => row.id === ids.phase2ProductionEventId));
+      assert.equal((await request(app).get('/api/v1/processing-events').set('Authorization', `Bearer ${ids.siteToken}`)).body.some((row) => row.id === ids.processingEventId), false);
+
+      const facilities = await request(app).get('/api/v1/recovery-facilities').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(facilities.status, 200, facilities.text);
+      assert.ok(facilities.body.some((row) => row.id === ids.phaseThree.recoveryFacilityId));
+      const facility = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(facility.status, 200, facility.text);
+      assert.ok(facility.body.locations.some((row) => row.id === ids.phaseThree.recoveryLocationId));
+      const recoveryEvents = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(recoveryEvents.status, 200, recoveryEvents.text);
+      assert.ok(recoveryEvents.body.some((row) => row.id === ids.phaseThree.recoveryEventId));
+      assert.equal((await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).status, 404);
+      const eligibleInputs = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/eligible-inputs`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(eligibleInputs.status, 200, eligibleInputs.text);
+      const consignmentList = await request(app).get('/api/v1/consignments').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(consignmentList.status, 200, consignmentList.text);
+      assert.ok(consignmentList.body.some((row) => row.id === ids.phaseThree.consignmentId));
+      const saleList = await request(app).get('/api/v1/residue-sales').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(saleList.status, 200, saleList.text);
+      assert.ok(saleList.body.some((row) => row.id === ids.phaseThree.saleId));
+      const movements = await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/movements`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(movements.status, 200, movements.text);
+      assert.ok(movements.body.some((row) => row.consignment_stage === 'RECEIPT'));
+      assert.equal((await request(app).get('/api/v1/consignments').set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`)).body.some((row) => row.id === ids.phaseThree.consignmentId), false);
+    });
+
     await phase.test('recovery facility permissions are live and role revocation takes effect immediately', async () => {
       const revoked = await request(app).post(`/api/v1/admin/role-assignments/${ids.phaseThree.recoveryRoleId}/revoke`).set('Authorization', `Bearer ${ids.adminToken}`).set('Idempotency-Key', randomUUID()).send({});
       assert.equal(revoked.status, 200, revoked.text);
