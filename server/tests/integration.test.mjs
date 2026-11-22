@@ -764,6 +764,10 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
   await t.test('hole-scoped access stays within assigned holes across nested endpoints', async () => {
     ids.holeB1Id = randomUUID();
     await db(`INSERT INTO mining_hole(id,site_id,hole_code,name) VALUES (:id,:siteId,'HOLE-B1','Third fictional hole')`, { id: ids.holeB1Id, siteId: ids.siteBId });
+    const siteAuditor = await seedUser('site-auditor@example.test', 'Fictional Site Auditor', {
+      roleCode: 'AUDITOR', scopeKind: 'SITE', scopeId: ids.siteId,
+    });
+    ids.siteAuditorToken = testToken(siteAuditor.userId);
 
     const holeA2Participant = await request(app).post(`/api/v1/sites/${ids.siteId}/participants`)
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', randomUUID())
@@ -818,7 +822,13 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(holeA2Association.status, 403);
 
     const siteWideEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${holeA1Token}`);
-    assert.equal(siteWideEvents.status, 403);
+    assert.equal(siteWideEvents.status, 200, siteWideEvents.text);
+    const siteReadableEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(siteReadableEvents.status, 200, siteReadableEvents.text);
+    const eventsWithinHoleGrant = siteReadableEvents.body.filter((event) => event.hole_id === ids.holeId).map((event) => event.id).sort();
+    assert.deepEqual(siteWideEvents.body.map((event) => event.id).sort(), eventsWithinHoleGrant);
+    assert.ok(siteWideEvents.body.every((event) => event.hole_id === ids.holeId));
+    assert.equal(siteWideEvents.body.some((event) => event.hole_id === ids.secondHoleId), false);
     const a1Event = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}`).set('Authorization', `Bearer ${holeA1Token}`);
     assert.equal(a1Event.status, 200, a1Event.text);
     assert.equal(a1Event.body.outputs[0].batch_id, ids.outputs[0].batchId);
@@ -837,14 +847,9 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const crossOutput = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${ids.productionEventId}/outputs/${holeA2Output.id}/measurements`)
       .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
     assert.equal(crossOutput.status, 404);
-    const siteAuditor = await seedUser('site-auditor@example.test', 'Fictional Site Auditor', {
-      roleCode: 'AUDITOR', scopeKind: 'SITE', scopeId: ids.siteId,
-    });
-    const siteAuditorToken = testToken(siteAuditor.userId);
-    ids.siteAuditorToken = siteAuditorToken;
-    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${siteAuditorToken}`)).status, 200);
+    assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}`).set('Authorization', `Bearer ${ids.siteAuditorToken}`)).status, 200);
     const auditorWrite = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events/${holeA2Event.id}/outputs/${holeA2Output.id}/measurements`)
-      .set('Authorization', `Bearer ${siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
+      .set('Authorization', `Bearer ${ids.siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(measurementInput);
     assert.equal(auditorWrite.status, 404);
     const unauthorizedProduction = await request(app).post(`/api/v1/sites/${ids.siteId}/production-events`)
       .set('Authorization', `Bearer ${holeA1Token}`).set('Idempotency-Key', randomUUID())
@@ -1232,6 +1237,22 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
   });
 
   await t.test('QR writes require lineage access; lookup stays authorized and revocation works', async () => {
+    const secondDoraUser = await seedUser('other-dora-operator@example.test', 'Fictional Other Dora Operator', {
+      roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraTwoId,
+    });
+    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
+      id: randomUUID(), userId: secondDoraUser.userId, holeId: ids.holeId,
+    });
+    ids.doraTwoOperatorUserId = secondDoraUser.userId;
+    ids.doraTwoToken = testToken(secondDoraUser.userId);
+    const secondDoraProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.doraTwoToken}`);
+    assert.equal(secondDoraProfile.status, 200, secondDoraProfile.text);
+    assert.ok(secondDoraProfile.body.roles.some((role) => role.role_code === 'DORA_OPERATOR' && role.scope_id === ids.doraTwoId));
+
+    const siteAuditorProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.siteAuditorToken}`);
+    assert.equal(siteAuditorProfile.status, 200, siteAuditorProfile.text);
+    assert.ok(siteAuditorProfile.body.roles.some((role) => role.role_code === 'AUDITOR' && role.scope_kind === 'SITE' && role.scope_id === ids.siteId));
+
     const processingQr = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
       .set('Authorization', `Bearer ${ids.doraToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(processingQr.status, 201, processingQr.text);
@@ -1245,19 +1266,10 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(resolved.body.material_batch_id, ids.processingOutputs[1].batchId);
     assert.equal(resolved.body.origins[0].processing_facility_id, ids.doraOneId);
 
-    const secondDoraUser = await seedUser('other-dora-operator@example.test', 'Fictional Other Dora Operator', {
-      roleCode: 'DORA_OPERATOR', scopeKind: 'FACILITY', scopeId: ids.doraTwoId,
-    });
-    await db(`INSERT INTO role_assignment(id,user_id,role_code,scope_kind,scope_id) VALUES (:id,:userId,'FIELD_OFFICER','HOLE',:holeId)`, {
-      id: randomUUID(), userId: secondDoraUser.userId, holeId: ids.holeId,
-    });
-    const secondDoraToken = testToken(secondDoraUser.userId);
-    ids.doraTwoOperatorUserId = secondDoraUser.userId;
-    ids.doraTwoToken = secondDoraToken;
     const deniedFacilityCreate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
-      .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
+      .set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({});
     const deniedFacilityRotate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr/rotate`)
-      .set('Authorization', `Bearer ${secondDoraToken}`).set('Idempotency-Key', randomUUID()).send({});
+      .set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({});
     assert.equal(deniedFacilityCreate.status, 404);
     assert.equal(deniedFacilityRotate.status, 404);
 
@@ -1717,10 +1729,18 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
 
     await phase.test('unrelated Dora and read-only auditor cannot create the consignment', async () => {
       const body = { recoveryFacilityId: ids.phaseThree.recoveryFacilityId, occurredAt: happenedAt, items: [{ sourceStockpileId: ids.phaseThree.stockpileTwo, batchId: ids.processingOutputs[1].batchId, quantityGrams: '0.500000' }] };
+      const unrelatedProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.doraTwoToken}`);
+      assert.equal(unrelatedProfile.status, 200, unrelatedProfile.text);
+      assert.ok(unrelatedProfile.body.roles.some((role) => role.role_code === 'DORA_OPERATOR' && role.scope_id === ids.doraTwoId));
+      const auditorProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.siteAuditorToken}`);
+      assert.equal(auditorProfile.status, 200, auditorProfile.text);
+      assert.ok(auditorProfile.body.roles.some((role) => role.role_code === 'AUDITOR' && role.scope_kind === 'SITE' && role.scope_id === ids.siteId));
       const unrelated = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send(body);
       const auditor = await request(app).post('/api/v1/consignments').set('Authorization', `Bearer ${ids.siteAuditorToken}`).set('Idempotency-Key', randomUUID()).send(body);
-      assert.equal(unrelated.status, 404);
-      assert.equal(auditor.status, 404);
+      assert.equal(unrelated.status, 404, unrelated.text);
+      assert.equal(unrelated.body.error.code, 'RESOURCE_NOT_FOUND');
+      assert.equal(auditor.status, 404, auditor.text);
+      assert.equal(auditor.body.error.code, 'RESOURCE_NOT_FOUND');
       assert.equal((await request(app).get(`/api/v1/consignments/${ids.phaseThree.consignmentId}`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`)).status, 404);
     });
 
@@ -2286,27 +2306,77 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     });
 
     await phase.test('operations registers apply live facility, hole, and participant-side authorization', async () => {
+      const doraProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(doraProfile.status, 200, doraProfile.text);
+      const activeDoraFacilityGrants = doraProfile.body.roles
+        .filter((role) => role.role_code === 'DORA_OPERATOR' && role.scope_kind === 'FACILITY')
+        .map((role) => role.scope_id).sort();
+      assert.deepEqual(activeDoraFacilityGrants, [ids.doraOneId, ids.doraTwoId].sort());
       const doras = await request(app).get('/api/v1/doras').set('Authorization', `Bearer ${ids.doraToken}`);
       assert.equal(doras.status, 200, doras.text);
-      assert.deepEqual(doras.body.map((row) => row.id), [ids.doraOneId]);
+      assert.deepEqual(doras.body.map((row) => row.id).sort(), activeDoraFacilityGrants);
       const destinations = await request(app).get(`/api/v1/doras/${ids.doraOneId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraToken}`);
       assert.equal(destinations.status, 200, destinations.text);
       assert.ok(destinations.body.some((row) => row.id === ids.phaseThree.recoveryFacilityId));
-      assert.equal((await request(app).get(`/api/v1/doras/${ids.doraTwoId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraToken}`)).status, 404);
+      const bothFacilityDestinations = await request(app).get(`/api/v1/doras/${ids.doraTwoId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraToken}`);
+      assert.equal(bothFacilityDestinations.status, 200, bothFacilityDestinations.text);
+      assert.deepEqual(bothFacilityDestinations.body.map((row) => row.id).sort(), destinations.body.map((row) => row.id).sort());
+      const secondDoraProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.doraTwoToken}`);
+      assert.equal(secondDoraProfile.status, 200, secondDoraProfile.text);
+      assert.deepEqual(secondDoraProfile.body.roles.filter((role) => role.role_code === 'DORA_OPERATOR' && role.scope_kind === 'FACILITY').map((role) => role.scope_id), [ids.doraTwoId]);
+      assert.equal((await request(app).get(`/api/v1/doras/${ids.doraOneId}/recovery-destinations`).set('Authorization', `Bearer ${ids.doraTwoToken}`)).status, 404);
       const processing = await request(app).get('/api/v1/processing-events').set('Authorization', `Bearer ${ids.doraToken}`);
       assert.equal(processing.status, 200, processing.text);
       assert.ok(processing.body.some((row) => row.id === ids.processingEventId));
       const sourceEvents = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${ids.doraToken}`);
       assert.equal(sourceEvents.status, 200, sourceEvents.text);
       assert.ok(sourceEvents.body.some((row) => row.id === ids.phase2ProductionEventId));
+      assert.ok(sourceEvents.body.some((row) => row.id === ids.productionEventId));
+      assert.ok(sourceEvents.body.every((row) => row.hole_id === ids.holeId));
+      const completeSiteEventList = await request(app).get(`/api/v1/sites/${ids.siteId}/production-events`).set('Authorization', `Bearer ${ids.siteToken}`);
+      assert.equal(completeSiteEventList.status, 200, completeSiteEventList.text);
+      assert.deepEqual(sourceEvents.body.map((row) => row.id).sort(), completeSiteEventList.body.filter((row) => row.hole_id === ids.holeId).map((row) => row.id).sort());
       assert.equal((await request(app).get('/api/v1/processing-events').set('Authorization', `Bearer ${ids.siteToken}`)).body.some((row) => row.id === ids.processingEventId), false);
 
       const facilities = await request(app).get('/api/v1/recovery-facilities').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(facilities.status, 200, facilities.text);
       assert.ok(facilities.body.some((row) => row.id === ids.phaseThree.recoveryFacilityId));
+      const recoveryProfile = await request(app).get('/api/v1/me').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(recoveryProfile.status, 200, recoveryProfile.text);
+      const recoveryOperatorGrants = recoveryProfile.body.roles.filter((role) => role.role_code === 'RECOVERY_FACILITY_OPERATOR');
+      assert.equal(recoveryOperatorGrants.length, 1);
+      assert.equal(recoveryOperatorGrants[0].scope_kind, 'FACILITY');
+      assert.equal(recoveryOperatorGrants[0].scope_id, ids.phaseThree.recoveryFacilityId);
+      const activeRecoveryAssignments = await db(
+        `SELECT role_code,scope_kind,scope_id FROM role_assignment
+         WHERE user_id=:userId AND status='ACTIVE' AND valid_from<=now() AND (valid_to IS NULL OR valid_to>now())
+         ORDER BY role_code,scope_kind,scope_id`,
+        { userId: ids.phaseThree.recoveryUserId }, undefined, QueryTypes.SELECT,
+      );
+      assert.deepEqual(activeRecoveryAssignments, [{
+        role_code: 'RECOVERY_FACILITY_OPERATOR', scope_kind: 'FACILITY', scope_id: ids.phaseThree.recoveryFacilityId,
+      }]);
+      assert.notEqual(ids.phaseThree.recoveryFacilityId, ids.phaseThree.otherRecoveryFacilityId);
+      const directFacilityRelationships = await db(
+        `SELECT recovery_facility_id,party_id,role_code FROM facility_party_role
+         WHERE recovery_facility_id IN (:facilityIds) AND party_id=:operatorPartyId AND status='ACTIVE'
+           AND valid_from<=now() AND (valid_to IS NULL OR valid_to>now())`,
+        { facilityIds: [ids.phaseThree.recoveryFacilityId, ids.phaseThree.otherRecoveryFacilityId], operatorPartyId: ids.phaseThree.recoveryPartyUserId },
+        undefined, QueryTypes.SELECT,
+      );
+      assert.deepEqual(directFacilityRelationships, []);
       const facility = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(facility.status, 200, facility.text);
       assert.ok(facility.body.locations.some((row) => row.id === ids.phaseThree.recoveryLocationId));
+      const unrelatedFacilityForOwnOperator = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(unrelatedFacilityForOwnOperator.status, 404, unrelatedFacilityForOwnOperator.text);
+      assert.equal(unrelatedFacilityForOwnOperator.body.error.code, 'RESOURCE_NOT_FOUND');
+      const unrelatedFacilityForItsOperator = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`);
+      assert.equal(unrelatedFacilityForItsOperator.status, 200, unrelatedFacilityForItsOperator.text);
+      assert.equal(unrelatedFacilityForItsOperator.body.id, ids.phaseThree.otherRecoveryFacilityId);
+      const ownFacilityForAuditor = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`);
+      assert.equal(ownFacilityForAuditor.status, 200, ownFacilityForAuditor.text);
+      assert.equal((await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`)).status, 404);
       const recoveryEvents = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(recoveryEvents.status, 200, recoveryEvents.text);
       assert.ok(recoveryEvents.body.some((row) => row.id === ids.phaseThree.recoveryEventId));
@@ -2330,6 +2400,8 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       assert.equal(revoked.status, 200, revoked.text);
       const stillToken = await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(stillToken.status, 404);
+      const revokedFacilityRead = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(revokedFacilityRead.status, 404, revokedFacilityRead.text);
       assert.equal((await request(app).get(`/api/v1/inventory/locations/${ids.phaseThree.recoveryLocationId}/balances`).set('Authorization', `Bearer ${ids.phaseThree.recoveryAuditorToken}`)).status, 200);
     });
   });
