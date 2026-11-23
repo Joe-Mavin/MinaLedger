@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
-import { apiRequest, type SiteReference } from '../api';
+import { ApiError, apiRequest, type SiteReference } from '../api';
 import {
   activeMeasurementStatus, actingPartyId, displayDate, gramsFromSource, readable, toDateTimeInput,
   type ActingRole, type GoldTrade, type GoldTradeLine, type GoldTradeMeasurement, type GoldAssay,
@@ -40,26 +40,26 @@ function canWriteProduction(role: ActingRole | null, siteId: string, holeId: str
   return role.scopeKind === 'ORGANISATION' && sites.some((site) => site.id === siteId);
 }
 
-function canWriteProcessing(role: ActingRole | null, allRoles: ActingRole[], event: ProcessingEvent, sites: SiteReference[]): boolean {
-  const facilityGrant = role?.roleCode === 'DORA_OPERATOR'
-    && (role.scopeKind === 'ORGANISATION' || (role.scopeKind === 'FACILITY' && role.scopeId === event.processing_facility_id));
+function canOfferProcessingMeasurement(allRoles: ActingRole[], event: ProcessingEvent): boolean {
+  const facilityGrant = allRoles.some((grant) => grant.roleCode === 'DORA_OPERATOR'
+    && (grant.scopeKind === 'ORGANISATION' || (grant.scopeKind === 'FACILITY' && grant.scopeId === event.processing_facility_id)));
   if (!facilityGrant) return false;
   const sourceSites = event.sourceSiteIds ?? [];
   const sourceHoles = event.sourceHoleIds ?? [];
   if (!sourceSites.length || !sourceHoles.length) return false;
-  const sourceSitesCovered = sourceSites.every((siteId) => allRoles.some((grant) => {
+  // The event API returns separate site and hole ID sets, not the source pairs
+  // or live organization relationships used by canAccessHole. Offer the action
+  // when the session contains a plausible source-write grant; the server checks
+  // facility access and every actual source hole when the command is submitted.
+  return allRoles.some((grant) => {
     if (!['FIELD_OFFICER', 'MINING_OPERATOR'].includes(grant.roleCode)) return false;
-    return (grant.scopeKind === 'PILOT' && grant.roleCode === 'FIELD_OFFICER' && grant.scopeId === 'default')
-      || (grant.scopeKind === 'SITE' && grant.scopeId === siteId)
-      || (grant.scopeKind === 'ORGANISATION' && sites.some((site) => site.id === siteId));
-  }));
-  const sourceHolesCovered = sourceHoles.every((holeId) => allRoles.some((grant) => {
-    if (!['FIELD_OFFICER', 'MINING_OPERATOR'].includes(grant.roleCode)) return false;
-    if (grant.scopeKind === 'HOLE') return grant.scopeId === holeId;
     if (grant.scopeKind === 'PILOT') return grant.roleCode === 'FIELD_OFFICER' && grant.scopeId === 'default';
-    return sourceSites.length === 1 && grant.scopeKind === 'SITE' && grant.scopeId === sourceSites[0];
-  }));
-  return sourceSitesCovered && sourceHolesCovered;
+    if (grant.scopeKind === 'SITE') return sourceSites.includes(grant.scopeId);
+    if (grant.scopeKind === 'HOLE') return sourceHoles.includes(grant.scopeId);
+    // Membership and active site_party_role / hole_party_role relationships
+    // are database facts not exposed to this client-side capability check.
+    return grant.scopeKind === 'ORGANISATION';
+  });
 }
 
 function measurementSummary(measurements: ProductionMeasurement[]): string {
@@ -204,7 +204,7 @@ export function MeasurementsWorkspace({ token, personPartyId, actingRole, roles,
     finally { setLoadingDetail(false); }
   };
 
-  const recordSourceMeasurement = async (event: FormEvent<HTMLFormElement>, path: string, refresh: () => Promise<unknown>) => {
+  const recordSourceMeasurement = async (event: FormEvent<HTMLFormElement>, path: string, refresh: () => Promise<unknown>, sourceKind: 'production' | 'processing' = 'production') => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const sourceValue = String(data.get('sourceValue'));
@@ -234,7 +234,12 @@ export function MeasurementsWorkspace({ token, personPartyId, actingRole, roles,
       onMessage('The server recorded the observation. Refreshing the authorized source detail to show its history.');
       await refresh();
       return true;
-    } catch (error) { onError(asError(error)); return false; }
+    } catch (error) {
+      if (sourceKind === 'processing' && error instanceof ApiError && [403, 404].includes(error.status)) {
+        onError(`The server denied this processing measurement. Current write access must cover the processing facility and every source hole. Server response: ${asError(error)}`);
+      } else onError(asError(error));
+      return false;
+    }
   };
 
   return (
@@ -283,14 +288,12 @@ export function MeasurementsWorkspace({ token, personPartyId, actingRole, roles,
           itemKind={item.kind}
           event={selectedProcessing}
           token={token}
-          sites={sites}
-          actingRole={actingRole}
           roles={roles}
           online={online}
           onRecord={(event) => recordSourceMeasurement(event, `/api/v1/processing-events/${selectedProcessing.id}/${item.kind === 'input' ? 'inputs' : 'outputs'}/${item.id}/measurements`, async () => {
             const detail = await apiRequest<ProcessingEvent>(`/api/v1/processing-events/${selectedProcessing.id}`, token);
             setSelectedProcessing({ ...selectedProcessing, ...detail });
-          })}
+          }, 'processing')}
         />)}
         <p className="notice info">The processing-detail API returns source and recorder IDs, method and timestamps, but not measurement evidence references. No assay is implied by a recorded weight.</p>
       </section>}
@@ -329,26 +332,24 @@ function partyMayBeRepresented(personPartyId: string, roles: ActingRole[], party
 }
 
 function ProcessingMeasurementCard({
-  item, itemKind, event, token, sites, actingRole, roles, online, onRecord,
+  item, itemKind, event, token, roles, online, onRecord,
 }: {
   item: ProcessingItem;
   itemKind: 'input' | 'output';
   event: ProcessingEvent;
   token: string;
-  sites: SiteReference[];
-  actingRole: ActingRole | null;
   roles: ActingRole[];
   online: boolean;
   onRecord: (event: FormEvent<HTMLFormElement>) => Promise<boolean>;
 }) {
-  const canWrite = canWriteProcessing(actingRole, roles, event, sites);
+  const canOfferMeasurement = canOfferProcessingMeasurement(roles, event);
   return <article className="overview-card">
     <h3>{readable(itemKind)} · {item.batch_code} · {readable(item.material_kind)}</h3>
     <p>Batch {item.batch_id} · measurement set {item.measurement_set_id}{item.source_event_id ? ` · source event ${item.source_event_id}` : ''}</p>
     <p>{measurementSummary(item.measurements)}</p>
     {item.measurements.map((measurement) => showMeasurement(measurement, item.measurements))}
-    {canWrite && <MeasurementForm contextLabel={item.batch_code} online={online} onSubmit={onRecord}><small>Every processing observation must remain linked to the selected input/output and its source-hole context.</small></MeasurementForm>}
-    {!canWrite && <p className="muted">Read-only for the selected role. Writing requires a DORA facility grant and write access to every source hole; the server checks both.</p>}
+    {canOfferMeasurement && <MeasurementForm contextLabel={item.batch_code} online={online} onSubmit={onRecord}><small>The server validates current write access to this facility and every source hole when you submit.</small></MeasurementForm>}
+    {!canOfferMeasurement && <p className="muted">Read-only unless the account has a DORA facility grant and a possible source-scope write grant; the server checks both against current access.</p>}
     {item.source_production_output_id && <SourceEventReference eventId={item.source_event_id} token={token} />}
   </article>;
 }
