@@ -11,6 +11,7 @@ import { RegistryWorkspace } from './registry/RegistryWorkspace';
 import { AccessAdministration, type RegisteredOrganization, type SessionAdminAccount } from './admin/AccessAdministration';
 import { ProductionWorkspace } from './production/ProductionWorkspace';
 import { OperationsWorkspace } from './operations/OperationsWorkspace';
+import { CommerceWorkspace } from './commerce/CommerceWorkspace';
 
 interface RoleGrant {
   roleCode: string;
@@ -742,6 +743,17 @@ export default function App() {
         {activeSection === 'operations' && token && <OperationsWorkspace
           token={token}
           selectedRole={selectedRole}
+          sites={sites}
+          online={online}
+        />}
+
+        {['measurements', 'gold-trades', 'payments'].includes(activeSection) && token && <CommerceWorkspace
+          section={activeSection as 'measurements' | 'gold-trades' | 'payments'}
+          token={token}
+          personPartyId={recorder.personPartyId}
+          userId={recorder.id}
+          actingRole={selectedRole}
+          roles={recorder.roles}
           sites={sites}
           online={online}
         />}

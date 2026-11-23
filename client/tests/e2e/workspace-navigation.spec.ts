@@ -22,14 +22,14 @@ const roleScopes: Record<string, { scope_kind: string; scope_id: string }> = {
 
 const expectedNavigation: Record<string, string[]> = {
   SYSTEM_ADMIN: ['Overview', 'Access administration', 'My command queue'],
-  FIELD_OFFICER: ['Overview', 'Material operations', 'Production', 'Registry', 'Field capture', 'My command queue', 'Audit evidence'],
-  MINING_OPERATOR: ['Overview', 'Material operations', 'Production', 'Registry', 'Field capture', 'My command queue', 'Audit evidence'],
-  MINER: ['Overview', 'Material operations', 'Field capture', 'My command queue', 'Audit evidence'],
-  DORA_OPERATOR: ['Overview', 'Material operations', 'Field capture', 'My command queue', 'Audit evidence'],
-  RECOVERY_FACILITY_OPERATOR: ['Overview', 'Material operations', 'Field capture', 'My command queue', 'Audit evidence'],
-  LOCAL_MERCHANT: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
-  LARGER_MERCHANT: ['Overview', 'Field capture', 'My command queue', 'Audit evidence'],
-  AUDITOR: ['Overview', 'Material operations', 'Production', 'Registry', 'My command queue', 'Audit evidence'],
+  FIELD_OFFICER: ['Overview', 'Material operations', 'Production', 'Registry', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  MINING_OPERATOR: ['Overview', 'Material operations', 'Production', 'Registry', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  MINER: ['Overview', 'Material operations', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  DORA_OPERATOR: ['Overview', 'Material operations', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  RECOVERY_FACILITY_OPERATOR: ['Overview', 'Material operations', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  LOCAL_MERCHANT: ['Overview', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  LARGER_MERCHANT: ['Overview', 'Field capture', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
+  AUDITOR: ['Overview', 'Material operations', 'Production', 'Registry', 'Measurements & assays', 'Gold trades', 'Payments', 'My command queue', 'Audit evidence'],
 };
 
 const rolesWithSiteRead: string[] = ['FIELD_OFFICER', 'MINING_OPERATOR', 'AUDITOR'];

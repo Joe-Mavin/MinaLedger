@@ -1,4 +1,4 @@
-export type WorkspaceSection = 'overview' | 'capture' | 'queue' | 'audit' | 'registry' | 'access' | 'production' | 'operations';
+export type WorkspaceSection = 'overview' | 'capture' | 'queue' | 'audit' | 'registry' | 'access' | 'production' | 'operations' | 'measurements' | 'gold-trades' | 'payments';
 
 export interface NavigationItem {
   id: WorkspaceSection;
@@ -54,6 +54,17 @@ const AUDIT_ROLES = new Set([
   'AUDITOR',
 ]);
 
+const COMMERCE_ROLES = new Set([
+  'FIELD_OFFICER',
+  'MINING_OPERATOR',
+  'MINER',
+  'DORA_OPERATOR',
+  'RECOVERY_FACILITY_OPERATOR',
+  'LOCAL_MERCHANT',
+  'LARGER_MERCHANT',
+  'AUDITOR',
+]);
+
 export function getNavigationItems(roleCode: string | undefined, scopeKind?: string, scopeId?: string): NavigationItem[] {
   const items = [...BASE_NAVIGATION];
   if (roleCode === 'SYSTEM_ADMIN' && scopeKind === 'GLOBAL' && scopeId === 'global') {
@@ -70,6 +81,15 @@ export function getNavigationItems(roleCode: string | undefined, scopeKind?: str
   }
   if (roleCode && scopeKind && OPERATIONS_SCOPES[roleCode]?.includes(scopeKind)) {
     items.splice(1, 0, { id: 'operations', label: 'Material operations', description: 'Inspect Dora processing, residue inventory, consignments, custody and recovery.' });
+  }
+  if (roleCode && COMMERCE_ROLES.has(roleCode)) {
+    const queueIndex = items.findIndex((item) => item.id === 'queue');
+    const commerceItems: NavigationItem[] = [
+      { id: 'measurements', label: 'Measurements & assays', description: 'Review measurements against their source and record supported observations.' },
+      { id: 'gold-trades', label: 'Gold trades', description: 'Review or propose party-authorized gold trades and bilateral terms.' },
+      { id: 'payments', label: 'Payments', description: 'Review payment reports and counterparty decisions for gold trades.' },
+    ];
+    items.splice(queueIndex < 0 ? items.length : queueIndex, 0, ...commerceItems);
   }
   if (roleCode && AUDIT_ROLES.has(roleCode)) {
     items.push({ id: 'audit', label: 'Audit evidence', description: 'Create and verify checkpoints for authorized streams.' });
