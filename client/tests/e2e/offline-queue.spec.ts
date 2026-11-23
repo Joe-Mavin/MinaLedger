@@ -73,11 +73,12 @@ test('session token stays tab-scoped and offline commands survive reload with th
     }
     return route.fulfill({ status: 404, json: { error: { message: 'Not found' } } });
   });
-  await page.route((url) => url.pathname === '/api/v1/material-batches' && url.searchParams.has('query'), (route) => route.fulfill({ json: [
+  await page.route((url) => url.pathname === '/api/v1/material-batches' && url.searchParams.has('query'), (route) => route.fulfill({ json: { results: [
     { id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED', qr_status: null },
-  ] }));
+  ], complete: true } }));
   await page.route(`**/api/v1/material-batches/${offlineBatchId}/traceability`, (route) => route.fulfill({ json: {
     batch: { id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED' }, qr: null,
+    origins: [],
     relatedBatches: [{ id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED' }],
     productionEvents: [], processingEvents: [], inventoryMovements: [], consignments: [], recoveryEvents: [], residueSales: [], goldTrades: [],
     limitations: { pooledAttribution: 'Pooled recovery outputs remain aggregate.', tradeLookup: 'Trades require party access.' },

@@ -707,7 +707,7 @@ export default function App() {
         {activeSection === 'traceability' && token && <TraceabilityWorkspace
           token={token}
           roles={recorder.roles}
-          actingRoleCode={selectedRole?.roleCode ?? ''}
+          actingRole={selectedRole}
           online={online}
           initialBatchId={traceBatchId}
         />}

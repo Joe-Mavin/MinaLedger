@@ -8,7 +8,7 @@ import { executeIdempotent } from '../commands/idempotency.service.mjs';
 
 const tokenHash = (token) => createHash('sha256').update(token, 'utf8').digest();
 
-async function batchOrigins(batchId) {
+export async function getBatchOrigins(batchId) {
   return sequelize.query(
     `
      SELECT DISTINCT h.site_id,h.id AS hole_id,NULL::uuid AS processing_facility_id,NULL::uuid AS recovery_facility_id
@@ -38,7 +38,7 @@ async function batchOrigins(batchId) {
 }
 
 export async function canAccessBatch(auth, batchId, { write = false } = {}) {
-  const origins = await batchOrigins(batchId);
+  const origins = await getBatchOrigins(batchId);
   if (!origins.length) return false;
   for (const origin of origins) {
     if (origin.site_id && !(await canAccessHole(auth, origin.site_id, origin.hole_id, { write }))) return false;
@@ -108,6 +108,6 @@ export async function lookupQr(token, auth) {
   if (!record || !(await canAccessBatch(auth, record.material_batch_id))) {
     throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested resource was not found.');
   }
-  const origins = await batchOrigins(record.material_batch_id);
+  const origins = await getBatchOrigins(record.material_batch_id);
   return { ...record, origins };
 }

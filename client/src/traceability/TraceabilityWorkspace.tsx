@@ -5,9 +5,12 @@ import { WorkspaceHeading } from '../AppShell';
 interface RoleGrant { roleCode: string; scopeKind: string; scopeId: string }
 interface MaterialBatch { id: string; batch_code: string; material_kind: string; current_status: string; created_at?: string }
 interface BatchResult extends MaterialBatch { qr_status?: string | null }
+interface BatchSearchResponse { results: BatchResult[]; complete: boolean }
+interface BatchOrigin { site_id: string | null; hole_id: string | null; processing_facility_id: string | null; recovery_facility_id: string | null }
 type RecordRow = Record<string, unknown>;
 interface TraceabilityData {
   batch: MaterialBatch;
+  origins: BatchOrigin[];
   qr: { id: string; status: string; rotatedFromId: string | null; createdAt: string } | null;
   relatedBatches: MaterialBatch[];
   productionEvents: RecordRow[];
@@ -45,8 +48,58 @@ const GROUPS: Array<{ key: keyof Pick<TraceabilityData, 'productionEvents' | 'pr
   { key: 'goldTrades', title: 'Authorized gold trades and payment records', empty: 'No trade available to this account is linked to this batch.' },
 ];
 
-export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, initialBatchId = '' }: {
-  token: string; roles: RoleGrant[]; actingRoleCode: string; online: boolean; initialBatchId?: string;
+const QR_WRITE_ROLES = new Set(['FIELD_OFFICER', 'MINING_OPERATOR', 'DORA_OPERATOR', 'RECOVERY_FACILITY_OPERATOR']);
+
+function holeScopeMatches(role: RoleGrant, origin: BatchOrigin): boolean {
+  if (!origin.site_id || !origin.hole_id) return false;
+  if (role.roleCode === 'FIELD_OFFICER' && role.scopeKind === 'PILOT' && role.scopeId === 'default') return true;
+  if (role.scopeKind === 'SITE') return role.scopeId === origin.site_id;
+  if (role.scopeKind === 'HOLE') return role.scopeId === origin.hole_id;
+  return role.scopeKind === 'ORGANISATION' && Boolean(role.scopeId);
+}
+
+function processingFacilityScopeMatches(role: RoleGrant, origin: BatchOrigin): boolean {
+  if (!origin.processing_facility_id) return false;
+  if (role.scopeKind === 'FACILITY') return role.scopeId === origin.processing_facility_id;
+  return role.scopeKind === 'ORGANISATION' && Boolean(role.scopeId);
+}
+
+function recoveryFacilityScopeMatches(role: RoleGrant, origin: BatchOrigin): boolean {
+  if (!origin.recovery_facility_id) return false;
+  if (role.scopeKind === 'FACILITY') return role.scopeId === origin.recovery_facility_id;
+  return role.scopeKind === 'ORGANISATION' && Boolean(role.scopeId);
+}
+
+function canManageQrForBatch(actingRole: RoleGrant | null, roles: RoleGrant[], origins: BatchOrigin[]): boolean {
+  if (!actingRole || !QR_WRITE_ROLES.has(actingRole.roleCode) || origins.length === 0) return false;
+
+  const recoveryOrigins = origins.filter((origin) => origin.recovery_facility_id);
+  if (recoveryOrigins.length > 0) {
+    return actingRole.roleCode === 'RECOVERY_FACILITY_OPERATOR'
+      && recoveryOrigins.every((origin) => recoveryFacilityScopeMatches(actingRole, origin));
+  }
+
+  const processingOrigins = origins.filter((origin) => origin.processing_facility_id);
+  if (processingOrigins.length > 0) {
+    return processingOrigins.every((origin) => {
+      const hasSourceHoleScope = roles.some((role) =>
+        ['FIELD_OFFICER', 'MINING_OPERATOR'].includes(role.roleCode) && holeScopeMatches(role, origin));
+      if (!hasSourceHoleScope) return false;
+      if (actingRole.roleCode === 'DORA_OPERATOR') return processingFacilityScopeMatches(actingRole, origin);
+      if (!['FIELD_OFFICER', 'MINING_OPERATOR'].includes(actingRole.roleCode) || !holeScopeMatches(actingRole, origin)) return false;
+      return roles.some((role) => role.roleCode === 'DORA_OPERATOR' && processingFacilityScopeMatches(role, origin));
+    });
+  }
+
+  const productionOrigins = origins.filter((origin) => origin.site_id && origin.hole_id);
+  return productionOrigins.length > 0
+    && productionOrigins.length === origins.length
+    && ['FIELD_OFFICER', 'MINING_OPERATOR'].includes(actingRole.roleCode)
+    && productionOrigins.every((origin) => holeScopeMatches(actingRole, origin));
+}
+
+export function TraceabilityWorkspace({ token, roles, actingRole, online, initialBatchId = '' }: {
+  token: string; roles: RoleGrant[]; actingRole: RoleGrant | null; online: boolean; initialBatchId?: string;
 }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<BatchResult[]>([]);
@@ -54,6 +107,7 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
   const [qrToken, setQrToken] = useState('');
   const [resolvedQr, setResolvedQr] = useState<QrRecord | null>(null);
   const [issuedToken, setIssuedToken] = useState('');
+  const [searchIncomplete, setSearchIncomplete] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -72,13 +126,14 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
   const search = useCallback(async (value: string, openExactMatch = false) => {
     const clean = value.trim();
     if (clean.length < 2) { setError('Enter at least two characters or a known batch UUID.'); return; }
-    setBusy(true); setError(''); setTrace(null); setResults([]); setIssuedToken(''); setResolvedQr(null);
+    setBusy(true); setError(''); setTrace(null); setResults([]); setIssuedToken(''); setResolvedQr(null); setSearchIncomplete(false);
     try {
-      const rows = await apiRequest<BatchResult[]>(`/api/v1/material-batches?query=${encodeURIComponent(clean)}`, token);
-      setResults(rows);
-      if (!rows.length) setError('No accessible material batches matched this search.');
+      const response = await apiRequest<BatchSearchResponse>(`/api/v1/material-batches?query=${encodeURIComponent(clean)}`, token);
+      setResults(response.results);
+      setSearchIncomplete(!response.complete);
+      if (!response.results.length && response.complete) setError('No accessible material batches matched this search.');
       if (openExactMatch) {
-        const exact = rows.find((batch) => batch.id.toLowerCase() === clean.toLowerCase());
+        const exact = response.results.find((batch) => batch.id.toLowerCase() === clean.toLowerCase());
         if (exact) await openTrace(exact.id);
       }
     } catch (searchError) { setError(searchError instanceof Error ? searchError.message : 'Batch search failed.'); }
@@ -98,7 +153,11 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
       setIssuedToken(result.payload);
       await openTrace(trace.batch.id);
     } catch (writeError) {
-      setError(writeError instanceof Error ? writeError.message : 'QR identity change was rejected by the server.');
+      if (writeError instanceof ApiError && (writeError.status === 403 || writeError.status === 404)) {
+        setError(`The server denied this QR action (HTTP ${writeError.status}): ${writeError.message}`);
+      } else if (writeError instanceof ApiError) {
+        setError(`QR action failed (HTTP ${writeError.status}): ${writeError.message}`);
+      } else setError(writeError instanceof Error ? writeError.message : 'QR identity change was rejected by the server.');
     } finally { setBusy(false); }
   };
 
@@ -112,7 +171,7 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
     finally { setBusy(false); }
   };
 
-  const canManageQr = actingRoleCode !== 'AUDITOR' && roles.length > 0;
+  const canManageQr = trace ? canManageQrForBatch(actingRole, roles, trace.origins) : false;
 
   return <>
     <WorkspaceHeading eyebrow="SOURCE-LINKED GOLD RECORDS" title="Traceability" description="Find an authorized batch, resolve its authenticated QR identity and follow records that exist in its source lineage." />
@@ -124,6 +183,7 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
         <label>Batch code or UUID<input aria-label="Batch code or UUID" value={query} onChange={(event) => setQuery(event.target.value)} minLength={2} maxLength={80} /></label>
         <button className="primary" type="submit" disabled={!online || busy || query.trim().length < 2}>{busy ? 'Searching...' : 'Find batch'}</button>
       </form>
+      {searchIncomplete && <p className="notice warning" role="status">This search may be incomplete. Refine the query for a narrower search; only batches authorized for this account are shown.</p>}
       {results.length > 0 && <div className="queue-list">{results.map((batch) => <article className="queue-item" key={batch.id}>
         <div className="queue-main"><div className="queue-title"><strong>{batch.batch_code}</strong><span className="state-pill">{batch.current_status}</span></div><p className="queue-meta">{batch.material_kind} · QR {batch.qr_status ?? 'not created'} · {batch.id}</p></div>
         <div className="queue-actions"><button className="small-button" type="button" onClick={() => void openTrace(batch.id)} disabled={!online || busy}>Open trace</button></div>
@@ -151,7 +211,7 @@ export function TraceabilityWorkspace({ token, roles, actingRoleCode, online, in
           {!trace.qr && <button className="primary" type="button" onClick={() => void mutateQr(false)} disabled={!online || busy}>Create QR identity</button>}
           {trace.qr?.status === 'ACTIVE' && <button className="secondary" type="button" onClick={() => void mutateQr(true)} disabled={!online || busy}>Rotate QR identity</button>}
         </div>}
-        {actingRoleCode === 'AUDITOR' && <p className="muted">QR creation and rotation are hidden in the read-only auditor workspace.</p>}
+        {actingRole?.roleCode === 'AUDITOR' && <p className="muted">QR creation and rotation are hidden in the read-only auditor workspace.</p>}
         {issuedToken && <div className="notice success" role="status"><strong>New active QR token</strong><p>This token is shown once by this response. Store or print it through the approved field process.</p><code className="qr-token">{issuedToken}</code></div>}
       </section>
       <section className="queue-section" aria-labelledby="trace-lineage-heading">

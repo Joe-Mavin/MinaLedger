@@ -4,7 +4,7 @@ import { AppError } from '../../utils/errors.mjs';
 import { listSites } from '../mining-sites/site.service.mjs';
 import { listAccessibleProductionEvents, getProductionEvent } from '../production/production.service.mjs';
 import { listAccessibleProcessingEvents, getProcessingEvent } from '../processing/processing.service.mjs';
-import { canAccessBatch } from '../qr/qr.service.mjs';
+import { canAccessBatch, getBatchOrigins } from '../qr/qr.service.mjs';
 import {
   listAccessibleConsignments, readConsignment, listAccessibleRecoveryFacilities,
   listAccessibleRecoveryEvents, readRecoveryEvent, listInventoryMovements,
@@ -19,17 +19,37 @@ function isHiddenResource(error) {
 }
 
 export async function searchAccessibleMaterialBatches(search, auth) {
-  const rows = await query(`SELECT b.id,b.batch_code,b.material_kind,b.current_status,
-      (SELECT q.status FROM qr_record q WHERE q.material_batch_id=b.id ORDER BY q.created_at DESC,q.id DESC LIMIT 1) AS qr_status
-    FROM material_batch b
-    WHERE b.batch_code ILIKE :pattern OR b.id::text=:search
-    ORDER BY b.batch_code,b.id LIMIT 250`, { pattern: `%${search}%`, search });
   const visible = [];
-  for (const batch of rows) {
-    if (await canAccessBatch(auth, batch.id)) visible.push(batch);
+  const pageSize = 100;
+  const maxCandidates = 1000;
+  let scanned = 0;
+  let cursor = null;
+  let complete = false;
+
+  while (scanned < maxCandidates && visible.length < 50) {
+    const remaining = Math.min(pageSize, maxCandidates - scanned);
+    const cursorClause = cursor ? 'AND (b.batch_code,b.id) > (:cursorCode,CAST(:cursorId AS uuid))' : '';
+    const rows = await query(`SELECT b.id,b.batch_code,b.material_kind,b.current_status,
+        (SELECT q.status FROM qr_record q WHERE q.material_batch_id=b.id ORDER BY q.created_at DESC,q.id DESC LIMIT 1) AS qr_status
+      FROM material_batch b
+      WHERE (b.batch_code ILIKE :pattern OR b.id::text=:search) ${cursorClause}
+      ORDER BY b.batch_code,b.id LIMIT :pageSize`, {
+      pattern: `%${search}%`, search, pageSize: remaining,
+      ...(cursor ? { cursorCode: cursor.batch_code, cursorId: cursor.id } : {}),
+    });
+    if (rows.length === 0) { complete = true; break; }
+
+    for (const batch of rows) {
+      scanned += 1;
+      cursor = batch;
+      if (await canAccessBatch(auth, batch.id)) visible.push(batch);
+      if (visible.length === 50) break;
+    }
+
     if (visible.length === 50) break;
+    if (rows.length < remaining) { complete = true; break; }
   }
-  return visible;
+  return { results: visible, complete };
 }
 
 async function connectedBatchIds(batchId) {
@@ -62,6 +82,7 @@ export async function getMaterialBatchTraceability(batchId, auth) {
   if (!batch) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested material batch was not found.');
   const [qr] = await query(`SELECT id,status,rotated_from_id,created_at FROM qr_record
     WHERE material_batch_id=:batchId ORDER BY created_at DESC,id DESC LIMIT 1`, { batchId });
+  const origins = await getBatchOrigins(batchId);
   const candidates = await connectedBatchIds(batchId);
   const visibleBatchIds = [];
   for (const id of candidates) if (await canAccessBatch(auth, id)) visibleBatchIds.push(id);
@@ -149,6 +170,7 @@ export async function getMaterialBatchTraceability(batchId, auth) {
   const relatedBatches = await query(`SELECT id,batch_code,material_kind,current_status FROM material_batch WHERE id IN (:batchIds) ORDER BY created_at,id`, { batchIds: visibleBatchIds });
   return {
     batch,
+    origins,
     qr: qr ? { id: qr.id, status: qr.status, rotatedFromId: qr.rotated_from_id, createdAt: qr.created_at } : null,
     relatedBatches,
     productionEvents,

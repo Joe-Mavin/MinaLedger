@@ -1285,7 +1285,8 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const sourceSearch = await request(app).get(`/api/v1/material-batches?query=${encodeURIComponent(sourceBatch.batch_code)}`)
       .set('Authorization', `Bearer ${ids.siteToken}`);
     assert.equal(sourceSearch.status, 200, sourceSearch.text);
-    assert.ok(sourceSearch.body.some((row) => row.id === sourceBatchId && row.batch_code === sourceBatch.batch_code));
+    assert.equal(sourceSearch.body.complete, true);
+    assert.ok(sourceSearch.body.results.some((row) => row.id === sourceBatchId && row.batch_code === sourceBatch.batch_code));
     const sourceTrace = await request(app).get(`/api/v1/material-batches/${sourceBatchId}/traceability`)
       .set('Authorization', `Bearer ${ids.siteToken}`);
     assert.equal(sourceTrace.status, 200, sourceTrace.text);
@@ -1296,6 +1297,75 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(processingTrace.status, 200, processingTrace.text);
     assert.ok(processingTrace.body.processingEvents.some((event) => event.id === ids.processingEventId));
     assert.ok(processingTrace.body.productionEvents.some((event) => event.id === ids.phase2ProductionEventId), 'hole-scoped production source remains visible through its authorized record service');
+
+    const otherSiteUser = await seedUser('batch-search-other-site@example.test', 'Fictional Batch Search Other-Site Operator', {
+      roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId,
+    });
+    const otherSiteToken = testToken(otherSiteUser.userId);
+    const fixtureEvent = await request(app).post(`/api/v1/sites/${ids.siteBId}/production-events`)
+      .set('Authorization', `Bearer ${otherSiteToken}`).set('Idempotency-Key', randomUUID()).send({
+        holeId: ids.holeB1Id, occurredAt: happenedAt, outputs: [{ materialKind: 'GOLD_BEARING_FEED' }],
+      });
+    assert.equal(fixtureEvent.status, 201, fixtureEvent.text);
+    const hiddenBatchIds = [];
+    const hiddenBatchCodes = [];
+    const hiddenOutputIds = [];
+    const hiddenMeasurementSetIds = [];
+    const hiddenBatchReplacements = {};
+    const hiddenOutputReplacements = { eventId: fixtureEvent.body.id };
+    const hiddenLinkReplacements = { eventId: fixtureEvent.body.id };
+    const hiddenSetReplacements = {};
+    const sourceBatchNumber = BigInt(`0x${sourceBatchId.replaceAll('-', '')}`);
+    assert.ok(sourceBatchNumber > 275n);
+    const batchValues = [];
+    const outputValues = [];
+    const linkValues = [];
+    const setValues = [];
+    for (let index = 0; index < 275; index += 1) {
+      const rawId = (sourceBatchNumber - BigInt(index + 1)).toString(16).padStart(32, '0');
+      const hiddenId = `${rawId.slice(0, 8)}-${rawId.slice(8, 12)}-${rawId.slice(12, 16)}-${rawId.slice(16, 20)}-${rawId.slice(20)}`;
+      const hiddenCode = `BATCH-${hiddenId}`;
+      const outputId = randomUUID();
+      const measurementSetId = randomUUID();
+      hiddenBatchIds.push(hiddenId);
+      hiddenBatchCodes.push(hiddenCode);
+      hiddenOutputIds.push(outputId);
+      hiddenMeasurementSetIds.push(measurementSetId);
+      hiddenBatchReplacements[`batchId${index}`] = hiddenId;
+      hiddenBatchReplacements[`batchCode${index}`] = hiddenCode;
+      hiddenOutputReplacements[`outputId${index}`] = outputId;
+      hiddenOutputReplacements[`batchId${index}`] = hiddenId;
+      hiddenOutputReplacements[`sequence${index}`] = index + 2;
+      hiddenLinkReplacements[`outputId${index}`] = outputId;
+      hiddenSetReplacements[`setId${index}`] = measurementSetId;
+      hiddenSetReplacements[`batchId${index}`] = hiddenId;
+      hiddenSetReplacements[`outputId${index}`] = outputId;
+      batchValues.push(`(:batchId${index},:batchCode${index},'GOLD_BEARING_FEED','ACTIVE')`);
+      outputValues.push(`(:outputId${index},:eventId,:batchId${index},:sequence${index},'GOLD_BEARING_FEED')`);
+      linkValues.push(`(:outputId${index},:eventId)`);
+      setValues.push(`(:setId${index},:batchId${index},:outputId${index})`);
+    }
+    const collisions = await db(`SELECT id FROM material_batch WHERE id IN (:batchIds) OR batch_code IN (:batchCodes)`,
+      { batchIds: hiddenBatchIds, batchCodes: hiddenBatchCodes }, undefined, QueryTypes.SELECT);
+    assert.equal(collisions.length, 0, 'deterministic lower UUID fixtures do not collide with existing batches');
+    await sequelize.transaction(async (transaction) => {
+      await db(`INSERT INTO material_batch(id,batch_code,material_kind,current_status) VALUES ${batchValues.join(',')}`, hiddenBatchReplacements, transaction);
+      await db(`INSERT INTO material_event_output(id,event_id,batch_id,output_sequence,output_kind) VALUES ${outputValues.join(',')}`, hiddenOutputReplacements, transaction);
+      await db(`INSERT INTO production_event_output(material_event_output_id,production_event_id) VALUES ${linkValues.join(',')}`, hiddenLinkReplacements, transaction);
+      await db(`INSERT INTO material_measurement_set(id,batch_id,material_event_output_id) VALUES ${setValues.join(',')}`, hiddenSetReplacements, transaction);
+      await appendAuditEvent({
+        transaction, eventType: 'PRODUCTION.TEST_SEARCH_FIXTURES_ADDED', actorUserId: otherSiteUser.userId,
+        actorPartyId: otherSiteUser.partyId, occurredAt: new Date(happenedAt), clientMutationId: randomUUID(),
+        payload: { production_event_id: fixtureEvent.body.id, test_fixture_output_ids: hiddenOutputIds, output_count: hiddenOutputIds.length },
+        streams: [{ kind: 'material_event', id: fixtureEvent.body.id }, { kind: 'mining_hole', id: ids.holeB1Id }, ...hiddenBatchIds.map((id) => ({ kind: 'material_batch', id }))],
+      });
+    });
+    const completeSearch = await request(app).get('/api/v1/material-batches?query=BATCH-')
+      .set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(completeSearch.status, 200, completeSearch.text);
+    assert.equal(completeSearch.body.complete, true, 'all bounded matching candidates were scanned');
+    assert.ok(completeSearch.body.results.some((row) => row.id === sourceBatchId && row.batch_code === sourceBatch.batch_code), 'accessible match after more than 250 inaccessible candidates is returned');
+    assert.equal(completeSearch.body.results.some((row) => hiddenBatchIds.includes(row.id)), false, 'inaccessible batches are not returned');
 
     const siteOperator = await seedUser('site-mining-operator@example.test', 'Fictional Site Mining Operator', {
       roleCode: 'MINING_OPERATOR', scopeKind: 'SITE', scopeId: ids.siteId,
@@ -1333,14 +1403,12 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(crossHoleCreate.status, 404);
     assert.equal(crossHoleRotate.status, 404);
 
-    const otherSiteUser = await seedUser('other-site-qr-operator@example.test', 'Fictional Other Site Operator', {
-      roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId,
-    });
-    const otherSiteToken = testToken(otherSiteUser.userId);
     const unrelatedSearch = await request(app).get(`/api/v1/material-batches?query=${encodeURIComponent(sourceBatch.batch_code)}`)
       .set('Authorization', `Bearer ${otherSiteToken}`);
     assert.equal(unrelatedSearch.status, 200, unrelatedSearch.text);
-    assert.deepEqual(unrelatedSearch.body, []);
+    assert.equal(unrelatedSearch.body.complete, true);
+    assert.deepEqual(unrelatedSearch.body.results, []);
+    assert.equal(unrelatedSearch.body.results.some((row) => hiddenBatchIds.includes(row.id)), false);
     const unrelatedTrace = await request(app).get(`/api/v1/material-batches/${sourceBatchId}/traceability`)
       .set('Authorization', `Bearer ${otherSiteToken}`);
     assert.equal(unrelatedTrace.status, 404, unrelatedTrace.text);
