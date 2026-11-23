@@ -28,7 +28,11 @@ const schema = z.object({
 const result = schema.safeParse(process.env);
 if (!result.success) {
   const fields = result.error.issues.map((issue) => issue.path.join('.')).join(', ');
-  throw new Error(`Invalid environment configuration: ${fields}`);
+  const needsDatabaseUrl = result.error.issues.some((issue) => issue.path[0] === 'DATABASE_URL');
+  const databaseHint = needsDatabaseUrl
+    ? ' DATABASE_URL is required by the API; TEST_DATABASE_URL is only used by npm test. Copy server/.env.example to server/.env and set DATABASE_URL to the application database.'
+    : '';
+  throw new Error(`Invalid environment configuration: ${fields}.${databaseHint}`);
 }
 
 export const env = Object.freeze({

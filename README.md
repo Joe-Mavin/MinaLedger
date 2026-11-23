@@ -42,7 +42,7 @@ Prerequisites: Node.js 24 LTS for a current development setup and PostgreSQL 14 
    Copy-Item .env.example .env
    ```
 
-3. Edit `server/.env` and set `DATABASE_URL` and `JWT_SECRET`. Use a random secret of at least 32 characters. URL-encode reserved characters in the database password.
+3. Edit `server/.env` and set `DATABASE_URL` and `JWT_SECRET`. Use a random secret of at least 32 characters. URL-encode reserved characters in the database password. The API reads `DATABASE_URL`; `TEST_DATABASE_URL` is only for `npm test`, whose integration suite recreates the test database's `public` schema. Keep the application and `_test` databases separate.
 
 4. Apply the reviewed SQL migration and create the first administrator account. Bootstrap credentials are read only from environment variables and are not written to logs.
 
