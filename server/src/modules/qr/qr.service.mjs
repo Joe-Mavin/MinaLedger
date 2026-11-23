@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { QueryTypes } from 'sequelize';
 import { sequelize } from '../../database/connection.mjs';
 import { AppError } from '../../utils/errors.mjs';
-import { canAccessHole, canAccessProcessingFacility } from '../../middleware/auth.mjs';
+import { canAccessHole, canAccessProcessingFacility, canAccessRecoveryFacility } from '../../middleware/auth.mjs';
 import { appendAuditEvent } from '../audit/audit.service.mjs';
 import { executeIdempotent } from '../commands/idempotency.service.mjs';
 
@@ -10,23 +10,29 @@ const tokenHash = (token) => createHash('sha256').update(token, 'utf8').digest()
 
 async function batchOrigins(batchId) {
   return sequelize.query(
-    `WITH RECURSIVE batch_origins(batch_id,site_id,hole_id,processing_facility_id,depth) AS (
-       SELECT eo.batch_id, h.site_id, h.id, NULL::uuid, 0
-       FROM production_event_output peo
-       JOIN material_event_output eo ON eo.id=peo.material_event_output_id
-       JOIN production_event pe ON pe.event_id=peo.production_event_id
-       JOIN mining_hole h ON h.id=pe.hole_id
-       UNION
-       SELECT output_eo.batch_id, origin.site_id, origin.hole_id, pe.processing_facility_id, origin.depth+1
-       FROM processing_event_output peo
-       JOIN material_event_output output_eo ON output_eo.id=peo.material_event_output_id
-       JOIN processing_event pe ON pe.event_id=peo.processing_event_id
-       JOIN processing_event_input pei ON pei.processing_event_id=pe.event_id
-       JOIN material_event_input mei ON mei.id=pei.material_event_input_id
-       JOIN batch_origins origin ON origin.batch_id=mei.batch_id
-       WHERE origin.depth < 16
-     )
-     SELECT DISTINCT site_id,hole_id,processing_facility_id FROM batch_origins WHERE batch_id=:batchId`,
+    `
+     SELECT DISTINCT h.site_id,h.id AS hole_id,NULL::uuid AS processing_facility_id,NULL::uuid AS recovery_facility_id
+     FROM material_event_output eo
+     JOIN production_event_output peo ON peo.material_event_output_id=eo.id
+     JOIN production_event pe ON pe.event_id=peo.production_event_id
+     JOIN mining_hole h ON h.id=pe.hole_id
+     WHERE eo.batch_id=:batchId
+     UNION
+     SELECT DISTINCT source_hole.site_id,source_hole.id,pe.processing_facility_id,NULL::uuid
+     FROM material_event_output eo
+     JOIN processing_event_output peo ON peo.material_event_output_id=eo.id
+     JOIN processing_event pe ON pe.event_id=peo.processing_event_id
+     JOIN processing_event_input pei ON pei.processing_event_id=pe.event_id
+     JOIN production_event_output source_output ON source_output.material_event_output_id=pei.source_production_output_id
+     JOIN production_event source_event ON source_event.event_id=source_output.production_event_id
+     JOIN mining_hole source_hole ON source_hole.id=source_event.hole_id
+     WHERE eo.batch_id=:batchId
+     UNION
+     SELECT DISTINCT NULL::uuid,NULL::uuid,NULL::uuid,re.recovery_facility_id
+     FROM material_event_output eo
+     JOIN recovery_event_output reo ON reo.material_event_output_id=eo.id
+     JOIN recovery_event re ON re.event_id=reo.recovery_event_id
+     WHERE eo.batch_id=:batchId`,
     { replacements: { batchId }, type: QueryTypes.SELECT },
   );
 }
@@ -35,8 +41,9 @@ export async function canAccessBatch(auth, batchId, { write = false } = {}) {
   const origins = await batchOrigins(batchId);
   if (!origins.length) return false;
   for (const origin of origins) {
-    if (!(await canAccessHole(auth, origin.site_id, origin.hole_id, { write }))) return false;
+    if (origin.site_id && !(await canAccessHole(auth, origin.site_id, origin.hole_id, { write }))) return false;
     if (origin.processing_facility_id && !(await canAccessProcessingFacility(auth, origin.processing_facility_id, { write }))) return false;
+    if (origin.recovery_facility_id && !(await canAccessRecoveryFacility(auth, origin.recovery_facility_id, { write }))) return false;
   }
   return true;
 }

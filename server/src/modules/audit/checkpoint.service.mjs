@@ -183,6 +183,64 @@ async function requireStreamAccess(auth, stream) {
   if (!allowed) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested audit stream was not found.');
 }
 
+async function streamAccessAllowed(auth, stream) {
+  try {
+    await requireStreamAccess(auth, stream);
+    return true;
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'RESOURCE_NOT_FOUND') return false;
+    throw error;
+  }
+}
+
+export async function listAccessibleAuditStreams(auth) {
+  const streams = await query(`SELECT stream_kind,stream_id,last_sequence,encode(head_hash,'hex') AS head_hash,updated_at
+    FROM audit_stream_head ORDER BY updated_at DESC,stream_kind,stream_id`);
+  const visible = [];
+  for (const stream of streams) {
+    if (await streamAccessAllowed(auth, stream)) visible.push({
+      streamKind: stream.stream_kind,
+      streamId: stream.stream_id,
+      sequence: Number(stream.last_sequence),
+      headHash: stream.head_hash,
+      updatedAt: stream.updated_at,
+    });
+  }
+  return visible;
+}
+
+export async function listAccessibleAuditCheckpoints(auth) {
+  const checkpoints = await query(`SELECT c.id,c.created_by_user_id,c.created_at,c.manifest_version,
+      encode(c.manifest_hash,'hex') AS manifest_hash,o.status,o.attempt_count,o.last_error_code,
+      count(cs.stream_id)::int AS stream_count
+    FROM audit_checkpoint c
+    JOIN audit_checkpoint_outbox o ON o.checkpoint_id=c.id
+    JOIN audit_checkpoint_stream cs ON cs.checkpoint_id=c.id
+    GROUP BY c.id,o.status,o.attempt_count,o.last_error_code
+    ORDER BY c.created_at DESC,c.id DESC LIMIT 100`);
+  const visible = [];
+  for (const checkpoint of checkpoints) {
+    const streams = await query(`SELECT stream_kind,stream_id FROM audit_checkpoint_stream
+      WHERE checkpoint_id=:id ORDER BY stream_kind,stream_id`, { id: checkpoint.id });
+    let allowed = true;
+    for (const stream of streams) {
+      if (!(await streamAccessAllowed(auth, stream))) { allowed = false; break; }
+    }
+    if (allowed) visible.push({
+      id: checkpoint.id,
+      createdAt: checkpoint.created_at,
+      createdByUserId: checkpoint.created_by_user_id,
+      manifestVersion: checkpoint.manifest_version,
+      manifestHash: checkpoint.manifest_hash,
+      status: checkpoint.status,
+      attemptCount: Number(checkpoint.attempt_count),
+      lastErrorCode: checkpoint.last_error_code,
+      streamCount: Number(checkpoint.stream_count),
+    });
+  }
+  return visible;
+}
+
 async function loadCheckpoint(checkpointId, transaction) {
   const [checkpoint] = await query('SELECT * FROM audit_checkpoint WHERE id=:id', { id: checkpointId }, transaction);
   if (!checkpoint) throw new AppError(404, 'RESOURCE_NOT_FOUND', 'The requested audit checkpoint was not found.');

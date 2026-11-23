@@ -9,6 +9,7 @@ const participantPartyId = '55555555-5555-4555-8555-555555555555';
 const productionEventId = '77777777-7777-4777-8777-777777777777';
 const outputId = '88888888-8888-4888-8888-888888888888';
 const captureId = '99999999-9999-4999-8999-999999999999';
+const offlineBatchId = 'aaaaaaa1-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const validToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.test`;
 
 test('session token stays tab-scoped and offline commands survive reload with their server state', async ({ page, context }) => {
@@ -67,11 +68,20 @@ test('session token stays tab-scoped and offline commands survive reload with th
     if (lostResponseMutationId && route.request().url().endsWith(lostResponseMutationId)) {
       return route.fulfill({ status: 200, json: { receipt: {
         clientMutationId: lostResponseMutationId, status: 'server_accepted', receivedAt: new Date().toISOString(),
-        resolvedAt: new Date().toISOString(), response: { id: 'event-2' }, error: null,
+        resolvedAt: new Date().toISOString(), response: { id: 'event-2', batchId: offlineBatchId }, error: null,
       } } });
     }
     return route.fulfill({ status: 404, json: { error: { message: 'Not found' } } });
   });
+  await page.route((url) => url.pathname === '/api/v1/material-batches' && url.searchParams.has('query'), (route) => route.fulfill({ json: [
+    { id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED', qr_status: null },
+  ] }));
+  await page.route(`**/api/v1/material-batches/${offlineBatchId}/traceability`, (route) => route.fulfill({ json: {
+    batch: { id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED' }, qr: null,
+    relatedBatches: [{ id: offlineBatchId, batch_code: 'OFFLINE-BATCH-02', material_kind: 'GOLD_BEARING_FEED', current_status: 'RECORDED' }],
+    productionEvents: [], processingEvents: [], inventoryMovements: [], consignments: [], recoveryEvents: [], residueSales: [], goldTrades: [],
+    limitations: { pooledAttribution: 'Pooled recovery outputs remain aggregate.', tradeLookup: 'Trades require party access.' },
+  } }));
 
   await page.goto('/');
   await page.evaluate(() => navigator.serviceWorker.ready);
@@ -162,11 +172,15 @@ test('session token stays tab-scoped and offline commands survive reload with th
   }, offlineCommand.mutationId!);
   expect(localState.command).toMatchObject({ envelope: { clientMutationId: offlineCommand.mutationId }, state: 'server_accepted' });
   expect(localState.receipt).toMatchObject({ clientMutationId: offlineCommand.mutationId, status: 'server_accepted' });
+  await expect(offlineCommandRow.getByText(`Related material batch ${offlineBatchId}`)).toBeVisible();
+  await offlineCommandRow.getByRole('button', { name: 'Open related batch' }).click();
+  await expect(page.getByRole('heading', { name: 'OFFLINE-BATCH-02' })).toBeVisible();
 });
 
 test('audit checkpoint UI distinguishes database acceptance from a live unanchored-tail verification', async ({ page }) => {
   const checkpointId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   let getCount = 0;
+  let created = false;
   await page.route('**/api/v1/auth/login', (route) => route.fulfill({ json: {
     token: validToken,
     user: { id: userId, personPartyId: partyId, displayName: 'Fictional Recorder' },
@@ -178,15 +192,18 @@ test('audit checkpoint UI distinguishes database acceptance from a live unanchor
   } }));
   await page.route('**/api/v1/sites', (route) => route.fulfill({ json: [{ id: siteId, siteCode: 'TEST-01', name: 'Fictional Site' }] }));
   await page.route(`**/api/v1/sites/${siteId}/holes`, (route) => route.fulfill({ json: [{ id: holeId, siteId, holeCode: 'H-01' }] }));
+  await page.route('**/api/v1/audit/streams', (route) => route.fulfill({ json: [{ streamKind: 'mining_site', streamId: siteId, sequence: 7, headHash: 'cd'.repeat(32), updatedAt: new Date().toISOString() }] }));
   await page.route('**/api/v1/audit/checkpoints', async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: created ? [{ id: checkpointId, createdAt: new Date().toISOString(), manifestHash: 'ab'.repeat(32), status: 'VERIFIED', attemptCount: 1, streamCount: 1 }] : [] });
     const body = route.request().postDataJSON() as { clientMutationId: string; streams: Array<{ streamKind: string; streamId: string }> };
     expect(route.request().headers()['idempotency-key']).toBe(body.clientMutationId);
     expect(body.streams).toEqual([{ streamKind: 'mining_site', streamId: siteId }]);
+    created = true;
     await route.fulfill({ status: 202, json: {
       checkpoint: { id: checkpointId, createdAt: new Date().toISOString(), createdByUserId: userId, manifestHash: 'ab'.repeat(32), streams: [{ streamKind: 'mining_site', streamId: siteId, sequence: 7, headHash: 'cd'.repeat(32) }] },
       databaseState: 'ACCEPTED',
-      processing: { status: 'PENDING', attemptCount: 0, verification: null },
-      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 7, currentHeadStatus: 'CONSISTENT', tailStatus: 'NONE', tailEntries: 0 }] },
+      processing: { status: 'PENDING', attemptCount: 0, verification: null, attempts: [] },
+      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 7, currentHeadStatus: 'CONSISTENT', checkpointStatus: 'VERIFIED', tailStatus: 'NONE', tailEntries: 0 }] },
       externalCommitment: 'NOT_IMPLEMENTED',
     } });
   });
@@ -195,8 +212,8 @@ test('audit checkpoint UI distinguishes database acceptance from a live unanchor
     await route.fulfill({ status: 200, json: {
       checkpoint: { id: checkpointId, createdAt: new Date().toISOString(), createdByUserId: userId, manifestHash: 'ab'.repeat(32), streams: [{ streamKind: 'mining_site', streamId: siteId, sequence: 7, headHash: 'cd'.repeat(32) }] },
       databaseState: 'ACCEPTED',
-      processing: { status: 'VERIFIED', attemptCount: 1, verification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', tailStatus: 'UNANCHORED', tailEntries: 1 }] } },
-      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', tailStatus: 'UNANCHORED', tailEntries: 1 }] },
+      processing: { status: 'VERIFIED', attemptCount: 1, verification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', tailStatus: 'UNANCHORED', tailEntries: 1 }] }, attempts: [{ attempt_number: 1, outcome: 'VERIFIED', started_at: new Date().toISOString(), completed_at: new Date().toISOString() }] },
+      liveVerification: { checkpointStatus: 'VERIFIED', manifestStatus: 'VALID', streams: [{ streamKind: 'mining_site', streamId: siteId, coveredSequence: 7, currentSequence: 8, currentHeadStatus: 'CONSISTENT', checkpointStatus: 'VERIFIED', tailStatus: 'UNANCHORED', tailEntries: 1 }] },
       externalCommitment: 'NOT_IMPLEMENTED',
     } });
   });
@@ -206,12 +223,14 @@ test('audit checkpoint UI distinguishes database acceptance from a live unanchor
   await page.getByLabel('Password').fill('test-password');
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Audit evidence' }).click();
-  await page.getByLabel('Checkpoint stream ID').fill(siteId);
-  await page.getByRole('button', { name: 'Add stream' }).click();
+  await expect(page.getByLabel('Authorized audit stream')).toContainText(siteId);
+  await page.getByRole('button', { name: 'Add stream to checkpoint' }).click();
   await page.getByRole('button', { name: 'Create checkpoint' }).click();
-  await expect(page.getByText('Database state: ACCEPTED. External commitment: NOT_IMPLEMENTED.')).toBeVisible();
-  await expect(page.getByText(/Live database verification: VERIFIED; manifest: VALID\./)).toBeVisible();
-  await page.getByRole('button', { name: 'Refresh verification' }).click();
-  await expect(page.getByText(/tail unanchored \(1 entry\)/i)).toBeVisible();
+  await page.getByRole('button', { name: 'Open and verify' }).click();
+  await expect(page.getByText('ACCEPTED', { exact: true })).toBeVisible();
+  await expect(page.getByText(/VERIFIED.*VALID/)).toBeVisible();
+  await expect(page.getByText(/Covered sequence 7; current sequence 8/)).toBeVisible();
+  await expect(page.getByText(/unanchored tail UNANCHORED \(1 record\(s\)\)/i)).toBeVisible();
+  await expect(page.getByText(/there is no external independent commitment/i)).toBeVisible();
   expect(getCount).toBeGreaterThan(0);
 });

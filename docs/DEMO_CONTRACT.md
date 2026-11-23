@@ -1,6 +1,6 @@
 # MinaLedger fictional demo contract
 
-**Status:** Stage 7A Milestones 0–2. Demo identities and workflow records described here are fictional design fixtures. The repository does not provide a complete fixture seeder or an end-to-end product UI for either value-chain route. This document does not authorize live or production data entry.
+**Status:** Stage 7A Milestones 0–6. Demo identities and workflow records described here are fictional design fixtures. Role-aware workspaces now include Registry, Access, Production/Allocation, Operations, Commerce, Traceability, Reports and Audit evidence, but the repository still lacks a complete fixture seeder and an end-to-end product UI for either value-chain route. Milestone 6 PostgreSQL integration passed **56/56** on the dedicated `minaledger_test` database. This document does not authorize live or production data entry.
 
 ## Safety boundary
 

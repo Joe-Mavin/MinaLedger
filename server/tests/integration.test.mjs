@@ -1264,7 +1264,7 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     const resolved = await request(app).get(`/api/v1/qr/${processingQr.body.payload}`).set('Authorization', `Bearer ${ids.doraToken}`);
     assert.equal(resolved.status, 200, resolved.text);
     assert.equal(resolved.body.material_batch_id, ids.processingOutputs[1].batchId);
-    assert.equal(resolved.body.origins[0].processing_facility_id, ids.doraOneId);
+    assert.ok(resolved.body.origins.some((origin) => origin.processing_facility_id === ids.doraOneId));
 
     const deniedFacilityCreate = await request(app).post(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/qr`)
       .set('Authorization', `Bearer ${ids.doraTwoToken}`).set('Idempotency-Key', randomUUID()).send({});
@@ -1281,6 +1281,21 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       .set('Authorization', `Bearer ${ids.siteToken}`).set('Idempotency-Key', qrKey).send({});
     assert.equal(sourceQr.status, 201, sourceQr.text);
     assert.equal(sourceReplay.body.payload, sourceQr.body.payload);
+    const [sourceBatch] = await db(`SELECT batch_code FROM material_batch WHERE id=:id`, { id: sourceBatchId }, undefined, QueryTypes.SELECT);
+    const sourceSearch = await request(app).get(`/api/v1/material-batches?query=${encodeURIComponent(sourceBatch.batch_code)}`)
+      .set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(sourceSearch.status, 200, sourceSearch.text);
+    assert.ok(sourceSearch.body.some((row) => row.id === sourceBatchId && row.batch_code === sourceBatch.batch_code));
+    const sourceTrace = await request(app).get(`/api/v1/material-batches/${sourceBatchId}/traceability`)
+      .set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(sourceTrace.status, 200, sourceTrace.text);
+    assert.equal(sourceTrace.body.batch.id, sourceBatchId);
+    assert.ok(sourceTrace.body.productionEvents.some((event) => event.id === ids.phase2ProductionEventId));
+    const processingTrace = await request(app).get(`/api/v1/material-batches/${ids.processingOutputs[1].batchId}/traceability`)
+      .set('Authorization', `Bearer ${ids.doraToken}`);
+    assert.equal(processingTrace.status, 200, processingTrace.text);
+    assert.ok(processingTrace.body.processingEvents.some((event) => event.id === ids.processingEventId));
+    assert.ok(processingTrace.body.productionEvents.some((event) => event.id === ids.phase2ProductionEventId), 'hole-scoped production source remains visible through its authorized record service');
 
     const siteOperator = await seedUser('site-mining-operator@example.test', 'Fictional Site Mining Operator', {
       roleCode: 'MINING_OPERATOR', scopeKind: 'SITE', scopeId: ids.siteId,
@@ -1322,6 +1337,13 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       roleCode: 'FIELD_OFFICER', scopeKind: 'SITE', scopeId: ids.siteBId,
     });
     const otherSiteToken = testToken(otherSiteUser.userId);
+    const unrelatedSearch = await request(app).get(`/api/v1/material-batches?query=${encodeURIComponent(sourceBatch.batch_code)}`)
+      .set('Authorization', `Bearer ${otherSiteToken}`);
+    assert.equal(unrelatedSearch.status, 200, unrelatedSearch.text);
+    assert.deepEqual(unrelatedSearch.body, []);
+    const unrelatedTrace = await request(app).get(`/api/v1/material-batches/${sourceBatchId}/traceability`)
+      .set('Authorization', `Bearer ${otherSiteToken}`);
+    assert.equal(unrelatedTrace.status, 404, unrelatedTrace.text);
     const crossSiteCreate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr`)
       .set('Authorization', `Bearer ${otherSiteToken}`).set('Idempotency-Key', randomUUID()).send({});
     const crossSiteRotate = await request(app).post(`/api/v1/material-batches/${sourceBatchId}/qr/rotate`)
@@ -2380,6 +2402,21 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
       const recoveryEvents = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/recovery-events`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(recoveryEvents.status, 200, recoveryEvents.text);
       assert.ok(recoveryEvents.body.some((row) => row.id === ids.phaseThree.recoveryEventId));
+      const [recoveredBatch] = await db(`SELECT batch_id FROM recovery_event_output WHERE recovery_event_id=:eventId AND output_role='RECOVERED_GOLD' LIMIT 1`, { eventId: ids.phaseThree.recoveryEventId }, undefined, QueryTypes.SELECT);
+      const recoveryQr = await request(app).post(`/api/v1/material-batches/${recoveredBatch.batch_id}/qr`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({});
+      assert.equal(recoveryQr.status, 201, recoveryQr.text);
+      const recoveryLookup = await request(app).get(`/api/v1/qr/${recoveryQr.body.payload}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(recoveryLookup.status, 200, recoveryLookup.text);
+      assert.ok(recoveryLookup.body.origins.some((origin) => origin.recovery_facility_id === ids.phaseThree.recoveryFacilityId));
+      const recoveryTrace = await request(app).get(`/api/v1/material-batches/${recoveredBatch.batch_id}/traceability`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+      assert.equal(recoveryTrace.status, 200, recoveryTrace.text);
+      assert.ok(recoveryTrace.body.recoveryEvents.some((event) => event.id === ids.phaseThree.recoveryEventId));
+      const rotatedRecoveryQr = await request(app).post(`/api/v1/material-batches/${recoveredBatch.batch_id}/qr/rotate`)
+        .set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`).set('Idempotency-Key', randomUUID()).send({});
+      assert.equal(rotatedRecoveryQr.status, 201, rotatedRecoveryQr.text);
+      assert.equal((await request(app).get(`/api/v1/qr/${recoveryQr.body.payload}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).status, 404);
+      assert.equal((await request(app).post(`/api/v1/material-batches/${recoveredBatch.batch_id}/qr`).set('Authorization', `Bearer ${ids.phaseThree.otherRecoveryToken}`).set('Idempotency-Key', randomUUID()).send({})).status, 404);
       assert.equal((await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.otherRecoveryFacilityId}`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`)).status, 404);
       const eligibleInputs = await request(app).get(`/api/v1/recovery-facilities/${ids.phaseThree.recoveryFacilityId}/eligible-inputs`).set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
       assert.equal(eligibleInputs.status, 200, eligibleInputs.text);
@@ -3109,6 +3146,12 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal((await request(app).get(`/api/v1/sites/${ids.siteId}`).set('Authorization', `Bearer ${ids.siteToken}`)).status, 200);
     const [authorizedSiteHead] = await db(`SELECT last_sequence FROM audit_stream_head WHERE stream_kind='mining_site' AND stream_id=:id`, { id: ids.siteId }, undefined, QueryTypes.SELECT);
     assert.ok(authorizedSiteHead?.last_sequence, 'the authorized site must have an existing audit stream head');
+    const discoveredSiteStreams = await request(app).get('/api/v1/audit/streams').set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(discoveredSiteStreams.status, 200, discoveredSiteStreams.text);
+    assert.ok(discoveredSiteStreams.body.some((stream) => stream.streamKind === 'mining_site' && stream.streamId === ids.siteId));
+    const isolatedStreams = await request(app).get('/api/v1/audit/streams').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+    assert.equal(isolatedStreams.status, 200, isolatedStreams.text);
+    assert.equal(isolatedStreams.body.some((stream) => stream.streamKind === 'mining_site' && stream.streamId === ids.siteId), false);
 
     const oneKey = randomUUID();
     const created = await postCheckpoint([siteStream], oneKey);
@@ -3117,6 +3160,12 @@ test('PostgreSQL foundation integrity and API integration', async (t) => {
     assert.equal(created.body.processing.status, 'PENDING');
     assert.equal(created.body.externalCommitment, 'NOT_IMPLEMENTED');
     assert.equal(created.body.checkpoint.streams.length, 1);
+    const visibleHistory = await request(app).get('/api/v1/audit/checkpoints').set('Authorization', `Bearer ${ids.siteToken}`);
+    assert.equal(visibleHistory.status, 200, visibleHistory.text);
+    assert.ok(visibleHistory.body.some((checkpoint) => checkpoint.id === created.body.checkpoint.id));
+    const hiddenHistory = await request(app).get('/api/v1/audit/checkpoints').set('Authorization', `Bearer ${ids.phaseThree.recoveryToken}`);
+    assert.equal(hiddenHistory.status, 200, hiddenHistory.text);
+    assert.equal(hiddenHistory.body.some((checkpoint) => checkpoint.id === created.body.checkpoint.id), false);
     const duplicate = await postCheckpoint([siteStream], oneKey);
     assert.equal(duplicate.status, 202, duplicate.text);
     assert.equal(duplicate.body.checkpoint.id, created.body.checkpoint.id);

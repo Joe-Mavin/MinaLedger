@@ -1,4 +1,4 @@
-export type WorkspaceSection = 'overview' | 'capture' | 'queue' | 'audit' | 'registry' | 'access' | 'production' | 'operations' | 'measurements' | 'gold-trades' | 'payments';
+export type WorkspaceSection = 'overview' | 'capture' | 'queue' | 'audit' | 'registry' | 'access' | 'production' | 'operations' | 'measurements' | 'gold-trades' | 'payments' | 'traceability' | 'reports';
 
 export interface NavigationItem {
   id: WorkspaceSection;
@@ -88,6 +88,8 @@ export function getNavigationItems(roleCode: string | undefined, scopeKind?: str
       { id: 'measurements', label: 'Measurements & assays', description: 'Review measurements against their source and record supported observations.' },
       { id: 'gold-trades', label: 'Gold trades', description: 'Review or propose party-authorized gold trades and bilateral terms.' },
       { id: 'payments', label: 'Payments', description: 'Review payment reports and counterparty decisions for gold trades.' },
+      { id: 'traceability', label: 'Traceability', description: 'Search authorized material batches, manage QR identities and follow recorded lineage.' },
+      { id: 'reports', label: 'Reports', description: 'Review source-linked production and operations records for an authorized period.' },
     ];
     items.splice(queueIndex < 0 ? items.length : queueIndex, 0, ...commerceItems);
   }

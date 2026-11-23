@@ -12,6 +12,9 @@ import { AccessAdministration, type RegisteredOrganization, type SessionAdminAcc
 import { ProductionWorkspace } from './production/ProductionWorkspace';
 import { OperationsWorkspace } from './operations/OperationsWorkspace';
 import { CommerceWorkspace } from './commerce/CommerceWorkspace';
+import { AuditEvidenceWorkspace } from './audit/AuditEvidenceWorkspace';
+import { TraceabilityWorkspace } from './traceability/TraceabilityWorkspace';
+import { ReportsWorkspace } from './reports/ReportsWorkspace';
 
 interface RoleGrant {
   roleCode: string;
@@ -24,20 +27,6 @@ interface Recorder {
   personPartyId: string;
   displayName: string;
   roles: RoleGrant[];
-}
-
-type CheckpointStreamKind = 'mining_site' | 'mining_hole' | 'material_event' | 'processing_facility' | 'recovery_facility' | 'gold_trade' | 'consignment';
-interface AuditVerificationView {
-  checkpointStatus: string;
-  manifestStatus: string;
-  streams: Array<{ streamKind: string; streamId: string; coveredSequence: number; currentSequence: number | null; currentHeadStatus?: string; tailStatus: string; tailEntries: number; checkpointFailure?: string; tailFailure?: string }>;
-}
-interface AuditCheckpointView {
-  checkpoint: { id: string; createdAt: string; createdByUserId: string; manifestHash: string; streams: Array<{ streamKind: string; streamId: string; sequence: number; headHash: string }> };
-  databaseState: string;
-  processing: { status: string; attemptCount: number; lastErrorCode?: string | null; verification?: AuditVerificationView | null };
-  liveVerification: AuditVerificationView;
-  externalCommitment: string;
 }
 
 const STATE_LABELS: Record<SyncState, string> = {
@@ -96,6 +85,24 @@ function localContextKey(context: ActingContext): string {
   return `${context.roleCode}:${context.scopeKind}:${context.scopeId}:${context.partyId}`;
 }
 
+function getQueuedBatchId(command: QueuedCommand): string | null {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const find = (value: unknown): string | null => {
+    if (!value || typeof value !== 'object') return null;
+    if (Array.isArray(value)) {
+      for (const item of value) { const match = find(item); if (match) return match; }
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    for (const [key, nested] of Object.entries(record)) {
+      if (['batchId', 'batch_id', 'materialBatchId', 'material_batch_id'].includes(key) && typeof nested === 'string' && uuid.test(nested)) return nested;
+      if (typeof nested === 'object') { const match = find(nested); if (match) return match; }
+    }
+    return null;
+  };
+  return find(command.envelope.payload) ?? find(command.receipt?.response);
+}
+
 export default function App() {
   const [recorder, setRecorder] = useState<Recorder | null>(null);
   const [token, setToken] = useState<string | null>(null);
@@ -143,11 +150,7 @@ export default function App() {
   const [revisionPayloadText, setRevisionPayloadText] = useState('{}');
   const [revisionSource, setRevisionSource] = useState<QueuedCommand | null>(null);
   const [busy, setBusy] = useState(false);
-  const [checkpointStreamKind, setCheckpointStreamKind] = useState<CheckpointStreamKind>('mining_site');
-  const [checkpointStreamId, setCheckpointStreamId] = useState('');
-  const [checkpointStreams, setCheckpointStreams] = useState<Array<{ streamKind: CheckpointStreamKind; streamId: string }>>([]);
-  const [checkpointRecord, setCheckpointRecord] = useState<AuditCheckpointView | null>(null);
-  const [checkpointError, setCheckpointError] = useState('');
+  const [traceBatchId, setTraceBatchId] = useState('');
   const [activeSection, setActiveSection] = useState<WorkspaceSection>('overview');
   const [sessionOrganizations, setSessionOrganizations] = useState<RegisteredOrganization[]>([]);
   const [sessionAdminAccounts, setSessionAdminAccounts] = useState<SessionAdminAccount[]>([]);
@@ -295,23 +298,6 @@ export default function App() {
     if (online && recorder && token) void synchronizeCommands(recorder.id, token).then(() => refreshCommands(recorder.id)).catch((syncError) => setError(syncError instanceof Error ? syncError.message : 'Sync could not start.'));
   }, [online, recorder, token, refreshCommands]);
 
-  const activeCheckpointId = checkpointRecord?.checkpoint.id;
-  const activeCheckpointStatus = checkpointRecord?.processing.status;
-  useEffect(() => {
-    if (!token || !activeCheckpointId || !['PENDING', 'PROCESSING', 'RETRY'].includes(activeCheckpointStatus ?? '')) return undefined;
-    let active = true;
-    const refreshCheckpoint = async () => {
-      try {
-        const result = await apiRequest<AuditCheckpointView>(`/api/v1/audit/checkpoints/${activeCheckpointId}`, token);
-        if (active) setCheckpointRecord(result);
-      } catch (loadError) {
-        if (active) setCheckpointError(loadError instanceof Error ? loadError.message : 'Checkpoint status could not be refreshed.');
-      }
-    };
-    const timer = window.setInterval(() => { void refreshCheckpoint(); }, 2_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [token, activeCheckpointId, activeCheckpointStatus]);
-
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true); setError(''); setMessage('');
@@ -333,7 +319,7 @@ export default function App() {
     await clearReferenceCache().catch(() => undefined);
     setToken(null); setRecorder(null); setSites([]); setSitesSource('unavailable'); setHoles([]); setCommands([]); setSelectedRoleKey('');
     setSessionOrganizations([]); setSessionAdminAccounts([]);
-    setCheckpointRecord(null); setCheckpointStreams([]); setCheckpointError('');
+    setTraceBatchId('');
     setMessage('Signed out. Local commands remain on this device and are scoped to their recorder.');
   }
 
@@ -348,7 +334,7 @@ export default function App() {
       sessionStorage.removeItem('minaledger.sessionUser');
       void clearReferenceCache().catch(() => undefined);
       setToken(null); setRecorder(null); setSites([]); setSitesSource('unavailable'); setHoles([]); setSelectedRoleKey('');
-      setCheckpointRecord(null); setCheckpointStreams([]); setCheckpointError('');
+      setTraceBatchId('');
       setMessage('Session expired. Sign in again to continue; local commands are preserved.');
     }, timeout);
     return () => window.clearTimeout(timer);
@@ -364,46 +350,6 @@ export default function App() {
     } catch (syncError) {
       setError(syncError instanceof Error ? syncError.message : 'Sync could not finish.');
     } finally { setBusy(false); }
-  }
-
-  function addCheckpointStream() {
-    setCheckpointError('');
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(checkpointStreamId.trim())) {
-      setCheckpointError('Enter a valid stream UUID.');
-      return;
-    }
-    if (checkpointStreams.some((stream) => stream.streamKind === checkpointStreamKind && stream.streamId === checkpointStreamId.trim())) {
-      setCheckpointError('That stream is already selected.');
-      return;
-    }
-    setCheckpointStreams((current) => [...current, { streamKind: checkpointStreamKind, streamId: checkpointStreamId.trim() }]);
-    setCheckpointStreamId('');
-  }
-
-  async function createCheckpoint(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!token || checkpointStreams.length === 0) return;
-    setBusy(true); setCheckpointError('');
-    const clientMutationId = crypto.randomUUID();
-    try {
-      const result = await apiRequest<AuditCheckpointView>('/api/v1/audit/checkpoints', token, {
-        method: 'POST', headers: { 'Idempotency-Key': clientMutationId },
-        body: JSON.stringify({ clientMutationId, streams: checkpointStreams }),
-      });
-      setCheckpointRecord(result);
-    } catch (createError) {
-      setCheckpointError(createError instanceof Error ? createError.message : 'Checkpoint creation failed.');
-    } finally { setBusy(false); }
-  }
-
-  async function refreshCheckpointStatus() {
-    if (!token || !checkpointRecord) return;
-    setCheckpointError('');
-    try {
-      setCheckpointRecord(await apiRequest<AuditCheckpointView>(`/api/v1/audit/checkpoints/${checkpointRecord.checkpoint.id}`, token));
-    } catch (loadError) {
-      setCheckpointError(loadError instanceof Error ? loadError.message : 'Checkpoint status could not be refreshed.');
-    }
   }
 
   function participantFor(type: CommandType) {
@@ -758,6 +704,15 @@ export default function App() {
           online={online}
         />}
 
+        {activeSection === 'traceability' && token && <TraceabilityWorkspace
+          token={token}
+          roles={recorder.roles}
+          actingRoleCode={selectedRole?.roleCode ?? ''}
+          online={online}
+          initialBatchId={traceBatchId}
+        />}
+        {activeSection === 'reports' && token && <ReportsWorkspace token={token} online={online} />}
+
 
         {activeSection === 'capture' && <>
         <WorkspaceHeading eyebrow="FIELD WORKSPACE" title="Capture field information" description="Prepare allowlisted commands for the active role and scope. Server authorization is rechecked during synchronization." action={<button className="secondary" onClick={syncNow} disabled={busy || !online}>{busy ? 'Working…' : 'Sync queue'}</button>} />
@@ -880,6 +835,7 @@ export default function App() {
                 <p className="queue-meta">Mutation ID <code>{command.envelope.clientMutationId}</code></p>
                 <p className="queue-meta">{new Date(command.createdAt).toLocaleString()} · {command.envelope.actingContext.roleCode} · {command.envelope.actingContext.scopeKind.toLowerCase()} {command.envelope.actingContext.scopeId}</p>
                 {command.envelope.parentCommandIds.length > 0 && <p className="queue-meta">Linked to {command.envelope.parentCommandIds.join(', ')}</p>}
+                {getQueuedBatchId(command) && <p className="queue-meta">Related material batch <code>{getQueuedBatchId(command)}</code></p>}
                 {command.receipt?.error && <p className="error">{command.receipt.error.code}: {command.receipt.error.message}</p>}
                 {command.state === 'needs_review' && <p className="review-note">This record is stored as submitted information. Review is required; it is not participant approval.</p>}
                 {command.lastError && <p className="queue-meta">{command.lastError}</p>}
@@ -888,49 +844,13 @@ export default function App() {
                 {command.state === 'draft' && <button className="small-button" onClick={() => queueSavedDraft(command)}>Queue</button>}
                 {command.state === 'server_received' && <button className="small-button" onClick={() => checkReceipt(command)} disabled={busy}>Check receipt</button>}
                 {(command.state === 'conflict' || command.state === 'rejected') && <button className="small-button" onClick={() => prepareLinkedRevision(command)}>Prepare linked revision</button>}
+                {getQueuedBatchId(command) && <button className="small-button" onClick={() => { setTraceBatchId(getQueuedBatchId(command) ?? ''); setActiveSection('traceability'); }}>Open related batch</button>}
               </div>
             </article>)}
           </div>}
         </section>
         </>}
-        {activeSection === 'audit' && <>
-        <WorkspaceHeading eyebrow="DATABASE EVIDENCE" title="Audit evidence" description="Create and verify checkpoints only for streams the authenticated server allows you to access." />
-        {error && <div className="notice error" role="alert">{error}</div>}
-        {checkpointError && <p role="alert" className="error">{checkpointError}</p>}
-        <section className="queue-section" aria-labelledby="checkpoint-heading">
-          <div className="section-heading"><div><p className="eyebrow">DATABASE EVIDENCE</p><h2 id="checkpoint-heading">Audit checkpoints</h2></div></div>
-          <p className="muted">Create an immutable checkpoint for streams you are authorized to read. Checkpoints cover the listed sequence and head only; later events remain an unanchored tail. No external or blockchain commitment is implemented.</p>
-          <form onSubmit={createCheckpoint}>
-            <div className="form-grid">
-              <label>Aggregate stream<select aria-label="Checkpoint stream kind" value={checkpointStreamKind} onChange={(event) => setCheckpointStreamKind(event.target.value as CheckpointStreamKind)}>
-                <option value="mining_site">Mining site</option><option value="mining_hole">Mining hole</option><option value="material_event">Material event</option>
-                <option value="processing_facility">Processing facility</option><option value="recovery_facility">Recovery facility</option><option value="gold_trade">Gold trade</option><option value="consignment">Consignment</option>
-              </select></label>
-              <label>Stream ID<input aria-label="Checkpoint stream ID" value={checkpointStreamId} onChange={(event) => setCheckpointStreamId(event.target.value)} placeholder="UUID" /></label>
-              <button className="secondary" type="button" onClick={addCheckpointStream}>Add stream</button>
-              <div className="span-two" aria-label="Selected checkpoint streams">
-                {checkpointStreams.map((stream) => <p className="queue-meta" key={`${stream.streamKind}:${stream.streamId}`}>{stream.streamKind} · {stream.streamId} <button className="small-button" type="button" onClick={() => setCheckpointStreams((current) => current.filter((item) => item !== stream))}>Remove</button></p>)}
-              </div>
-              <button className="primary" type="submit" disabled={busy || !online || checkpointStreams.length === 0}>{busy ? 'Creating…' : 'Create checkpoint'}</button>
-            </div>
-          </form>
-          {checkpointRecord && <div className="notice info" aria-live="polite">
-            <strong>Outbox {checkpointRecord.processing.status.toLowerCase()} (attempts {checkpointRecord.processing.attemptCount})</strong>
-            <button className="small-button" type="button" onClick={() => void refreshCheckpointStatus()} disabled={busy}>Refresh verification</button>
-            <p>Database state: {checkpointRecord.databaseState}. External commitment: {checkpointRecord.externalCommitment}.</p>
-            <p>Manifest SHA-256: <code>{checkpointRecord.checkpoint.manifestHash}</code></p>
-            {checkpointRecord.processing.lastErrorCode && <p role="alert">Processing error: {checkpointRecord.processing.lastErrorCode}</p>}
-            {checkpointRecord.processing.verification && <p>Saved covered checkpoint: {checkpointRecord.processing.verification.checkpointStatus}; manifest: {checkpointRecord.processing.verification.manifestStatus}.</p>}
-            {checkpointRecord.liveVerification && <>
-              <p>Live database verification: {checkpointRecord.liveVerification.checkpointStatus}; manifest: {checkpointRecord.liveVerification.manifestStatus}.</p>
-              {checkpointRecord.liveVerification.streams.map((stream) => <p key={`${stream.streamKind}:${stream.streamId}`}>
-                {stream.streamKind} {stream.streamId}: covered through sequence {stream.coveredSequence}; current head {stream.currentHeadStatus?.toLowerCase() ?? 'unavailable'}; tail {stream.tailStatus.toLowerCase()} ({stream.tailEntries} {stream.tailEntries === 1 ? 'entry' : 'entries'}).
-                {stream.checkpointFailure ? ` Checkpoint issue: ${stream.checkpointFailure}.` : ''}{stream.tailFailure ? ` Tail issue: ${stream.tailFailure}.` : ''}
-              </p>)}
-            </>}
-          </div>}
-        </section>
-        </>}
+        {activeSection === 'audit' && token && <AuditEvidenceWorkspace token={token} online={online} readOnly={selectedRole?.roleCode === 'AUDITOR'} />}
         {!online && activeSection !== 'overview' && <div className="notice warning">You are offline. Capture can use cached references; audit checkpoints and server synchronization require a connection.</div>}
     </AppShell>
   );

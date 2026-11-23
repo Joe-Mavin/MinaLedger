@@ -17,11 +17,12 @@ import { measurementSchema, newMeasurementSchema, productionSchema } from './mod
 import { syncEnvelopeSchema } from './modules/sync/sync.schemas.mjs';
 import { getSyncCommandVersion, getSyncReceipt, submitSyncCommand } from './modules/sync/sync.service.mjs';
 import { createAuditCheckpointSchema } from './modules/audit/checkpoint.schemas.mjs';
-import { createAuditCheckpoint, getAuditCheckpoint } from './modules/audit/checkpoint.service.mjs';
+import { createAuditCheckpoint, getAuditCheckpoint, listAccessibleAuditStreams, listAccessibleAuditCheckpoints } from './modules/audit/checkpoint.service.mjs';
 import { createDora, listSiteDoras, listAccessibleDoras, getDora, updateDora } from './modules/dora/dora.service.mjs';
 import { createProcessingEvent, getProcessingEvent, addProcessingMeasurement, processingEventAccessRows, listAccessibleProcessingEvents } from './modules/processing/processing.service.mjs';
 import { createAllocationSet, getOutputAllocations } from './modules/allocations/allocation.service.mjs';
 import { createBatchQr, rotateBatchQr, lookupQr, canAccessBatch } from './modules/qr/qr.service.mjs';
+import { searchAccessibleMaterialBatches, getMaterialBatchTraceability } from './modules/traceability/traceability.service.mjs';
 import {
   createStockpile, listStockpiles, receiveDoraResidue, transferBetweenStockpiles, createConsignment,
   dispatchConsignment, addTransportLeg, readConsignment, createRecoveryInventoryLocation, listLocationBalances,
@@ -410,6 +411,8 @@ app.post('/api/v1/audit/checkpoints', requireIdempotencyKey, validateBody(create
   const checkpoint = await createAuditCheckpoint(req.body, req.auth, req.id, req.get('idempotency-key'));
   return res.status(202).json(checkpoint);
 }));
+app.get('/api/v1/audit/streams', asyncRoute(async (req, res) => res.json(await listAccessibleAuditStreams(req.auth))));
+app.get('/api/v1/audit/checkpoints', asyncRoute(async (req, res) => res.json(await listAccessibleAuditCheckpoints(req.auth))));
 app.get('/api/v1/audit/checkpoints/:checkpointId', requireUuidParams('checkpointId'), asyncRoute(async (req, res) => {
   return res.json(await getAuditCheckpoint(req.params.checkpointId, req.auth));
 }));
@@ -490,6 +493,14 @@ app.post('/api/v1/processing-events/:eventId/outputs/:outputId/measurements', re
 }));
 app.post('/api/v1/material-batches/:batchId/qr', requireUuidParams('batchId'), requireIdempotencyKey, validateBody(emptySchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await createBatchQr(req.params.batchId, req.auth, req.get('idempotency-key')));
+}));
+app.get('/api/v1/material-batches', asyncRoute(async (req, res) => {
+  const search = String(req.query.query ?? '').trim();
+  if (search.length < 2 || search.length > 80) throw new AppError(400, 'INVALID_SEARCH', 'Batch search must contain 2 to 80 characters.');
+  return res.json(await searchAccessibleMaterialBatches(search, req.auth));
+}));
+app.get('/api/v1/material-batches/:batchId/traceability', requireUuidParams('batchId'), asyncRoute(async (req, res) => {
+  return res.json(await getMaterialBatchTraceability(req.params.batchId, req.auth));
 }));
 app.post('/api/v1/material-batches/:batchId/qr/rotate', requireUuidParams('batchId'), requireIdempotencyKey, validateBody(emptySchema), asyncRoute(async (req, res) => {
   return res.status(201).json(await rotateBatchQr(req.params.batchId, req.auth, req.get('idempotency-key')));

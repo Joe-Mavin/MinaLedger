@@ -77,6 +77,10 @@ label { display: grid; gap: 7px; color: #394940; font-size: 13px; font-weight: 7
 .empty-state { padding: 28px 10px; color: #75847b; text-align: center; border: 1px dashed #cbd7cf; border-radius: 10px; }
 .queue-list { display: grid; }
 .queue-item { display: flex; justify-content: space-between; gap: 18px; padding: 16px 2px; border-top: 1px solid #e8ede9; }
+.trace-group { margin-top: 24px; }
+.trace-group > .section-heading h3 { margin: 0; }
+.text-button { min-height: auto; padding: 2px 0; border: 0; color: #176149; background: transparent; text-align: left; text-decoration: underline; overflow-wrap: anywhere; }
+.qr-token, pre { display: block; max-width: 100%; overflow-wrap: anywhere; white-space: pre-wrap; }
 .queue-main { min-width: 0; }
 .queue-title { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-bottom: 8px; text-transform: capitalize; }
 .state-pill { display: inline-block; padding: 5px 8px; border-radius: 999px; color: #43564a; background: #edf1ee; font-size: 10px; font-weight: 800; }
@@ -223,6 +227,14 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 14px
 
 @media (prefers-reduced-motion: no-preference) {
   button, input, select { transition: background-color .16s ease, border-color .16s ease; }
+}
+
+@media print {
+  .topbar, .side-rail, footer, button, .report-controls, .notice.warning { display: none !important; }
+  .app-frame, .workspace { display: block; min-height: 0; padding: 0; }
+  .queue-section, .overview-card { break-inside: avoid; box-shadow: none; }
+  details > :not(summary) { display: block !important; }
+  body { color: #111; background: #fff; }
 }
 
 .app-shell { min-height: 100vh; background: #f3f6f2; }
